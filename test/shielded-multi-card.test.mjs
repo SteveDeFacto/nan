@@ -17,7 +17,7 @@ function run(actions, verdict = { cards }) {
     const file = path.join(dir, 'cards.json'); writeFileSync(file, JSON.stringify(verdict));
     const stdout = execFileSync(process.execPath, [path.join(root, 'supervisor.js')], {
       env: { ...process.env, SECRET: 'test', ADDRESS_BOOK_ADDRESS: '', REGISTRY_ENABLED: '', CLAIM_ENABLED: '',
-        SHIELDED_SELFTEST: '', SHIELDED_VERDICT: file, SHIELDED_POOL_SELFTEST: JSON.stringify(actions) }, encoding: 'utf8' });
+        GPU_COUNT: '0', SHIELDED_SELFTEST: '', SHIELDED_VERDICT: file, SHIELDED_POOL_SELFTEST: JSON.stringify(actions) }, encoding: 'utf8' });
     return JSON.parse(stdout.trim().split('\n').at(-1));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -105,4 +105,53 @@ test('guest probes publish independent card verdicts and withdraw only the faile
   assert.deepEqual(published().map(c => [c.id, c.vram_free_gb]), [[0, 6.5], [2, 12]]);
   refresh.get(9500).clear(); refresh.get(9502).clear();
   assert.equal(files.has('/run/shielded-gpu.json'), false);
+});
+
+const pool = { mode: 'layers', cardIds: [0, 1, 2], pricing: { tflopUsdHr: .001, vramGiBUsdHr: .0045 } };
+const pooled = { pool, cards: cards.map((c, i) => ({ ...c, card_tflops: [20.4,101.7,113][i] })) };
+test('one GPU pool reserves the same fraction of every card, with exact proportional VRAM', () => {
+  const r = run([
+    { alloc: { name: 'a', gpu: .1, cpu: .2 } }, { launch: 'a' },
+    { alloc: { name: 'b', gpu: .9, cpu: .3 } }, { launch: 'b' },
+    { alloc: { name: 'over', gpu: .01, cpu: .01 } },
+    { release: 'a' }, { reconcile: true }, { reconcile: true },
+  ], pooled);
+  assert.equal(r[0].handle.pooled, true);
+  assert.equal(r[0].capacity.cardTflops, 235.1);
+  assert.equal(r[0].capacity.vramGb, 68.5);
+  assert.equal(r[0].pricePerSec6, 151); // $0.5436/hour, one full GPU pool
+  assert.equal(r[0].sizingUnits, 1);
+  assert.deepEqual(r[0].handle.cards.map(c => c.vramGb), [.65, 3.1, 3.1]);
+  assert.equal(r[1].route.workers.length, 3);
+  assert.ok(Math.abs(r[1].route.vramGb - 6.85) < 1e-9);
+  assert.deepEqual(r[1].route.workers.map(c => c.vsockPort), [9500,9501,9502]);
+  assert.equal(r[4].handle, null);
+  assert.ok(Math.abs(r[6].free - .1) < 1e-9);
+  assert.deepEqual(r[6].cards, r[7].cards);
+});
+test('pooled admission is atomic if any sibling lacks VRAM or compute', () => {
+  const r = run([{ alloc: { name: 'no', gpu: .2, cpu: .3 } }, { alloc: { name: 'yes', gpu: .1, cpu: .3 } }],
+    { ...pooled, cards: pooled.cards.map((c, i) => i === 1 ? { ...c, vram_free_gb: 3.1 } : c) });
+  assert.equal(r[0].handle, null); assert.equal(r[0].cpu, 1);
+  assert.deepEqual(r[0].cards.map(c => c.free), [6.5,31,31]);
+  assert.equal(r[1].handle.pooled, true);
+});
+test('missing pool member withdraws new shares without shrinking totals or rerouting a lease', () => {
+  const r = run([
+    { alloc: { name: 'a', gpu: .4, cpu: .3 } },
+    { verdict: { ...pooled, cards: [pooled.cards[0],pooled.cards[2]] } },
+    { alloc: { name: 'no', gpu: .1, cpu: .1 } }, { launch: 'a' },
+    { verdict: pooled }, { launch: 'a' },
+  ], pooled);
+  assert.equal(r[1].free, 0); assert.deepEqual(r[1].cards.map(c => c.total), [6.5,31,31]);
+  assert.equal(r[2].handle, null); assert.match(r[3].error, /partial pool/);
+  assert.equal(r[5].route.workers.length, 3);
+});
+test('pool waits for all boot proofs and refuses malformed or duplicated members', () => {
+  for (const verdict of [
+    { ...pooled, cards: pooled.cards.slice(0,2) },
+    { ...pooled, cards: pooled.cards.map((c,i) => i===2 ? {...c,endpoint:pooled.cards[1].endpoint} : c) },
+    { ...pooled, pool: {...pool,cardIds:[0,0,2]} },
+    { ...pooled, pool: {...pool,pricing:{tflopUsdHr:-1,vramGiBUsdHr:.1}} },
+  ]) assert.equal(run([{alloc:{name:'no',gpu:.1,cpu:.1}}], verdict)[0].handle, null);
 });

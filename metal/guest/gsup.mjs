@@ -471,7 +471,8 @@ const publishShieldedVerdicts = () => {
   const cards = [...shieldedVerdicts.values()].sort((a, b) => a.id - b.id);
   if (!cards.length) { try { fs.unlinkSync(VERDICT); } catch {} return; }
   const tmp = VERDICT + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(shieldedWorkers.length === 1 ? cards[0] : { cards }));
+  fs.writeFileSync(tmp, JSON.stringify(fw.shieldedPool ? { pool: fw.shieldedPool, cards }
+    : shieldedWorkers.length === 1 ? cards[0] : { cards }));
   fs.renameSync(tmp, VERDICT);
 };
 publishShieldedVerdicts();
@@ -519,7 +520,7 @@ for (const [id, sw] of shieldedWorkers.entries()) {
         // verdict gates the capacity: a price is only meaningful for hardware the
         // box has shown it can actually drive. No pass, no file, no price.
         const priceSec6 = usdHrToSec6(Number(sw.priceUsdHr));
-        if (!priceSec6)
+        if (!priceSec6 && !fw.shieldedPool)
           log('shielded GPU has no priceUsdHr — its card sells at the supervisor default');
         try {
           // vsock rides with the endpoint only if THIS guest has the device: the

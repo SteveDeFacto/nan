@@ -14,6 +14,9 @@ extern "C" {
 #include <cstring>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <sstream>
+#include <algorithm>
 #include <mutex>
 #include <set>
 #include <string>
@@ -137,7 +140,9 @@ static std::string sh_group_key(const std::string &name) {
 struct sh_state {
     std::mutex mu;
     std::string host = "127.0.0.1";
-    int port = 9500;
+    int port = 9500, vsock_port = -1, refill_threads = -1;
+    uint64_t reserve_bytes = 0;
+    bool explicit_link = false;
     std::string calib_path;
     bool configured = false;
     bool calib_loaded = false;
@@ -260,6 +265,26 @@ struct sh_state {
 
 static sh_state &sh_get() { static sh_state s; return s; }
 
+/* One ACCEL facade, independent verified links. Only public weight metadata
+ * drives placement. Nonlinear operations, KV, pads and verification stay in the
+ * enclave; activations are never copied in the clear between host GPUs. */
+struct sh_pool {
+    std::mutex mu;
+    bool initialized = false, invalid = false;
+    std::vector<std::unique_ptr<sh_state>> extra;
+    std::vector<sh_state *> cards;
+    std::map<std::string, ggml_tensor> pending;
+    std::map<std::string, int> owners;       // activation group -> card, -1 = CPU
+    std::map<std::string, int> layers;
+};
+static sh_pool &sh_pool_get() { static sh_pool p; return p; }
+static void sh_pool_init(sh_pool &p);
+static int sh_owner(sh_pool &p, const ggml_tensor *w) {
+    auto it = p.owners.find(sh_group_key(ggml_get_name(w)));
+    return it == p.owners.end() ? -1 : it->second;
+}
+static void sh_plan(sh_pool &p);
+
 /* The correction every site's calibrated exponent gets: the file format's own
  * (see calib_version) plus the process-wide SHIELDED_AF_DELTA. */
 static int sh_af_delta(const sh_state &s) { return (s.calib_version == 1 ? -5 : 0) + sh_af_delta_env(); }
@@ -273,11 +298,23 @@ void ggml_backend_shielded_configure(const char *host, int port, const char *cal
     s.configured = true;
 }
 
+int ggml_backend_shielded_pool_version(void) { return 1; }
+
 extern "C" double sh_prof[8];
 void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, uint64_t *vf) {
-    sh_state &s = sh_get();
+    sh_pool &p = sh_pool_get();
+    std::lock_guard<std::mutex> lock(p.mu);
+    sh_pool_init(p);
+    if (off) *off = 0;
+    if (loc) *loc = 0;
+    if (macs) *macs = 0;
+    if (vf) *vf = 0;
+    for (size_t card = 0; card < p.cards.size(); card++) {
+    sh_state &s = *p.cards[card];
     std::lock_guard<std::mutex> lk(s.mu);
     if (getenv("SHIELDED_PROFILE")) {
+        fprintf(stderr, "[shielded] card %zu %s:%d device_bytes=%lld reserve_cap=%lld\n",
+                card, s.host.c_str(), s.port, (long long)s.device_bytes, (long long)s.reserve_cap);
         uint64_t used = 0, missed = 0;
         if (s.link) sh_link_pool_stats(s.link, &used, &missed);
         fprintf(stderr, "[shielded] profile: exchanges=%llu nodes=%llu (completions=%llu served=%llu) | link: mask=%.1fms wire=%.1fms "
@@ -290,10 +327,11 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
                 (int)s.contended, (unsigned long long)s.contention_events,
                 sh_link_simd()->name, s.link ? sh_link_refill_threads(s.link) : 0);
     }
-    if (off)  *off  = s.offloaded_nodes;
-    if (loc)  *loc  = s.local_nodes;
-    if (macs) *macs = s.macs;
-    if (vf)   *vf   = s.verify_fail;
+    if (off)  *off  += s.offloaded_nodes;
+    if (loc)  *loc  += s.local_nodes;
+    if (macs) *macs += s.macs;
+    if (vf)   *vf   += s.verify_fail;
+    }
 }
 
 /* Read the environment once, so enabling the tier is launch configuration rather
@@ -319,6 +357,63 @@ static void sh_env_defaults(sh_state &s) {
             s.reserve_cap = (int64_t)((double)v * frac);
         }
     }
+}
+
+/* Manager-generated records: host|tcp-port|vsock-port|reservation-bytes,
+ * one per line. Strict parsing is fail-closed: a malformed pool must never
+ * turn a paid slice into the legacy uncapped single-worker connection. */
+static void sh_pool_init(sh_pool &p) {
+    if (p.initialized) return;
+    p.initialized = true;
+    p.cards.push_back(&sh_get());
+    const char *env = getenv("SHIELDED_WORKERS");
+    if (!env) return;
+    auto reject = [&]() {
+        p.invalid = true;
+        p.cards.resize(1);
+        p.extra.clear();
+        fprintf(stderr, "[shielded] invalid worker pool; all operations stay on CPU\n");
+    };
+    if (!*env || strlen(env) > 8192) { reject(); return; }
+    std::istringstream lines(env);
+    std::string line;
+    std::set<std::string> endpoints;
+    std::vector<std::unique_ptr<sh_state>> parsed;
+    while (std::getline(lines, line)) {
+        std::vector<std::string> parts;
+        std::istringstream fields(line);
+        std::string part;
+        while (std::getline(fields, part, '|')) parts.push_back(part);
+        if (parts.size() != 4 || parts[0].empty() || parts[0].size() > 127 || parsed.size() >= 16 ||
+            parts[0].find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-") != std::string::npos) { reject(); return; }
+        uint64_t nums[3];
+        for (int i = 0; i < 3; i++) {
+            if (parts[i+1].empty() || parts[i+1].find_first_not_of("0123456789") != std::string::npos || parts[i+1].size() > 15) { reject(); return; }
+            nums[i] = strtoull(parts[i+1].c_str(), nullptr, 10);
+        }
+        if (nums[0] < 1 || nums[0] > 65535 || nums[1] > (1U << 30) || nums[2] < 1 || nums[2] > (1ULL << 50) ||
+            !endpoints.insert(parts[0] + ":" + std::to_string(nums[0])).second) { reject(); return; }
+        auto s = std::make_unique<sh_state>();
+        sh_env_defaults(*s);
+        s->host = parts[0]; s->port = (int)nums[0]; s->vsock_port = (int)nums[1];
+        s->reserve_bytes = nums[2]; s->explicit_link = true;
+        double frac = getenv("SHIELDED_WEIGHT_BUDGET_FRAC") ? atof(getenv("SHIELDED_WEIGHT_BUDGET_FRAC")) : .90;
+        if (!(frac > .1 && frac <= 1)) frac = .90;
+        s->reserve_cap = std::max<int64_t>(1, (int64_t)(nums[2] * frac));
+        parsed.push_back(std::move(s));
+    }
+    if (parsed.empty()) { reject(); return; }
+    // A single process-wide refill budget, divided over links. More cards must
+    // not create N copies of the old ncores/2 thread pool.
+    int threads = sh_env_int("SHIELDED_REFILL_THREADS", (int)std::max(1U, std::thread::hardware_concurrency()/2));
+    threads = std::max(0, std::min(64, threads));
+    p.cards.clear();
+    for (size_t i = 0; i < parsed.size(); i++) {
+        parsed[i]->refill_threads = threads / (int)parsed.size() + ((int)i < threads % (int)parsed.size());
+        p.cards.push_back(parsed[i].get());
+    }
+    p.extra = std::move(parsed);
+    SH_LOG("pool: %zu workers, %d total refill threads\n", p.cards.size(), threads);
 }
 
 static void sh_load_calib(sh_state &s) {
@@ -466,6 +561,7 @@ static bool sh_register(sh_state &s, const ggml_tensor *w) {
         int err = SH_OK;
         s.link = sh_link_open(s.host.c_str(), s.port, true, &err);
         if (!s.link) { s.link_failed = true; return false; }
+        if (s.explicit_link) sh_link_configure(s.link, s.vsock_port, s.reserve_bytes, s.refill_threads);
     }
     int lo = e.f_w[0], hi = e.f_w[0];
     for (int64_t j = 1; j < N; j++) { if (e.f_w[j] < lo) lo = e.f_w[j]; if (e.f_w[j] > hi) hi = e.f_w[j]; }
@@ -492,6 +588,64 @@ static bool sh_register(sh_state &s, const ggml_tensor *w) {
     return true;
 }
 
+static std::string sh_layer_key(const std::string &name) {
+    const size_t blk = name.find("blk.");
+    if (blk != std::string::npos) {
+        const size_t end = name.find('.', blk + 4);
+        if (end != std::string::npos) return name.substr(0, end);
+    }
+    return sh_group_key(name);
+}
+static int64_t sh_weight_bytes(const ggml_tensor &w) {
+    return w.ne[0] * w.ne[1] + (int64_t)sh_max_m() * (3*w.ne[0] + 4*w.ne[1]);
+}
+static void sh_plan(sh_pool &p) {
+    if (p.invalid || p.pending.empty()) return;
+    using weights = std::vector<const ggml_tensor *>;
+    std::map<std::string, std::map<std::string, weights>> layers;
+    for (auto &kv : p.pending)
+        layers[sh_layer_key(kv.first)][sh_group_key(kv.first)].push_back(&kv.second);
+    auto fit = [&](int c, int64_t bytes) {
+        auto &s = *p.cards[c];
+        return !s.reserve_cap || s.device_bytes + bytes <= s.reserve_cap;
+    };
+    auto choose = [&](int64_t bytes) {
+        int best = -1;
+        for (size_t c = 0; c < p.cards.size(); c++) {
+            if (!fit((int)c, bytes)) continue;
+            auto &s = *p.cards[c];
+            if (best < 0) { best = (int)c; continue; }
+            auto &b = *p.cards[best];
+            const double used = (double)s.device_bytes / (s.reserve_cap ? s.reserve_cap : INT64_MAX);
+            const double prev = (double)b.device_bytes / (b.reserve_cap ? b.reserve_cap : INT64_MAX);
+            if (used < prev || (used == prev && s.reserve_cap > b.reserve_cap)) best = (int)c;
+        }
+        return best;
+    };
+    for (auto &layer : layers) {
+        int64_t total = 0;
+        for (auto &g : layer.second) for (auto *w : g.second) total += sh_weight_bytes(*w);
+        auto prev = p.layers.find(layer.first);
+        int preferred = prev == p.layers.end() ? choose(total) : prev->second;
+        // Prefer keeping a whole layer together. If it exceeds any one slice,
+        // place indivisible activation groups across cards, then CPU overflow.
+        for (auto &g : layer.second) {
+            int64_t bytes = 0;
+            for (auto *w : g.second) bytes += sh_weight_bytes(*w);
+            auto old = p.owners.find(g.first);
+            int card = old != p.owners.end() ? old->second :
+                preferred >= 0 && fit(preferred, bytes) ? preferred : choose(bytes);
+            p.owners[g.first] = card;
+            if (card < 0) { SH_LOG("placement %s -> CPU (pool reservation full)\n", g.first.c_str()); continue; }
+            if (prev == p.layers.end()) p.layers[layer.first] = card;
+            SH_LOG("placement %s -> card %d %s:%d (%lld bytes)\n", g.first.c_str(), card,
+                   p.cards[card]->host.c_str(), p.cards[card]->port, (long long)bytes);
+            for (auto *w : g.second) sh_register(*p.cards[card], w);
+        }
+    }
+    p.pending.clear();
+}
+
 /* --------------------------------------------------------------------------
  * The backend
  * ----------------------------------------------------------------------- */
@@ -499,8 +653,8 @@ static const char *ggml_backend_shielded_get_name(ggml_backend_t) { return "Shie
 static void ggml_backend_shielded_free(ggml_backend_t backend) { delete backend; }
 
 /* Claimable at all: a calibrated q8_0 weight times an f32 activation, above the
- * size floor. Registers the weight on first sight of its data, so that every
- * weight is known before the first exchange and the worker is set up once.
+ * size floor. Collects the public weight metadata on first sight of its data,
+ * so the planner knows complete layer sizes before the first exchange.
  * `batch_ok` additionally applies the batch-width policy. */
 static bool sh_claimable(const ggml_tensor *op, bool batch_ok) {
     if (op->op != GGML_OP_MUL_MAT) return false;
@@ -520,15 +674,21 @@ static bool sh_claimable(const ggml_tensor *op, bool batch_ok) {
     const char *nm = ggml_get_name(src0);
     if (!nm || !*nm) return false;
     if (src0->ne[0] * src0->ne[1] < sh_min_macs()) return false;
-    sh_state &s = sh_get();
-    std::lock_guard<std::mutex> lk(s.mu);
-    if (!sh_site_for(s, nm)) return false;
-    /* ggml also asks about ops built on tensors whose data is not loaded yet
-     * (buffer-type selection at model load); those cannot be registered and
-     * must not be refused either. */
-    if (src0->data && !s.link_failed && !sh_register(s, src0)) return false;
+    sh_pool &p = sh_pool_get();
+    std::lock_guard<std::mutex> lk(p.mu);
+    sh_pool_init(p);
+    if (p.invalid || !sh_site_for(*p.cards[0], nm)) return false;
+    // Collect public weight metadata during scheduler reservation. The first
+    // graph then plans whole layers with all their sizes known, rather than
+    // filling one GPU while supports_op discovers tensors one at a time.
+    int owner = sh_owner(p, src0);
+    if (src0->data && (owner < 0 || !p.cards[owner]->weights.count(nm)) && !p.owners.count(sh_group_key(nm)))
+        p.pending[nm] = *src0;
+    else if (src0->data && owner >= 0 && !p.cards[owner]->weights.count(nm) && !p.cards[owner]->refused.count(nm))
+        p.pending[nm] = *src0;
     if (batch_ok && src1->ne[1] > sh_max_m()) return false;
-    if (s.contended && sh_group_key(nm) != s.probe_group) return false;   /* the enclave's CPU is faster than a starved card */
+    if (p.owners.count(sh_group_key(nm)) && owner < 0) return false;
+    if (owner >= 0 && p.cards[owner]->contended && sh_group_key(nm) != p.cards[owner]->probe_group) return false;
     return true;
 }
 
@@ -680,17 +840,12 @@ static void sh_link_down(sh_state &s) {
     s.link_backoff_ms = s.link_backoff_ms < 60000 ? s.link_backoff_ms * 2 : 60000;
 }
 
-static enum ggml_status ggml_backend_shielded_graph_compute(ggml_backend_t, ggml_cgraph *cgraph) {
-    sh_state &s = sh_get();
+static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
     std::lock_guard<std::mutex> lk(s.mu);
     const double tg0 = sh_now_ms();
     const sh_simd *simd = sh_link_simd();
 
     const int n = ggml_graph_n_nodes(cgraph);
-    for (int i = 0; i < n; i++) {
-        ggml_tensor *node = ggml_graph_node(cgraph, i);
-        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->data) sh_register(s, node->src[0]);
-    }
     /* A failed link is retried once its backoff has passed: the same start
      * path as the first connection, carrying the whole weight set again. */
     if (s.link_failed && s.link && sh_now_ms() >= s.link_retry_at) { s.link_failed = false; s.dirty = true; }
@@ -931,9 +1086,60 @@ static enum ggml_status ggml_backend_shielded_graph_compute(ggml_backend_t, ggml
      * and the tenant's stderr (the owner's /logs) is the only channel out of
      * the guest. Counters only -- never a value that crossed or was masked. */
     if (s.contended) s.contended_graphs++;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_shielded_graph_compute(ggml_backend_t, ggml_cgraph *graph) {
+    sh_pool &p = sh_pool_get();
+    std::unique_lock<std::mutex> lk(p.mu);
+    sh_pool_init(p);
+    // Direct backend callers do not necessarily run supports_op first.
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const auto *node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[0]->data) continue;
+        const auto *w = node->src[0];
+        const std::string name = ggml_get_name(w);
+        int owner = sh_owner(p, w);
+        if (!p.invalid && w->type == GGML_TYPE_Q8_0 && sh_site_for(*p.cards[0], name.c_str()) &&
+            !p.owners.count(sh_group_key(name))) p.pending[name] = *w;
+        else if (!p.invalid && owner >= 0 && !p.cards[owner]->weights.count(name) && !p.cards[owner]->refused.count(name))
+            p.pending[name] = *w;
+    }
+    sh_plan(p);
+    // Preserve dependency order. Each contiguous run belongs to one link;
+    // completion caches still combine q/k/v or gate/up across scheduler splits.
+    for (int i = 0; i < graph->n_nodes;) {
+        auto *node = graph->nodes[i];
+        if (sh_is_meta(node)) { i++; continue; }
+        if (node->op != GGML_OP_MUL_MAT) return GGML_STATUS_FAILED;
+        const int owner = sh_owner(p, node->src[0]);
+        if (p.invalid || owner < 0) {
+            sh_plain_mul_mat(node->src[0], node->src[1], node);
+            p.cards[0]->local_nodes++; i++; continue;
+        }
+        int end = i + 1;
+        while (end < graph->n_nodes) {
+            const auto *next = graph->nodes[end];
+            if (!sh_is_meta(next) && (next->op != GGML_OP_MUL_MAT || sh_owner(p, next->src[0]) != owner)) break;
+            end++;
+        }
+        ggml_cgraph view = {};
+        view.n_nodes = view.size = end - i;
+        view.nodes = graph->nodes + i;
+        view.order = graph->order;
+        auto rc = sh_card_compute(*p.cards[owner], &view);
+        if (rc != GGML_STATUS_SUCCESS) return rc;
+        i = end;
+    }
     if (getenv("SHIELDED_PROFILE")) {
         static uint64_t last = 0;
-        if (s.exchanges - last >= 4096) { last = s.exchanges; s.mu.unlock(); ggml_backend_shielded_stats(nullptr, nullptr, nullptr, nullptr); s.mu.lock(); }
+        uint64_t exchanges = 0;
+        for (auto *s : p.cards) exchanges += s->exchanges;
+        if (exchanges - last >= 4096) {
+            last = exchanges;
+            lk.unlock();
+            ggml_backend_shielded_stats(nullptr, nullptr, nullptr, nullptr);
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

@@ -46,6 +46,9 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_shielded_reg(void);
 GGML_BACKEND_API void ggml_backend_shielded_configure(const char *host, int port,
                                                       const char *calib_path);
 
+/* Capability probe used by the manager before admitting a pooled tenant. */
+GGML_BACKEND_API int ggml_backend_shielded_pool_version(void);
+
 /* Counters for the boot probe and the supervisor's verdict. */
 GGML_BACKEND_API void ggml_backend_shielded_stats(uint64_t *offloaded_nodes,
                                                   uint64_t *local_nodes,

@@ -252,6 +252,21 @@ for (const [id, sw] of shieldedWorkers.entries()) {
   if (shieldedWorkers.length > 1 && sw.shm)
     throw new Error('Multi-GPU workers currently use TCP/vsock, not a shared-memory ring');
 }
+// Pool pricing is computed from each probed dedicated slice, never physical
+// VRAM or momentary benchmark speed. The existing registry price buys one pool.
+if (cfg.shieldedPool !== undefined) {
+  const p = cfg.shieldedPool;
+  if (!p || p.mode !== 'layers' || shieldedWorkers.length < 1)
+    throw new Error('shieldedPool needs mode "layers" and configured workers');
+  const pricing = p.pricing || {};
+  for (const key of ['tflopUsdHr', 'vramGiBUsdHr'])
+    if (!Number.isFinite(pricing[key]) || pricing[key] < 0 || pricing[key] > 100)
+      throw new Error(`shieldedPool.pricing.${key} must be a nonnegative hourly resource rate`);
+  if (!(pricing.tflopUsdHr + pricing.vramGiBUsdHr > 0))
+    throw new Error('shieldedPool pricing must be positive');
+  runtimeCfg.shieldedPool = { mode: 'layers', pricing,
+    cardIds: shieldedWorkers.map((_, id) => id) };
+}
 runtimeCfg.shieldedWorkers = [];
 for (const [id, sw] of shieldedWorkers.entries()) {
   const port = sw.port || 9500;

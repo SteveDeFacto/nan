@@ -160,7 +160,9 @@ class FleetList extends EnclaveElement {
           const shReservedGb = shPool ? shPool.reservedGb : 0;
           const shFree = shPool ? shPool.frac : 0;
           const shPct = Math.floor(shFree * 100);
-          const shVramTitle = shPool
+          const shVramTitle = sh?.pooled
+            ? fmtNum(shTotal) + ' GB combined across ' + sh.cardCount + ' GPUs. Each share reserves the same fraction of every card. Models are split automatically; overflow uses the enclave CPU.'
+            : shPool
             ? fmtNum(shPhysFreeGb) + ' GB of the ' + fmtNum(shTotal) + ' GB budget is free on the card'
               + (shReservedGb > 0 ? ' (' + fmtNum(shReservedGb) + ' GB is held by tenants)' : '')
               + ', and ' + shPct + '% is available to lease. A tenant reserves its share of the'
@@ -192,7 +194,8 @@ class FleetList extends EnclaveElement {
                 // keep the previous behaviour.
                 + ((sh.cardTflops || a.cardTflops) > 0
                     ? stat(fmtNum(shFree * (sh.cardTflops || a.cardTflops)), fmtNum(sh.cardTflops || a.cardTflops), "", "tflops available",
-                           "Rated dense fp16 for this card, the same basis every other box "
+                           (sh.pooled ? "Combined rated dense fp16 across the GPU pool. Model layers are distributed across cards; a single request is not guaranteed this aggregate throughput. " : "Rated dense fp16 for this card. ")
+                           + "The same basis every other box "
                            + "quotes, so boxes and shares compare like for like."
                            + (sh.gmacPerSec > 0
                                ? " The masked path itself sustains " + Math.round(sh.gmacPerSec)
@@ -209,7 +212,7 @@ class FleetList extends EnclaveElement {
                              + "figure, so the two columns are not directly comparable.")
                       : stat(esc(sh.card || "gpu"), "", "", "card")),
                 price.shielded) : "")
-            + (Array.isArray(a.shieldedCards) ? a.shieldedCards.filter(c => c.id !== sh?.id).map(c => {
+            + (!sh?.pooled && Array.isArray(a.shieldedCards) ? a.shieldedCards.filter(c => c.id !== sh?.id).map(c => {
                 const p = shieldedPoolOf({ availability: { shielded: c, gpuShareFree: c.gpuShareFree } });
                 if (!p) return "";
                 const badge = '<span class="ap-badge info" title="Shielded inference on the host GPU; masked inputs and verified results.">'

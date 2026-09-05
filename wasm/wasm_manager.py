@@ -46,6 +46,7 @@ Notes:
   models larger than HF's 50GB per-file cap load as one graph.
 """
 import collections
+import functools
 import hashlib
 import hmac
 import http.server
@@ -60,6 +61,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2221,7 +2223,9 @@ def _nn_arbiter_live() -> bool:
 
 
 def _nn_arb_queue(rec: dict) -> str:
-    """One fairness queue per physical shielded worker, bound to the launch record."""
+    """One fairness queue per worker or whole pool, bound to the launch record."""
+    if (rec.get("shielded") or {}).get("pooled"):
+        return "shielded:pool"
     endpoint = str((rec.get("shielded") or {}).get("endpoint") or "")
     return ("shielded:" + endpoint) if endpoint else "0"
 
@@ -2358,6 +2362,17 @@ SHIELDED_BACKEND_SO = os.environ.get("SHIELDED_BACKEND_SO", "/opt/enclave/shield
 SHIELDED_CALIB_DIR  = os.environ.get("SHIELDED_CALIB_DIR", "/opt/enclave/shielded/calib")
 
 
+@functools.lru_cache(maxsize=1)
+def _shielded_pool_available() -> bool:
+    """Probe the measured module, not just this manager's support for a field."""
+    try:
+        code = "import ctypes,sys; b=ctypes.CDLL(sys.argv[1]); sys.exit(0 if b.ggml_backend_shielded_pool_version()==1 else 1)"
+        return subprocess.run([sys.executable, "-c", code, SHIELDED_BACKEND_SO],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _shielded_profile_tail(rec: dict) -> None:
     """Echo the backend's profile lines from a shielded tenant's log to our own
     stdout, i.e. the guest console, i.e. the host's journal. The tenant's log is
@@ -2418,6 +2433,39 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
     env["CUDA_VISIBLE_DEVICES"] = ""          # there is no local card; do not let one be found
     env["ENCLAVE_GGML_N_GPU_LAYERS"] = "0"
 
+    env.pop("SHIELDED_WORKERS", None)
+    env.pop("SHIELDED_VSOCK_PORT", None)
+    workers = (spec or {}).get("workers")
+    if (spec or {}).get("pooled"):
+        if not isinstance(workers, list) or not 1 <= len(workers) <= 16:
+            raise ValueError("shielded pool needs 1..16 worker reservations")
+        records, endpoints, devices, card_ids, vsock_ports = [], set(), set(), set(), set()
+        total = 0
+        for worker in workers:
+            if not isinstance(worker, dict):
+                raise ValueError("invalid shielded pool worker")
+            endpoint = str(worker.get("endpoint") or "")
+            host, _, port = endpoint.rpartition(":")
+            if not re.fullmatch(r"[A-Za-z0-9._:-]{1,127}", host) or not port.isdecimal() or not 1 <= int(port) <= 65535:
+                raise ValueError("invalid shielded pool endpoint")
+            vport = int(worker.get("vsockPort") or 0)
+            reserve = int(float(worker.get("vramGb") or 0) * (1 << 30))
+            device = str(worker.get("deviceUuid") or "").lower()
+            card_id = worker.get("cardId")
+            endpoint = f"{host}:{int(port)}"
+            if type(card_id) is not int or not 0 <= card_id < 16 or endpoint in endpoints or (device and device in devices) or card_id in card_ids or (vport > 0 and vport in vsock_ports) or not 0 <= vport <= (1 << 30) or not 0 < reserve <= (1 << 50):
+                raise ValueError("invalid or duplicate shielded pool reservation")
+            endpoints.add(endpoint); devices.add(device); card_ids.add(card_id); vsock_ports.add(vport)
+            records.append(f"{host}|{int(port)}|{vport}|{reserve}")
+            total += reserve
+        advertised = int(float(spec.get("vramGb") or 0) * (1 << 30))
+        if abs(total - advertised) > len(workers):
+            raise ValueError("shielded pool total differs from worker reservations")
+        env["SHIELDED_WORKERS"] = "\n".join(records)
+        # Keep the first address for the engine's shielded-capability detection.
+        spec = {**spec, "endpoint": workers[0]["endpoint"], "vsockPort": workers[0].get("vsockPort", 0)}
+    elif workers is not None:
+        raise ValueError("worker reservations require a shielded pool")
     endpoint = str((spec or {}).get("endpoint") or "")
     host, _, port = endpoint.rpartition(":")
     env["SHIELDED_HOST"] = host or "10.0.2.2"
@@ -2470,8 +2518,8 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
     # that silently claims NOTHING is indistinguishable from one that is working:
     # both serve tokens, one just quietly ignores the card it is billing for.
     env.setdefault("SHIELDED_VERBOSE", "1")
-    # Host-configured tuning, applied LAST so metal/config.json's shieldedWorker.
-    # tenantEnv wins over every default above (that is what a knob is for). The
+    # Host-configured tuning is applied last. Routing, reservation and calibration
+    # fields remain bound to the launch spec; other tuning overrides defaults. The
     # one that exists today is SHIELDED_SPIN_US: the wire layer's bounded
     # MSG_DONTWAIT poll before it blocks on a reply, the guest-side answer to a
     # vhost-vsock exchange that costs 152 us in the CVM against 46 on the host.
@@ -2487,6 +2535,8 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
     if isinstance(te, dict):
         for k, v in te.items():
             k = str(k)
+            if k in {"SHIELDED_WORKERS", "SHIELDED_HOST", "SHIELDED_PORT", "SHIELDED_VSOCK_PORT", "SHIELDED_RESERVE_BYTES", "SHIELDED_CALIB"}:
+                continue  # routing, budget and model calibration come from the launch spec
             if not re.fullmatch(r"SHIELDED_[A-Z0-9_]{0,63}", k):
                 print(f"[shielded] tenantEnv: dropping {k[:40]!r} (only SHIELDED_* names may be set from host config)", flush=True)
                 continue
@@ -5309,7 +5359,13 @@ def _spawn_and_wait(rec, ctx):
         # per MODEL and this tenant attaches one volume in the shielded case; take
         # the first NAME in attach order rather than indexing a dict by 0.
         vol = next(iter(vol_mounts), "") if vol_mounts else ""
-        env = _shielded_tenant_env(shielded_spec, vol)
+        try:
+            if shielded_spec.get("pooled") and not _shielded_pool_available():
+                raise ValueError("shielded model-layer backend is unavailable")
+            env = _shielded_tenant_env(shielded_spec, vol)
+        except (ValueError, TypeError, OverflowError) as e:
+            rec["status"], rec["error"] = "failed", str(e)
+            return rec
         rec["shieldedEndpoint"] = shielded_spec.get("endpoint")
         # Same weighted turns as the CUDA branch below, same queue: shielded
         # tenants all funnel into ONE host worker whose g_gpu mutex serializes
@@ -6145,6 +6201,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {**live,
                                     "nn": _nn_available(),
                                     "nnProbe": dict(_NN_PROBE),
+                                    "shieldedPool": _shielded_pool_available(),
                                     # false = this binary predates wasmtime-loopback.patch, so
                                     # tenants run WITHOUT the cross-tenant wall (the launcher
                                     # cannot pass a flag that would fail every launch outright)

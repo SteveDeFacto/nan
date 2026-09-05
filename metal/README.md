@@ -186,12 +186,46 @@ Each worker receives its own `CUDA_VISIBLE_DEVICES`, probe, VRAM reservations,
 and inference fairness queue. Volta/V100 (`sm_70`) is included in the CUDA worker's
 default build. Rebuild the worker and update the measured guest image before
 activating multiple cards. TCP/vsock are supported; the shared-memory ring is
-currently single-worker only. A failed probe withdraws just that card's capacity.
-`/availability.shieldedCards` and `/v1/gpu` report the individual cards; legacy
-single-card sizing fields retain the smallest card's capacity. Each tenant uses
-one card; their VRAM is not combined. Node CPU admission still applies across all
-cards. Choose the same price for every card: the registry currently posts one
-shielded card-hour price for the node.
+currently single-worker only.
+
+To sell all cards as **one GPU pool**, add:
+
+```json
+"shieldedPool": {
+  "mode": "layers",
+  "pricing": { "tflopUsdHr": 0.001, "vramGiBUsdHr": 0.0045 }
+}
+```
+
+The GPU tag then shows combined **dedicated** VRAM and rated dense FP16 compute.
+A 10% GPU share reserves 10% of each worker's VRAM budget and compute, with a
+single fairness queue for pooled tenants. CPU admission remains independent.
+The pool hourly price is `TFLOPS × tflopUsdHr + GiB × vramGiBUsdHr`, rounded once
+to micro-USDC/second for the existing registry. It does not fluctuate with free
+memory or measured throughput. With a 20.4 TFLOPS / 6.5 GiB RTX slice and
+101.7 / 31 plus 113 / 31 V100 slices, the pool is 235.1 TFLOPS / 68.5 GiB at
+$0.5436/hour. Per-worker `priceUsdHr` is ignored in pool mode.
+
+The measured shielded backend distributes calibrated Q8_0 linear weights by
+layer across the reserved cards. It keeps a whole layer together when it fits;
+otherwise it places activation groups across cards and leaves overflow on CPU.
+Members sharing an activation (q/k/v, gate/up) always use the same worker and
+pad. Nonlinear operations, plaintext activations, KV, and verification stay
+inside the enclave. Unsupported or uncalibrated weights remain on CPU.
+Each worker link has its own reservation, transport and reconnection state;
+refill threads share one process-wide budget. Aggregate rated TFLOPS describe
+capacity, not the throughput of a single sequential inference.
+
+All configured workers must pass their boot proof before the pool opens. A
+failed worker withdraws **new pooled shares** until it recovers; existing tenants
+fall back to CPU for that worker's weights while other links continue. Totals
+and pricing remain stable. A restored pre-pool lease retains its original card
+until resize/reclaim replaces its reservation. The manager probes the built
+backend's pool capability before accepting pooled launches.
+
+Without `shieldedPool`, `shieldedWorkers` retains the legacy independent-card
+allocator and per-card sizing floor. Use equal `priceUsdHr` values in that mode,
+since the registry has one GPU price per node.
 
 `vramGb` is the part of the card dedicated to Enclave: the fleet sees a card of exactly
 that size, and the worker refuses to start if the card is smaller. It is held only as

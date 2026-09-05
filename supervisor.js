@@ -2445,7 +2445,8 @@ const rateFor = (gpuShare, cpuShare) => FULL_RATE * gpuShare + CPU_RATE * cpuSha
 function normalizeGpuReq(gpuShare, cpuShare) {
   const gpct = quantizePct(gpuShare);
   const cpct = quantizePct(cpuShare);
-  const v = Math.ceil((gpct / 100) * CARD_VRAM_GB / GRANULARITY_GB) * GRANULARITY_GB;
+  const v = _shieldedPool ? (gpct / 100) * CARD_VRAM_GB
+    : Math.ceil((gpct / 100) * CARD_VRAM_GB / GRANULARITY_GB) * GRANULARITY_GB;
   return { gpuShare: gpct / 100, cpuShare: cpct / 100, vramGb: v,
            computeShare: gpct / 100, computePct: gpct };
 }
@@ -2468,6 +2469,7 @@ function normalizeGpuReq(gpuShare, cpuShare) {
 // because the pool math reads it and the POOL_SELFTEST seam evaluates during
 // module init, which a later `let` would put in its temporal dead zone.
 let _shieldedAdopted = false;
+let _shieldedPool = null;
 const ctxOverheadGb = () => (_shieldedAdopted ? 0 : CTX_OVERHEAD_GB);
 
 // reserve an arbitrary slice on a single card (best-fit on VRAM) PLUS the
@@ -2478,6 +2480,21 @@ const cardFreeVram = c => c.shielded
   ? (c.available ? Math.min(c.vramFree, c.proof?.vramFreeGb || 0) : 0)
   : c.vramFree;
 function allocGpu(vramGb, computeShare, cpuShare) {
+  if (_shieldedPool) {
+    if (!(computeShare > 0) || cpuPool.shareFree < cpuShare - 1e-9) return null;
+    const shares = _shieldedPool.cardIds.map(id => ({ cardId: id, computeShare,
+      vramGb: computeShare * cardVram(gpuCards[id]),
+      _needV: computeShare * cardVram(gpuCards[id]) }));
+    if (shares.some(h => cardFreeVram(gpuCards[h.cardId]) < h._needV - 1e-9 ||
+        gpuCards[h.cardId].computeFree < computeShare - 1e-9)) return null;
+    for (const h of shares) {
+      gpuCards[h.cardId].vramFree -= h._needV;
+      gpuCards[h.cardId].computeFree -= computeShare;
+    }
+    cpuPool.shareFree -= cpuShare;
+    return { pooled: true, cardId: shares[0].cardId, cards: shares,
+      vramGb: shares.reduce((sum, h) => sum + h.vramGb, 0), computeShare, cpuShare };
+  }
   const need = c => c.shielded
     ? Math.max(vramGb, Math.ceil(computeShare * cardVram(c) / GRANULARITY_GB) * GRANULARITY_GB)
     : vramGb + ctxOverheadGb();
@@ -2497,16 +2514,21 @@ function releaseGpu(h) {
   if (!h) return;
   if (h.cpu) { cpuPool.shareFree = Math.min(1, cpuPool.shareFree + h.share); return; }
   cpuPool.shareFree = Math.min(1, cpuPool.shareFree + (h.cpuShare || 0));
-  const card = gpuCards[h.cardId]; if (!card) return;
-  card.vramFree = Math.min(cardVram(card), card.vramFree + h._needV);
-  card.computeFree = Math.min(1, card.computeFree + h.computeShare);
+  for (const slice of h.cards || [h]) {
+    const card = gpuCards[slice.cardId]; if (!card) continue;
+    card.vramFree = Math.min(cardVram(card), card.vramFree + slice._needV);
+    card.computeFree = Math.min(1, card.computeFree + slice.computeShare);
+  }
 }
 // largest slice a single card can still take (VRAM net of overhead; compute share)
-const maxFreeVram    = () => Math.max(0, ...gpuCards.map(c => cardFreeVram(c) - ctxOverheadGb()));
-const maxFreeCompute = () => Math.max(0, ...gpuCards.map(c => c.computeFree));
+const maxFreeVram    = () => _shieldedPool ? maxFreeGpuShare() * CARD_VRAM_GB
+  : Math.max(0, ...gpuCards.map(c => cardFreeVram(c) - ctxOverheadGb()));
+const maxFreeCompute = () => _shieldedPool ? Math.min(...gpuCards.map(c => c.computeFree))
+  : Math.max(0, ...gpuCards.map(c => c.computeFree));
 // largest GPU share a single card can still take (vram + compute must fit together)
-const maxFreeGpuShare = () => !IS_GPU ? 0 : Math.max(0, ...gpuCards.map(c =>
-  Math.min(c.computeFree, (cardFreeVram(c) - ctxOverheadGb()) / cardVram(c) || 0)));
+const maxFreeGpuShare = () => !IS_GPU ? 0 : Math.max(0,
+  (_shieldedPool ? Math.min : Math.max)(...gpuCards.map(c =>
+    Math.min(c.computeFree, (cardFreeVram(c) - ctxOverheadGb()) / cardVram(c) || 0))));
 
 const _applyGpu = (text) => {
   let got = 0; const totals = [];
@@ -2691,8 +2713,10 @@ function loadState() {
       if (r._gpu.cpu) cpuPool.shareFree = Math.max(0, cpuPool.shareFree - r._gpu.share);
       else {
         cpuPool.shareFree = Math.max(0, cpuPool.shareFree - (r._gpu.cpuShare || 0));
-        const card = gpuCards[r._gpu.cardId];
-        if (card) { card.vramFree -= r._gpu._needV; card.computeFree -= r._gpu.computeShare; }
+        for (const h of r._gpu.cards || [r._gpu]) {
+          const card = gpuCards[h.cardId];
+          if (card) { card.vramFree -= h._needV; card.computeFree -= h.computeShare; }
+        }
       }
     }
     if (r.status === "running") {
@@ -2734,8 +2758,10 @@ function reconcilePools() {
     if (TERMINAL_STATUSES.has(r.status)) { r._gpu = null; saveStateSoon(); continue; }
     if (h.cpu) { held.cpu += h.share; continue; }
     held.cpu += h.cpuShare || 0;
-    const c = held.cards[h.cardId];
-    if (c) { c.vram += (h._needV != null ? h._needV : h.vramGb + CTX_OVERHEAD_GB); c.compute += h.computeShare; }
+    for (const slice of h.cards || [h]) {
+      const c = held.cards[slice.cardId];
+      if (c) { c.vram += (slice._needV != null ? slice._needV : slice.vramGb + ctxOverheadGb()); c.compute += slice.computeShare; }
+    }
   }
   const fixed = [];
   const apply = (obj, key, want, label, fmt) => {
@@ -3139,6 +3165,7 @@ function launchSpecFrom(rec, sec, hosts) {
   return { deploymentId: rec.id,
     cardId: rec._gpu?.cardId ?? rec.resources?.cardId ?? 0,
     gpuVramGb: rec._gpu?.vramGb,
+    gpuCardsHeld: rec._gpu?.cards,
     gpuShare: rec.resources.gpuShare || 0, cpuShare: rec.resources.cpuShare,
     image: { reference: rec.appWasm || (rec.image && rec.image.reference) },
     appPort: rec.network.port, ports: rec.firewall,
@@ -3159,7 +3186,7 @@ if (process.env.LAUNCH_SPEC_SELFTEST) {
   })));
   process.exit(0);
 }
-async function spawnContainer({ deploymentId, gpuShare, cpuShare, cardId, gpuVramGb, image, appPort, ports, config, configCid, secrets, hosts }) {
+async function spawnContainer({ deploymentId, gpuShare, cpuShare, cardId, gpuVramGb, gpuCardsHeld, image, appPort, ports, config, configCid, secrets, hosts }) {
   // Two backends. "vm": hand the app reference to the app manager on VMMGR_URL
   // (the wasm-manager runs it as a `wasmtime serve` process; cpuShare is its
   // admission unit and sets the guest memory cap — cpuShare × node RAM;
@@ -3185,8 +3212,8 @@ async function spawnContainer({ deploymentId, gpuShare, cpuShare, cardId, gpuVra
     // the flag unconditionally is safe -- a manager that predates it ignores an
     // unknown field, and on such a manager gpuShare would simply fail to launch,
     // which is the correct outcome rather than a silently unshielded tenant.
-    const shieldedCard = g > 0 ? shieldedCapacity(cardId ?? 0) : null;
-    const shieldedSpec = g > 0 && _shieldedAdopted ? shieldedLaunchSpec(cardId, g, gpuVramGb) : null;
+    const shieldedCard = g > 0 ? shieldedCapacity(_shieldedPool ? null : cardId ?? 0) : null;
+    const shieldedSpec = g > 0 && _shieldedAdopted ? shieldedLaunchSpec(cardId, g, gpuVramGb, gpuCardsHeld) : null;
     const r = await vmReq("POST", "/vms",
       { image: ref, cpuShare: c, gpuShare: g,
         ...(shieldedSpec ? { shielded: shieldedSpec } : {}),
@@ -4634,17 +4661,24 @@ function adoptShieldedCards(values) {
     card.proof = v;
     card.uuid = v.deviceUuid || card.uuid;
   }
-  GPU_COUNT = gpuCards.length;
+  GPU_COUNT = _shieldedPool ? 1 : gpuCards.length;
   // Legacy consumers have one sizing unit. Use a conservative per-card floor;
   // each actual allocation and launch uses the selected card's own budget.
   const known = gpuCards.filter(c => c.shielded && c.vramTotal > 0);
-  CARD_VRAM_GB = Math.min(...known.map(c => c.vramTotal));
+  const combine = xs => _shieldedPool ? xs.reduce((a, b) => a + b, 0) : Math.min(...xs);
+  CARD_VRAM_GB = combine(known.map(c => c.vramTotal));
   const rated = known.map(c => c.proof?.cardTflops || (c.proof?.gmacPerSec || 0) * 2 / 1000).filter(v => v > 0);
-  if (rated.length) CARD_TFLOPS = round1(Math.min(...rated));
+  if (rated.length) CARD_TFLOPS = round1(combine(rated));
   const sms = known.map(c => c.proof?.smCount || 0).filter(v => v > 0);
-  if (sms.length) SM_TOTAL = Math.min(...sms);
+  if (sms.length) SM_TOTAL = combine(sms);
   const prices = known.map(c => c.proof?.pricePerSec6 || 0).filter(v => v > 0);
-  if (prices.length) SELL_GPU_PRICE6 = Math.min(...prices);
+  if (_shieldedPool) {
+    const rate = _shieldedPool.pricing;
+    SELL_GPU_PRICE6 = Math.round((CARD_TFLOPS * rate.tflopUsdHr + CARD_VRAM_GB * rate.vramGiBUsdHr) * 1e6 / 3600);
+  } else if (prices.length) SELL_GPU_PRICE6 = Math.min(...prices);
+  // Reconstruct every sibling's holds after discovery (restored arrays may
+  // predate the probe that creates card 1..N in this process).
+  if (_shieldedPool) reconcilePools();
 }
 
 const SHIELDED_VERDICT = process.env.SHIELDED_VERDICT || "/run/shielded-gpu.json";
@@ -4653,13 +4687,22 @@ function shieldedCapacity(cardId = null) {
   const now = Date.now();
   if (now - _shieldedCache.at >= 10_000) {
     const cards = [], ids = new Set(), endpoints = new Set(), devices = new Set();
+    let pool = null;
     try {
       const raw = JSON.parse(readFileSync(SHIELDED_VERDICT, "utf8"));
+      const rp = raw?.pool;
+      if (rp?.mode === "layers" && Array.isArray(rp.cardIds) && rp.cardIds.length > 0 && rp.cardIds.length <= 16 &&
+          rp.cardIds.every((id, i) => id === i) &&
+          [rp.pricing?.tflopUsdHr, rp.pricing?.vramGiBUsdHr].every(v => Number.isFinite(v) && v >= 0 && v <= 100) &&
+          rp.pricing.tflopUsdHr + rp.pricing.vramGiBUsdHr > 0) pool = rp;
+      // A pool cannot silently degrade into separately priced cards.
+      if (rp && !pool) throw new Error("invalid shielded pool");
       for (const v of Array.isArray(raw?.cards) ? raw.cards : [raw]) {
         const id = v?.id === undefined ? 0 : Number(v.id);
         if (!v || !v.exact || !v.verified || !v.lie_rejected || !v.denylist_refused || !(v.vram_total_gb > 0)) continue;
         if (!Number.isInteger(id) || id < 0 || id >= 16 || ids.has(id) || !v.endpoint || endpoints.has(v.endpoint)) continue;
         if (v.deviceUuid && devices.has(String(v.deviceUuid).toLowerCase())) continue;
+        if (pool && (!Number.isFinite(v.card_tflops) || v.card_tflops <= 0 || !(v.vram_budget_gb > 0))) continue;
         ids.add(id); endpoints.add(v.endpoint); if (v.deviceUuid) devices.add(String(v.deviceUuid).toLowerCase());
         cards.push({
         id,
@@ -4698,14 +4741,52 @@ function shieldedCapacity(cardId = null) {
       }
     } catch {} // An absent or malformed verdict withdraws capacity, not leases.
     for (const card of gpuCards) if (card.shielded) card.available = false;
+    if (pool && !_shieldedPool) {
+      // Do not publish or admit a fraction of a pool while its siblings are
+      // still booting. Once adopted, retain the total through probe failures.
+      if (cards.length !== pool.cardIds.length || !pool.cardIds.every(id => cards.some(c => c.id === id))) cards.length = 0;
+      else _shieldedPool = pool;
+    }
+    if (_shieldedPool && (!pool || JSON.stringify(pool.cardIds) !== JSON.stringify(_shieldedPool.cardIds))) cards.length = 0;
+    if (_shieldedPool) {
+      for (let i = cards.length - 1; i >= 0; i--) if (!_shieldedPool.cardIds.includes(cards[i].id)) cards.splice(i, 1);
+    }
     adoptShieldedCards(cards);
     _shieldedCache = { at: now, cards };
   }
-  return cardId == null ? (_shieldedCache.cards[0] || null)
+  return cardId == null ? (_shieldedPool ? shieldedPoolCapacity() : (_shieldedCache.cards[0] || null))
     : (_shieldedCache.cards.find(c => c.id === Number(cardId)) || null);
 }
 
-function shieldedLaunchSpec(cardId, gpuShare, vramGb) {
+function shieldedPoolCapacity() {
+  const cards = _shieldedPool.cardIds.map(id => gpuCards[id]?.proof).filter(Boolean);
+  if (cards.length !== _shieldedPool.cardIds.length) return null;
+  const sum = key => cards.reduce((a, c) => a + (Number(c[key]) || 0), 0);
+  return { pooled: true, mode: "layers", card: "GPU", cardCount: cards.length,
+    vramGb: CARD_VRAM_GB, vramBudgetGb: CARD_VRAM_GB,
+    vramFreeGb: maxFreeGpuShare() * CARD_VRAM_GB,
+    vramReservedGb: sum("vramReservedGb"), cardTflops: CARD_TFLOPS,
+    smCount: SM_TOTAL, pricePerSec6: SELL_GPU_PRICE6,
+    pricing: _shieldedPool.pricing, endpoint: cards[0].endpoint,
+    available: _shieldedPool.cardIds.every(id => gpuCards[id].available),
+  };
+}
+
+function shieldedLaunchSpec(cardId, gpuShare, vramGb, heldCards) {
+  // A restored legacy handle still reserves one card. Keep its route until a
+  // resize/reclaim replaces the handle; never grant unbooked sibling VRAM.
+  if (_shieldedPool && (heldCards || vramGb == null)) {
+    const holds = heldCards || _shieldedPool.cardIds.map(id => ({ cardId: id, vramGb: gpuShare * cardVram(gpuCards[id]) }));
+    const workers = holds.map(h => {
+      const card = shieldedCapacity(h.cardId);
+      if (!card) throw new Error(`Shielded GPU ${h.cardId} is unavailable; refusing a partial pool launch`);
+      return { cardId: card.id, deviceUuid: card.deviceUuid, endpoint: card.endpoint,
+        vsockPort: card.vsockPort || 0, vramGb: h.vramGb };
+    });
+    return { pooled: true, mode: "layers", endpoint: workers[0].endpoint, workers,
+      vramGb: workers.reduce((a, w) => a + w.vramGb, 0),
+      tenantEnv: gpuCards[workers[0].cardId].proof.tenantEnv || {} };
+  }
   const card = shieldedCapacity(cardId ?? 0);
   if (!card) throw new Error(`Shielded GPU ${cardId ?? 0} is unavailable; refusing to route its lease to another card`);
   return {
@@ -4734,12 +4815,13 @@ if (process.env.SHIELDED_POOL_SELFTEST) {
     }
     if (action.launch) {
       const h = handles.get(action.launch);
-      try { route = shieldedLaunchSpec(h.cardId, h.computeShare, h.vramGb); }
+      try { route = shieldedLaunchSpec(h.cardId, h.computeShare, h.vramGb, h.cards); }
       catch (e) { error = e.message; }
     }
     if (action.release) { releaseGpu(handles.get(action.release)); handles.delete(action.release); deployments.delete(action.release); }
     if (action.reconcile) reconcilePools();
     results.push({ handle, route, error, free: maxFreeGpuShare(), cpu: maxFreeCpu(),
+      capacity: shieldedCapacity(), pricePerSec6: SELL_GPU_PRICE6, sizingUnits: GPU_COUNT,
       cards: gpuCards.map(c => ({ id: c.id, total: cardVram(c), free: c.vramFree, available: c.available })) });
   }
   console.log(JSON.stringify(results)); process.exit(0);
@@ -4794,6 +4876,7 @@ app.get("/availability", async (_req, res) => {
     vramFreeGb: IS_GPU ? round1(gpuFree * CARD_VRAM_GB) : 0,
     gpuTflopsFree: IS_GPU ? round1(gpuFree * CARD_TFLOPS) : 0,
     cardVramGb: IS_GPU ? CARD_VRAM_GB : 0, cardTflops: IS_GPU ? CARD_TFLOPS : 0, cards: GPU_COUNT,
+    ...(_shieldedPool ? { gpuPool: "layers", physicalGpuCount: gpuCards.length } : {}),
     ...(IS_GPU ? { cardVramSource: CARD_VRAM_SRC } : {}),   // "nvidia-smi"/"manager"/"worker" = probed hardware; "env"/"default" = config fallback
     ...(() => {
       const sh = shieldedCapacity();
@@ -4866,7 +4949,7 @@ app.get("/availability", async (_req, res) => {
     // A verdict that has gone away means the path is not provable right now:
     // advertise no free capacity, without retracting the card itself.
     const shNow = shieldedCapacity();
-    const gpuFree = !IS_GPU ? 0
+    const gpuFree = !IS_GPU || (_shieldedPool && h.shieldedPool !== true) ? 0
       : shNow ? maxFreeGpuShare()
       : _shieldedAdopted ? 0
       : PROVISION_BACKEND === "vm" ? Math.min(maxFreeGpuShare(), c.gpuShareFree ?? Infinity)
@@ -4972,7 +5055,7 @@ app.get("/availability", async (_req, res) => {
 app.get("/v1/gpu", async (_req, res) => {
   shieldedCapacity();
   if (_shieldedAdopted) return res.json({
-    ok: true, role: "shielded", cards: gpuCards.filter(c => c.shielded).map(c => ({
+    ok: true, role: "shielded", ...(_shieldedPool ? { pool: shieldedPoolCapacity() } : {}), cards: gpuCards.filter(c => c.shielded).map(c => ({
       ...c.proof, id: c.id, available: !!c.available,
       vramBudgetGb: cardVram(c), vramLedgerFreeGb: round3(c.vramFree),
       vramFreeGb: round3(Math.max(0, cardFreeVram(c))),
@@ -8637,6 +8720,8 @@ async function considerClaim(d, { hinted = false, forced = false, background = f
       return "GPU interface not ready (CUDA readiness probe: " + h.nnProbe.state + ")";
     if (shReady && !shReady.endpoint)
       return "shielded GPU has no worker endpoint";
+    if (_shieldedPool && h.shieldedPool !== true)
+      return "shielded model-layer backend is not ready";
     slice = normalizeGpuReq(gpuShare, cpuShare);
     if (slice.vramGb > maxFreeVram() + 1e-9 || slice.cpuShare > maxFreeCpu() + 1e-9)
       return "no free capacity for those shares here right now";

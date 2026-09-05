@@ -67,6 +67,9 @@ typedef struct sh_link sh_link;
  *   SHIELDED_VSOCK_PORT      try AF_VSOCK to the host on this port before TCP;
  *                            unset = the TCP port number when /dev/vsock exists, 0 = never */
 sh_link *sh_link_open(const char *host, int port, bool verify, int *err);
+/* Explicit per-link transport/reservation for a pooled tenant. Call before start;
+ * avoids mutating process-wide environment while other links refill/reconnect. */
+void sh_link_configure(sh_link *l, int vsock_port, uint64_t reserve_bytes, int refill_threads);
 void     sh_link_close(sh_link *l);
 const char *sh_link_last_error(const sh_link *l);
 

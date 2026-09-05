@@ -24,6 +24,8 @@
 #include <vector>
 
 #include <dlfcn.h>
+#include <thread>
+#include <chrono>
 typedef void (*stats_fn)(uint64_t*, uint64_t*, uint64_t*, uint64_t*);
 static stats_fn shielded_stats = nullptr;
 
@@ -104,6 +106,13 @@ int main(int argc, char **argv) {
     if (llama_decode(ctx, batch)) { fprintf(stderr, "decode(prompt) failed\n"); return 2; }
     const int64_t t_pp1 = ggml_time_us();
 
+    // Test-only opt-in: compare every logit, not just the selected text, across
+    // single-card, pooled and exact CPU runs of the same public prompt.
+    FILE *logits_out = nullptr;
+    if (const char *path = getenv("SHIELDED_RUN_LOGITS")) {
+        logits_out = fopen(path, "wb");
+        if (!logits_out) { perror("logits output"); return 2; }
+    }
     std::string out;
     llama_token cur = 0;
     int n_gen = 0;
@@ -111,6 +120,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n_predict; i++) {
         const float *logits = llama_get_logits_ith(ctx, -1);
         const int n_vocab = llama_vocab_n_tokens(vocab);
+        if (logits_out && fwrite(logits, sizeof(float), (size_t)n_vocab, logits_out) != (size_t)n_vocab) {
+            perror("logits write"); return 2;
+        }
         int best = 0; float bv = logits[0];
         for (int t = 1; t < n_vocab; t++) if (logits[t] > bv) { bv = logits[t]; best = t; }
         cur = best;
@@ -121,6 +133,10 @@ int main(int argc, char **argv) {
         llama_batch b1 = llama_batch_get_one(&cur, 1);
         if (llama_decode(ctx, b1)) { fprintf(stderr, "decode failed at %d\n", i); break; }
         n_gen++;
+        if (const char *delay = getenv("SHIELDED_RUN_STEP_MS")) {
+            const int ms = atoi(delay);
+            if (ms > 0 && ms <= 1000) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
     }
     const int64_t t_tg1 = ggml_time_us();
 
@@ -138,6 +154,7 @@ int main(int argc, char **argv) {
     if (n_gen)
         printf("decode      : %d tokens in %.1f ms = %.1f ms/tok (%.2f tok/s)\n", n_gen,
                (t_tg1 - t_tg0) / 1e3, (t_tg1 - t_tg0) / 1e3 / n_gen, n_gen * 1e6 / (double)(t_tg1 - t_tg0));
+    if (logits_out) fclose(logits_out);
     llama_free(ctx); llama_model_free(model);
     return vf == 0 ? 0 : 1;
 }

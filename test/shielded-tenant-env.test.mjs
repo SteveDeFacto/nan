@@ -134,3 +134,47 @@ print(json.dumps(out))
 `);
   for (const [k, v] of Object.entries(r)) assert.equal(v, null, `tenantEnv as ${k}`);
 });
+
+test('pool launch binds independent endpoints, ports and byte reservations; tuning cannot override them', () => {
+  const r = py(`
+os.environ['SHIELDED_WORKERS'] = 'stale'
+os.environ['SHIELDED_VSOCK_PORT'] = '9999'
+spec = {'pooled':True, 'vramGb':6.85, 'workers':[
+  {'cardId':0,'endpoint':'10.0.2.2:9500','vsockPort':9500,'vramGb':.65},
+  {'cardId':1,'endpoint':'10.0.2.2:9501','vsockPort':9501,'vramGb':3.1},
+  {'cardId':2,'endpoint':'10.0.2.2:9502','vsockPort':9502,'vramGb':3.1}],
+  'tenantEnv': {'SHIELDED_WORKERS':'bad', 'SHIELDED_PORT':'1','SHIELDED_RESERVE_BYTES':'0','SHIELDED_SPIN_US':'40'}}
+e = wm._shielded_tenant_env(spec)
+legacy = wm._shielded_tenant_env({'endpoint':'10.0.2.2:9500'})
+print(json.dumps({'workers':e['SHIELDED_WORKERS'],'port':e['SHIELDED_PORT'], 'spin':e['SHIELDED_SPIN_US'],
+ 'reserve':e['SHIELDED_RESERVE_BYTES'], 'queue':wm._nn_arb_queue({'shielded':spec}),
+ 'legacy':legacy.get('SHIELDED_WORKERS'), 'legacyVsock':legacy.get('SHIELDED_VSOCK_PORT')}))
+`);
+  assert.deepEqual(r.workers.split('\n'), [.65,3.1,3.1].map((v,i) => `10.0.2.2|${9500+i}|${9500+i}|${Math.floor(v*2**30)}`));
+  assert.equal(r.port,'9500'); assert.equal(r.spin,'40'); assert.equal(r.reserve,String(Math.floor(6.85*2**30)));
+  assert.equal(r.queue,'shielded:pool'); assert.equal(r.legacy,null); assert.equal(r.legacyVsock,null);
+});
+test('malformed, uncapped, duplicate and mismatched pooled reservations are refused', () => {
+  const r = py(`
+base = {'cardId':0,'endpoint':'10.0.2.2:9500','vramGb':1}
+variants = [[],[base,base],[{**base,'vramGb':0}],[{**base,'endpoint':'bad|host:9500'}],
+ [{**base,'vsockPort':-1}],[{**base,'vramGb':float('nan')}],[base]]
+errors=[]
+for workers in variants:
+ try: wm._shielded_tenant_env({'pooled':True,'workers':workers,'vramGb':2})
+ except (ValueError, OverflowError): errors.append(True)
+ else: errors.append(False)
+print(json.dumps(errors))
+`);
+  assert.equal(r.length,7); assert.ok(r.every(Boolean));
+});
+
+
+test("a missing or old backend cannot advertise pooled inference", () => {
+  const r = py(`
+wm.SHIELDED_BACKEND_SO = '/nonexistent/libggml-shielded.so'
+wm._shielded_pool_available.cache_clear()
+print(json.dumps({'ready':wm._shielded_pool_available()}))
+`);
+  assert.equal(r.ready, false);
+});

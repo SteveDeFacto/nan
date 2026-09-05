@@ -307,7 +307,8 @@ typedef struct {
 struct sh_link {
     sh_pipe   *pipe;
     char       host[128];
-    int        port;
+    int        port, vsock_port;
+    uint64_t   reserve_bytes;
     bool       verify;
     /* Bytes per reply value: 4 (FIELD_GEMM, protocol 1.1) or 3 (FIELD_GEMM24,
      * 1.2). Decided at start from the worker's HELLO; SHIELDED_REPLY32=1
@@ -373,6 +374,9 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     if (!l) { if (err) *err = SH_ERR_NOMEM; return NULL; }
     snprintf(l->host, sizeof l->host, "%s", host);
     l->port = port; l->verify = verify; l->ywidth = 4;
+    l->vsock_port = env_int("SHIELDED_VSOCK_PORT", -1, -1, 1 << 30);
+    const char *r = getenv("SHIELDED_RESERVE_BYTES");
+    if (r && *r) { char *end = NULL; unsigned long long v = strtoull(r, &end, 10); if (end && *end == 0) l->reserve_bytes = v; }
     l->simd = sh_simd_get();
     if (!maskbank_init(&l->bank)) { free(l); if (err) *err = SH_ERR_IO; return NULL; }
     pthread_mutex_init(&l->pool_mu, NULL);
@@ -385,6 +389,13 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     l->warm_ms      = env_int("SHIELDED_WARM_MS", 5000, 0, 600000);
     if (err) *err = SH_OK;
     return l;
+}
+
+void sh_link_configure(sh_link *l, int vsock_port, uint64_t reserve_bytes, int refill_threads) {
+    if (!l || l->pipe || l->threads_running) return;
+    l->vsock_port = vsock_port;
+    l->reserve_bytes = reserve_bytes;
+    if (refill_threads >= 0 && refill_threads <= 64) l->threads_env = refill_threads;
 }
 
 static void stop_threads(sh_link *l) {
@@ -796,7 +807,7 @@ int sh_link_start(sh_link *l) {
     /* vsock first when the guest was told the worker listens on one, TCP as the
      * fallback: a guest without the vsock driver, or a host without the
      * device, still reaches the card over slirp -- more slowly, not not at all. */
-    int vport = env_int("SHIELDED_VSOCK_PORT", -1, -1, 1 << 30);
+    int vport = l->vsock_port;
     /* Unset means "if this guest has a vsock device, the worker listens on the
      * same port number there" -- which is what the launcher does -- so a guest
      * with the driver gets the fast path with no configuration at all. 0
@@ -824,11 +835,7 @@ int sh_link_start(sh_link *l) {
      * reserves nothing. Nothing in the reply is trusted beyond the version:
      * the reservation is the untrusted host's own bookkeeping, and the
      * tenant's privacy does not depend on it. */
-    uint64_t reserve = 0;
-    {
-        const char *r = getenv("SHIELDED_RESERVE_BYTES");
-        if (r && *r) { char *end = NULL; unsigned long long v = strtoull(r, &end, 10); if (end && *end == 0) reserve = (uint64_t)v; }
-    }
+    const uint64_t reserve = l->reserve_bytes;
     size_t n = sh_pack_hello(pay, 1, reserve);
     int rc = sh_pipe_call(l->pipe, SH_CMD_HELLO, pay, n, &rep);
     if (rc != SH_OK) { snprintf(l->err, sizeof l->err, "HELLO%s: %s", reserve ? " (with reservation)" : "", sh_pipe_last_error(l->pipe)); return rc; }

@@ -833,3 +833,12 @@ test("a free sibling GPU does not make a leased primary shielded card look avail
   const p = shieldedPoolOf({ availability: { shielded: primary, shieldedCards: [primary, sibling], gpuShareFree: 1 } });
   assert.equal(p.frac, 0); assert.equal(p.leasableGb, 0); assert.equal(p.freeGb, 6.4);
 });
+
+
+test("a pooled GPU uses aggregate capacity and its pool lease fraction", () => {
+  const p = shieldedPoolOf({ availability: { gpuShareFree: .1,
+    shielded: { pooled: true, vramGb: 68.5, vramBudgetGb: 68.5, vramFreeGb: 6.85 },
+    shieldedCards: [{ id: 0, gpuShareFree: .8, vramGb: 6.5 }] } });
+  assert.equal(p.total, 68.5); assert.equal(p.frac, .1);
+  assert.ok(Math.abs(p.leasableGb - 6.85) < 1e-9);
+});
