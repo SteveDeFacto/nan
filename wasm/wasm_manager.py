@@ -2366,7 +2366,10 @@ SHIELDED_CALIB_DIR  = os.environ.get("SHIELDED_CALIB_DIR", "/opt/enclave/shielde
 def _shielded_pool_available() -> bool:
     """Probe the measured module, not just this manager's support for a field."""
     try:
-        code = "import ctypes,sys; b=ctypes.CDLL(sys.argv[1]); sys.exit(0 if b.ggml_backend_shielded_pool_version()==1 else 1)"
+        # ggml normally loads this module after its own registry symbols are
+        # global. The capability function needs none of them; resolve lazily
+        # here so the probe does not require initializing an inference engine.
+        code = "import ctypes,os,sys; b=ctypes.CDLL(sys.argv[1],mode=os.RTLD_LAZY); sys.exit(0 if b.ggml_backend_shielded_pool_version()==1 else 1)"
         return subprocess.run([sys.executable, "-c", code, SHIELDED_BACKEND_SO],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
     except (OSError, subprocess.TimeoutExpired):

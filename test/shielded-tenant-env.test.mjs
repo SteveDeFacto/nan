@@ -178,3 +178,17 @@ print(json.dumps({'ready':wm._shielded_pool_available()}))
 `);
   assert.equal(r.ready, false);
 });
+
+
+test("pool capability probe handles a backend whose registry symbols resolve in the engine", () => {
+  const r = py(`
+import tempfile, subprocess
+with tempfile.TemporaryDirectory() as d:
+ so = os.path.join(d, 'backend.so')
+ subprocess.run(['cc','-shared','-fPIC','-x','c','-','-o',so], input='extern void engine_symbol(void); void unused(void){engine_symbol();} int ggml_backend_shielded_pool_version(void){return 1;}',text=True,check=True)
+ wm.SHIELDED_BACKEND_SO = so
+ wm._shielded_pool_available.cache_clear()
+ print(json.dumps({'ready':wm._shielded_pool_available()}))
+`);
+  assert.equal(r.ready, true);
+});
