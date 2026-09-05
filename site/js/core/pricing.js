@@ -338,7 +338,8 @@ export function shieldedPoolOf(row){
   const vramFrac = total > 0 ? clamp(freeGb / total) : 0;
   // Number.isFinite, not truthiness: 0 is the value this whole change exists to
   // report, and `||` would silently swap a fully-leased card back to 96%.
-  const lease = Number(a.gpuShareFree);
+  const own = Array.isArray(a.shieldedCards) ? a.shieldedCards.find(c => c.id === sh.id) : null;
+  const lease = Number(own ? own.gpuShareFree : a.gpuShareFree);
   const frac = Number.isFinite(lease) ? clamp(lease) : vramFrac;
   return { total, freeGb, reservedGb, vramFrac, frac, leasableGb: total * frac };
 }

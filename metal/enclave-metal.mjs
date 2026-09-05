@@ -226,9 +226,34 @@ if (cfg.egressHelper && cfg.relayUrl) {
 // wrote gains nothing -- the pad never crosses, and Freivalds rejects any product
 // that is not the real one. The worst it can do is refuse to answer, and
 // availability is explicitly not something this design promises.
-let shieldedChild = null;
-if (cfg.shieldedWorker) {
-  const sw = cfg.shieldedWorker;
+const shieldedChildren = new Set();
+const shieldedWorkers = cfg.shieldedWorkers ?? (cfg.shieldedWorker ? [cfg.shieldedWorker] : []);
+if (!Array.isArray(shieldedWorkers) || shieldedWorkers.length > 16)
+  throw new Error('shieldedWorkers must be an array of at most 16 workers');
+const workerPorts = new Set(), workerVsockPorts = new Set(), workerDevices = new Set();
+for (const [id, sw] of shieldedWorkers.entries()) {
+  if (!sw || typeof sw !== 'object' || Array.isArray(sw))
+    throw new Error('Each shielded worker must be an object');
+  const port = Number(sw.port || 9500);
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || workerPorts.has(port))
+    throw new Error('shieldedWorkers need distinct valid TCP ports');
+  workerPorts.add(port);
+  if (sw.vsock !== false) {
+    const vsockPort = Number(sw.vsockPort || port);
+    if (!Number.isInteger(vsockPort) || vsockPort < 1 || vsockPort > 65535 || workerVsockPorts.has(vsockPort))
+      throw new Error('shieldedWorkers need distinct valid vsock ports');
+    workerVsockPorts.add(vsockPort);
+  }
+  if (shieldedWorkers.length > 1 && !/^GPU-[a-f0-9-]{36}$/i.test(sw.device || ''))
+    throw new Error('Every worker in a multi-GPU pool needs an explicit GPU UUID');
+  if (sw.device && workerDevices.has(sw.device.toLowerCase()))
+    throw new Error('A GPU UUID must not be advertised by multiple workers');
+  if (sw.device) workerDevices.add(sw.device.toLowerCase());
+  if (shieldedWorkers.length > 1 && sw.shm)
+    throw new Error('Multi-GPU workers currently use TCP/vsock, not a shared-memory ring');
+}
+runtimeCfg.shieldedWorkers = [];
+for (const [id, sw] of shieldedWorkers.entries()) {
   const port = sw.port || 9500;
   // The C++/CUDA worker when it has been built (make -C shielded/worker-cuda),
   // the Python reference otherwise. Same protocol, same admission rules; the
@@ -292,15 +317,17 @@ if (cfg.shieldedWorker) {
     CUDA_MPS_PIPE_DIRECTORY: `/run/user/${process.getuid()}/enclave-mps`,
     CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: String(Math.max(1, Math.round(computeShare * 100))),
   } : {};
-  const swEnv = { ...process.env, ...mpsEnv, ...workerEnv };
+  const swEnv = { ...process.env, ...mpsEnv, ...workerEnv, ...(sw.device ? { CUDA_VISIBLE_DEVICES: sw.device } : {}) };
   if (computeShare)
     console.log(`[enclave-metal] shielded worker capped to ${Math.round(computeShare * 100)}% of the card's SMs (MPS)`);
   if (Object.keys(workerEnv).length)
     console.log(`[enclave-metal] shielded worker env: ${Object.entries(workerEnv).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   let swRestarts = 0;
   const startWorker = () => {
-    shieldedChild = spawn(swExe, swArgs, { stdio: ['ignore', 'inherit', 'inherit'], env: swEnv });
+    const shieldedChild = spawn(swExe, swArgs, { stdio: ['ignore', 'inherit', 'inherit'], env: swEnv });
+    shieldedChildren.add(shieldedChild);
     shieldedChild.on('exit', (code, sig) => {
+      shieldedChildren.delete(shieldedChild);
       if (stopping) return;
       swRestarts++;
       const delay = Math.min(2000 * swRestarts, 30000);
@@ -326,7 +353,8 @@ if (cfg.shieldedWorker) {
   // vCPU halts or spins while it waits for bytes the host was always going to
   // send it.
   const tenantEnv = envMap(sw.tenantEnv, 'shieldedWorker.tenantEnv', /^SHIELDED_/);
-  runtimeCfg.shieldedWorker = { host: '10.0.2.2', port,
+  const guestWorker = { id, host: '10.0.2.2', port,
+    ...(sw.device ? { deviceUuid: sw.device } : {}),
     ...(useCuda && vsockPort ? { vsockPort, guestCid } : {}),
     ...(Object.keys(tenantEnv).length ? { tenantEnv } : {}),
     // the ring's size in MiB, so the guest can bound its mapping of the BAR
@@ -338,7 +366,10 @@ if (cfg.shieldedWorker) {
     // the compute fraction the MPS cap above enforces, so the guest's verdict
     // (and from it the supervisor's pool) advertises only what is for sale
     ...(computeShare ? { computeShare } : {}) };
+  runtimeCfg.shieldedWorkers.push(guestWorker);
 }
+// Older guest images see only the original card until their update lands.
+runtimeCfg.shieldedWorker = runtimeCfg.shieldedWorkers[0];
 
 // A string->string map from config, validated to be environment-shaped
 // (NAME=value, printable values, bounded) and optionally filtered to a name
@@ -441,13 +472,13 @@ function baseArgs() {
   ];
   // The shielded worker's vsock. Host CID 2 is implicit; the guest's own CID is
   // whatever the config says (3 by default) and is never used for anything.
-  if (runtimeCfg.shieldedWorker && runtimeCfg.shieldedWorker.vsockPort)
-    a.push('-device', `vhost-vsock-pci,guest-cid=${runtimeCfg.shieldedWorker.guestCid || 3}`);
+  if (runtimeCfg.shieldedWorkers.some(sw => sw.vsockPort))
+    a.push('-device', `vhost-vsock-pci,guest-cid=${runtimeCfg.shieldedWorkers.find(sw => sw.vsockPort).guestCid || 3}`);
   // The shielded worker's shared-memory ring: the worker's --shm file becomes
   // BAR2 of an ivshmem-plain device. Verified to boot and poll exit-free
   // under SEV-SNP with this OVMF and kernel (2026-08-26, throwaway VM).
-  if (runtimeCfg.shieldedWorker && runtimeCfg.shieldedWorker.shmMib && cfg.shieldedWorker.shm && cfg.shieldedWorker.shm.path) {
-    a.push('-object', `memory-backend-file,id=shring,share=on,mem-path=${cfg.shieldedWorker.shm.path},size=${runtimeCfg.shieldedWorker.shmMib}M`);
+  if (runtimeCfg.shieldedWorker?.shmMib && shieldedWorkers[0]?.shm?.path) {
+    a.push('-object', `memory-backend-file,id=shring,share=on,mem-path=${shieldedWorkers[0].shm.path},size=${runtimeCfg.shieldedWorker.shmMib}M`);
     a.push('-device', 'ivshmem-plain,memdev=shring');
   }
   // model volumes: one read-only virtio-blk disk each. cache=none keeps the
@@ -520,7 +551,7 @@ function launch() {
 }
 for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => {
   stopping = true;
-  for (const c of [child, shieldedChild]) if (c) { try { c.kill('SIGTERM'); } catch {} }
+  for (const c of [child, ...shieldedChildren]) if (c) { try { c.kill('SIGTERM'); } catch {} }
   setTimeout(() => process.exit(0), 2000);
 });
 launch();

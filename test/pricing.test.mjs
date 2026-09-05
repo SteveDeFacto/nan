@@ -826,3 +826,10 @@ test("ranking: a card too small to hold the app sizes the box as CPU work", () =
   // and given both, the box that can actually run it on its card is preferred
   assert.equal(rankEnclavesFor(v, [metal0, kryptos])[0].name, "kryptos");
 });
+
+test("a free sibling GPU does not make a leased primary shielded card look available", () => {
+  const primary = { id: 0, vramGb: 7.7, vramBudgetGb: 6.5, vramFreeGb: 6.4, gpuShareFree: 0 };
+  const sibling = { id: 1, vramGb: 31.7, vramBudgetGb: 31, vramFreeGb: 31, gpuShareFree: 1 };
+  const p = shieldedPoolOf({ availability: { shielded: primary, shieldedCards: [primary, sibling], gpuShareFree: 1 } });
+  assert.equal(p.frac, 0); assert.equal(p.leasableGb, 0); assert.equal(p.freeGb, 6.4);
+});

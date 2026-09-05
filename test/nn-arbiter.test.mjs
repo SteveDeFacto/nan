@@ -333,7 +333,7 @@ test("shielded tenants arm with the same arbiter env — and still no MPS caps",
   const r = run(`
 m._nn_arbiter_live = lambda: True
 env = m._shielded_tenant_env({"endpoint": "10.0.2.2:9500"})
-rec = {"id": "dep-shielded"}
+rec = {"id": "dep-shielded", "shielded": {"endpoint": "10.0.2.2:9500"}}
 m._nn_arb_arm(env, rec, 0.35)
 print(json.dumps({
   "sock": env.get("ENCLAVE_NN_ARBITER"), "tenant": env.get("ENCLAVE_NN_ARB_TENANT"),
@@ -346,7 +346,7 @@ print(json.dumps({
   assert.equal(r.sock, "/tmp/enclave-nn-arb.sock");
   assert.equal(r.tenant, "dep-shielded");
   assert.equal(r.weight, "0.35");
-  assert.equal(r.queue, "0");
+  assert.equal(r.queue, "shielded:10.0.2.2:9500");
   assert.equal(r.armed, true);
   assert.deepEqual(r.mps, [], "the card is on the untrusted host: arming must not re-introduce MPS env");
   assert.equal(r.cvd, "", "no local card may be found");
@@ -357,11 +357,46 @@ test("shielded tenants stay bit-identical when the arbiter is not live", () => {
   const r = run(`
 m._nn_arbiter_live = lambda: False
 env = m._shielded_tenant_env({"endpoint": "10.0.2.2:9500"})
-rec = {"id": "dep-shielded"}
+rec = {"id": "dep-shielded", "shielded": {"endpoint": "10.0.2.2:9500"}}
 m._nn_arb_arm(env, rec, 0.35)
 print(json.dumps({"arb": [k for k in env if k.startswith("ENCLAVE_NN_ARB")],
                   "armed": rec.get("nnArbiter", False)}))
 `, { NODE_HAS_GPU: "0" });
   assert.deepEqual(r.arb, [], "not live = not a single arbiter var");
   assert.equal(r.armed, false);
+});
+
+test("shielded GPUs run independently while tenants sharing a worker queue fairly", () => {
+  const r = run(`
+m._nn_arbiter_live = lambda: True
+records = [{"id": str(i), "shielded": {"endpoint": ep}} for i, ep in
+           enumerate(["10.0.2.2:9501", "10.0.2.2:9502", "10.0.2.2:9501"])]
+s = m.NnArbScheduler(conc=1, max_hold=30, grace=0)
+queues = []
+for i, rec in enumerate(records):
+    env = {}; m._nn_arb_arm(env, rec, .5)
+    queues.append(env["ENCLAVE_NN_ARB_QUEUE"])
+    s.hello(i + 1, rec["id"], .5, queues[-1])
+print(json.dumps({"queues": queues, "first": s.acquire(1, 1),
+                  "second": s.acquire(2, 1), "same": s.acquire(3, 1)}))
+`);
+  assert.equal(r.queues[0], r.queues[2]); assert.notEqual(r.queues[0], r.queues[1]);
+  assert.deepEqual(r.first, [[1, 1]]); assert.deepEqual(r.second, [[2, 1]]);
+  assert.deepEqual(r.same, []);
+});
+
+test("socket server binds shielded queue to the tenant record", () => {
+  const r = run(`
+p = tempfile.mktemp(prefix="nn-arb-record-", suffix=".sock")
+m._apps["bound"] = {"id": "bound", "gpuShare": .25, "shielded": {"endpoint": "10.0.2.2:9502"}}
+srv = m._NnArbServer(p)
+c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); c.settimeout(2); c.connect(p)
+c.sendall(b'{"op":"hello","tenant":"bound","weight":1,"queue":"bypass"}\\n')
+f = c.makefile("r"); assert json.loads(f.readline())["ok"]
+with srv.lock:
+    queues = list(srv.sched.queues)
+    weight = srv.sched.queues[queues[0]]["tenants"]["bound"]["weight"]
+print(json.dumps({"queues": queues, "weight": weight}))
+`);
+  assert.deepEqual(r.queues, ["shielded:10.0.2.2:9502"]); assert.equal(r.weight, .25);
 });

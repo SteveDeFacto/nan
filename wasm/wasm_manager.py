@@ -2013,15 +2013,18 @@ class _NnArbServer:
                 return
             tenant = str(hello.get("tenant") or "")[:128]
             weight = hello.get("weight")
+            queue = hello.get("queue")
             with _lock:
                 rec = _apps.get(tenant)
                 if rec and rec.get("gpuShare"):
                     weight = rec["gpuShare"]
+                if rec:
+                    queue = _nn_arb_queue(rec)
             with self.lock:
                 self._n += 1
                 cid = self._n
                 self.socks[cid] = (s, threading.Lock())
-                self.sched.hello(cid, tenant, weight, hello.get("queue"))
+                self.sched.hello(cid, tenant, weight, queue)
             self._send(cid, {"ok": True})
             for line in f:
                 try:
@@ -2217,13 +2220,19 @@ def _nn_arbiter_live() -> bool:
     return bool(_arbiter_support().get("supported"))
 
 
+def _nn_arb_queue(rec: dict) -> str:
+    """One fairness queue per physical shielded worker, bound to the launch record."""
+    endpoint = str((rec.get("shielded") or {}).get("endpoint") or "")
+    return ("shielded:" + endpoint) if endpoint else "0"
+
+
 def _nn_arb_arm(env: dict, rec: dict, gpu_share: float) -> None:
     """Arm one tenant's runtime as an arbiter client — the ONE place the four
     ENCLAVE_NN_ARB* vars are written, shared by the CUDA branch and the
     shielded branch so the two can never drift. Grant weight = the launch-time
-    gpuShare (re-checked against the RECORD by the arbiter at hello). All
-    wasi-nn tenants share queue "0" today — per-card queues become a
-    launcher-side env change if per-tenant card packing lands. A no-op unless
+    gpuShare (re-checked against the RECORD by the arbiter at hello). Shielded
+    workers have independent queues; tenants on the same worker share turns.
+    A no-op unless
     the arbiter is live, which keeps OFF bit-identical to the pre-arbiter
     fleet."""
     if not _nn_arbiter_live():
@@ -2231,7 +2240,8 @@ def _nn_arb_arm(env: dict, rec: dict, gpu_share: float) -> None:
     env["ENCLAVE_NN_ARBITER"] = NN_ARB_SOCK
     env["ENCLAVE_NN_ARB_TENANT"] = rec["id"]
     env["ENCLAVE_NN_ARB_WEIGHT"] = str(gpu_share)
-    env["ENCLAVE_NN_ARB_QUEUE"] = "0"
+    # Independent host workers must not serialize behind the same GPU queue.
+    env["ENCLAVE_NN_ARB_QUEUE"] = _nn_arb_queue(rec)
     rec["nnArbiter"] = True
 
 

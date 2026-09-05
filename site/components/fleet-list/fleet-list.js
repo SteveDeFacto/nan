@@ -190,8 +190,8 @@ class FleetList extends EnclaveElement {
                 // tooltip, which is the only place the two can sit together without
                 // being read as one scale. Rows too old to report a rated figure
                 // keep the previous behaviour.
-                + (a.cardTflops > 0
-                    ? stat(fmtNum(a.gpuTflopsFree), fmtNum(a.cardTflops), "", "tflops available",
+                + ((sh.cardTflops || a.cardTflops) > 0
+                    ? stat(fmtNum(shFree * (sh.cardTflops || a.cardTflops)), fmtNum(sh.cardTflops || a.cardTflops), "", "tflops available",
                            "Rated dense fp16 for this card, the same basis every other box "
                            + "quotes, so boxes and shares compare like for like."
                            + (sh.gmacPerSec > 0
@@ -209,6 +209,18 @@ class FleetList extends EnclaveElement {
                              + "figure, so the two columns are not directly comparable.")
                       : stat(esc(sh.card || "gpu"), "", "", "card")),
                 price.shielded) : "")
+            + (Array.isArray(a.shieldedCards) ? a.shieldedCards.filter(c => c.id !== sh?.id).map(c => {
+                const p = shieldedPoolOf({ availability: { shielded: c, gpuShareFree: c.gpuShareFree } });
+                if (!p) return "";
+                const badge = '<span class="ap-badge info" title="Shielded inference on the host GPU; masked inputs and verified results.">'
+                  + esc(c.card || "gpu") + '</span>';
+                return pool(badge, Math.floor(p.frac * 100),
+                  stat(fmtNum(p.leasableGb), fmtNum(p.total), "GB", "vram available",
+                    fmtNum(p.freeGb) + " GB free on the card; " + fmtNum(p.reservedGb) + " GB reserved by tenants.")
+                  + stat(fmtNum(p.frac * c.cardTflops), fmtNum(c.cardTflops), "", "tflops available",
+                    "Rated dense fp16. Masked field GEMM measured at " + Math.round(c.gmacPerSec) + " G-MAC/s."),
+                  price.shielded);
+              }).join("") : "")
             // ONLY when the card is in the enclave. A shielded card already drew its
             // pool above, from the numbers the probe actually measured; drawing
             // this one too would advertise one piece of silicon twice.

@@ -338,7 +338,8 @@ start('wasm-manager',
     // pass, and the runtime client only takes turns once the toolchain knows
     // a SHIELDED_HOST graph is a GPU graph — armed here, active on the next
     // wasmtime repin, fail-open (unarbitrated) everywhere in between.
-    ...(fw.shieldedWorker && fw.shieldedWorker.port ? { WASM_NN_ARBITER: '1' } : {}),
+    ...((Array.isArray(fw.shieldedWorkers) ? fw.shieldedWorkers : [fw.shieldedWorker]).some(sw => sw?.port)
+      ? { WASM_NN_ARBITER: '1' } : {}),
     ...GGML_ENV,
     // attached model volumes: name -> path INSIDE the chroot (plus the optional
     // third field naming the one gguf to preload out of a multi-file tree). The
@@ -462,108 +463,127 @@ start('metal-agent', ['/usr/local/bin/node', '/opt/metal/agent.mjs'], {
 // It is deliberately at boot rather than on demand. The failure this catches --
 // a worker that is absent, wrong-version, or quietly returning garbage -- is one
 // you want to find before a tenant's request depends on it.
-if (fw.shieldedWorker && fw.shieldedWorker.port) {
-  const { host = '10.0.2.2', port } = fw.shieldedWorker;
-  // What this guest's idle vCPUs do while they wait for the worker: init
-  // loaded cpuidle-haltpoll (or said why not) before anything ran; say it
-  // again here, next to the card it exists for, so one console tells the
-  // whole transport story.
-  try {
-    const rd = (p) => fs.readFileSync(p, 'utf8').trim();
-    log(`shielded transport idle policy: cpuidle driver=${rd('/sys/devices/system/cpu/cpuidle/current_driver')} `
-      + `governor=${rd('/sys/devices/system/cpu/cpuidle/current_governor')}`
-      + (fs.existsSync('/sys/module/haltpoll/parameters/guest_halt_poll_ns')
-        ? ` haltpoll ns=${rd('/sys/module/haltpoll/parameters/guest_halt_poll_ns')}` : '')
-      + (fw.shieldedWorker.tenantEnv ? ` tenantEnv=${JSON.stringify(fw.shieldedWorker.tenantEnv).slice(0, 200)}` : ''));
-  } catch {}
-  const probe = spawn('/usr/local/bin/node',
-    ['/opt/metal/shielded-probe.mjs', '--host', String(host), '--port', String(port)],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  let buf = '';
-  probe.stdout.on('data', (d) => { buf += d; });
-  probe.stderr.on('data', (d) => log(`shielded-probe: ${String(d).trim()}`));
-  probe.on('error', (e) => log(`shielded-probe spawn failed: ${e.message}`));
-  // Where the supervisor looks for the verdict. A FILE rather than an env var,
-  // deliberately: the supervisor is already running by the time the probe
-  // finishes (the probe waits for a worker that spends ~10 s importing torch),
-  // so an env var would have to be set before the answer existed. A file also
-  // means the box stops advertising the card the moment the probe stops passing,
-  // instead of carrying a boot-time claim until the next restart.
-  const VERDICT = '/run/shielded-gpu.json';
-  const clearVerdict = () => { try { fs.unlinkSync(VERDICT); } catch {} };
-  clearVerdict();
-  probe.on('exit', (code) => {
-    let v = null;
-    try { v = JSON.parse(buf); } catch {}
-    if (code === 0 && v && v.ok && v.card) {
-      // Only a PASSING probe posts capacity. Advertising a card whose masked
-      // round trip did not come back exact, or whose worker did not refuse a
-      // denylisted op, would sell something we have not shown works.
-      // The ask travels with the verdict, not beside it, for the same reason the
-      // verdict gates the capacity: a price is only meaningful for hardware the
-      // box has shown it can actually drive. No pass, no file, no price.
-      const priceSec6 = usdHrToSec6(Number(fw.shieldedWorker.priceUsdHr));
-      if (!priceSec6)
-        log('shielded GPU has no priceUsdHr — its card sells at the supervisor default');
-      try {
-        // vsock rides with the endpoint only if THIS guest has the device: the
-        // modules are in the image, but a kernel without them, or a host that
-        // did not attach one, must leave tenants on TCP rather than on an
-        // address nothing answers.
-        const vsockPort = Number(fw.shieldedWorker.vsockPort) > 0 && fs.existsSync('/dev/vsock')
-          ? Number(fw.shieldedWorker.vsockPort) : 0;
-        if (Number(fw.shieldedWorker.vsockPort) > 0 && !vsockPort)
-          log('shielded worker offers vsock but this guest has no /dev/vsock; tenants stay on TCP');
-        // Tenant knobs from host config (SHIELDED_SPIN_US and friends). Only
-        // SHIELDED_* names, only printable strings: the host tunes the
-        // backend it already serves, it does not get an env injector into a
-        // tenant. The manager filters again; this end keeps the verdict
-        // file honest on its own.
-        const tenantEnv = {};
-        const te = fw.shieldedWorker.tenantEnv;
-        if (te && typeof te === 'object' && !Array.isArray(te)) {
-          for (const [k, val] of Object.entries(te)) {
-            if (!/^SHIELDED_[A-Z0-9_]{0,63}$/.test(k)) { log(`shielded tenantEnv: dropping ${String(k).slice(0, 40)} (only SHIELDED_* names)`); continue; }
-            if ((typeof val !== 'string' && typeof val !== 'number') || String(val).length > 256 || /[^\x20-\x7e]/.test(String(val))) {
-              log(`shielded tenantEnv: dropping ${k} (value must be printable ASCII, at most 256 bytes)`); continue;
+const configuredShieldedWorkers = fw.shieldedWorkers ?? (fw.shieldedWorker ? [fw.shieldedWorker] : []);
+const shieldedWorkers = Array.isArray(configuredShieldedWorkers) ? configuredShieldedWorkers.slice(0, 16) : [];
+const shieldedVerdicts = new Map();
+const VERDICT = '/run/shielded-gpu.json';
+const publishShieldedVerdicts = () => {
+  const cards = [...shieldedVerdicts.values()].sort((a, b) => a.id - b.id);
+  if (!cards.length) { try { fs.unlinkSync(VERDICT); } catch {} return; }
+  const tmp = VERDICT + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(shieldedWorkers.length === 1 ? cards[0] : { cards }));
+  fs.renameSync(tmp, VERDICT);
+};
+publishShieldedVerdicts();
+for (const [id, sw] of shieldedWorkers.entries()) {
+  if (!sw || !sw.port) continue;
+  const clearVerdict = () => { shieldedVerdicts.delete(id); publishShieldedVerdicts(); };
+  const readVerdict = () => shieldedVerdicts.get(id);
+  const writeVerdict = v => { shieldedVerdicts.set(id, { ...v, id }); publishShieldedVerdicts(); };
+  const startProbe = () => {
+    const { host = '10.0.2.2', port } = sw;
+    // What this guest's idle vCPUs do while they wait for the worker: init
+    // loaded cpuidle-haltpoll (or said why not) before anything ran; say it
+    // again here, next to the card it exists for, so one console tells the
+    // whole transport story.
+    try {
+      const rd = (p) => fs.readFileSync(p, 'utf8').trim();
+      log(`shielded transport idle policy: cpuidle driver=${rd('/sys/devices/system/cpu/cpuidle/current_driver')} `
+        + `governor=${rd('/sys/devices/system/cpu/cpuidle/current_governor')}`
+        + (fs.existsSync('/sys/module/haltpoll/parameters/guest_halt_poll_ns')
+          ? ` haltpoll ns=${rd('/sys/module/haltpoll/parameters/guest_halt_poll_ns')}` : '')
+        + (sw.tenantEnv ? ` tenantEnv=${JSON.stringify(sw.tenantEnv).slice(0, 200)}` : ''));
+    } catch {}
+    const probe = spawn('/usr/local/bin/node',
+      ['/opt/metal/shielded-probe.mjs', '--host', String(host), '--port', String(port)],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let buf = '';
+    probe.stdout.on('data', (d) => { buf += d; });
+    probe.stderr.on('data', (d) => log(`shielded-probe: ${String(d).trim()}`));
+    probe.on('error', (e) => { log(`shielded-probe spawn failed: ${e.message}`); setTimeout(startProbe, 30_000).unref?.(); });
+    // Where the supervisor looks for the verdict. A FILE rather than an env var,
+    // deliberately: the supervisor is already running by the time the probe
+    // finishes (the probe waits for a worker that spends ~10 s importing torch),
+    // so an env var would have to be set before the answer existed. A file also
+    // means the box stops advertising the card the moment the probe stops passing,
+    // instead of carrying a boot-time claim until the next restart.
+    clearVerdict();
+    probe.on('exit', (code) => {
+      let v = null;
+      try { v = JSON.parse(buf); } catch {}
+      if (code === 0 && v && v.ok && v.card) {
+        // Only a PASSING probe posts capacity. Advertising a card whose masked
+        // round trip did not come back exact, or whose worker did not refuse a
+        // denylisted op, would sell something we have not shown works.
+        // The ask travels with the verdict, not beside it, for the same reason the
+        // verdict gates the capacity: a price is only meaningful for hardware the
+        // box has shown it can actually drive. No pass, no file, no price.
+        const priceSec6 = usdHrToSec6(Number(sw.priceUsdHr));
+        if (!priceSec6)
+          log('shielded GPU has no priceUsdHr — its card sells at the supervisor default');
+        try {
+          // vsock rides with the endpoint only if THIS guest has the device: the
+          // modules are in the image, but a kernel without them, or a host that
+          // did not attach one, must leave tenants on TCP rather than on an
+          // address nothing answers.
+          const vsockPort = Number(sw.vsockPort) > 0 && fs.existsSync('/dev/vsock')
+            ? Number(sw.vsockPort) : 0;
+          if (Number(sw.vsockPort) > 0 && !vsockPort)
+            log('shielded worker offers vsock but this guest has no /dev/vsock; tenants stay on TCP');
+          // Tenant knobs from host config (SHIELDED_SPIN_US and friends). Only
+          // SHIELDED_* names, only printable strings: the host tunes the
+          // backend it already serves, it does not get an env injector into a
+          // tenant. The manager filters again; this end keeps the verdict
+          // file honest on its own.
+          const tenantEnv = {};
+          const te = sw.tenantEnv;
+          if (te && typeof te === 'object' && !Array.isArray(te)) {
+            for (const [k, val] of Object.entries(te)) {
+              if (!/^SHIELDED_[A-Z0-9_]{0,63}$/.test(k)) { log(`shielded tenantEnv: dropping ${String(k).slice(0, 40)} (only SHIELDED_* names)`); continue; }
+              if ((typeof val !== 'string' && typeof val !== 'number') || String(val).length > 256 || /[^\x20-\x7e]/.test(String(val))) {
+                log(`shielded tenantEnv: dropping ${k} (value must be printable ASCII, at most 256 bytes)`); continue;
+              }
+              tenantEnv[k] = String(val);
             }
-            tenantEnv[k] = String(val);
           }
-        }
-        // The compute fraction the host's MPS cap enforces on the worker
-        // (enclave-metal.mjs computeShare). Rides the verdict like the price:
-        // config, not a probe result, but only meaningful for a card the
-        // probe passed. The supervisor caps its pool's computeFree with it.
-        const computeShare = Number(fw.shieldedWorker.computeShare) > 0 && Number(fw.shieldedWorker.computeShare) < 1
-          ? Number(fw.shieldedWorker.computeShare) : 0;
-        fs.writeFileSync(VERDICT, JSON.stringify({
-          ...v.card, endpoint: `${host}:${port}`,
-          ...(vsockPort ? { vsockPort } : {}),
-          ...(Object.keys(tenantEnv).length ? { tenantEnv } : {}),
-          ...(priceSec6 ? { pricePerSec6: priceSec6 } : {}),
-          ...(computeShare ? { compute_share: computeShare } : {}),
-          exact: v.exact, verified: v.verified, lie_rejected: v.lie_rejected,
-          denylist_refused: v.denylist_refused,
-          round_trip_ms: v.round_trip_ms, at: new Date().toISOString(),
-        }));
-      } catch (e) { log(`shielded verdict not written: ${e.message}`); }
-    } else {
-      clearVerdict();
-    }
-    if (code === 0 && v) {
-      log(`shielded GPU OK: ${v.worker?.device} at ${host}:${port} — exact=${v.exact} `
-        + `verified=${v.verified} lie_rejected=${v.lie_rejected} denylist=${v.denylist_refused} `
-        + `corr=${v.transcript_correlation} chi2=${v.transcript_chi2} `
-        + `rt=${v.round_trip_ms}ms warm (${v.cold_round_trip_ms}ms cold, kernel compile)`
-        + (v.waited_ms > 1000 ? ` after waiting ${(v.waited_ms / 1000).toFixed(1)}s for the worker` : '')
-        + (v.card ? ` — advertising ${v.card.vram_free_gb}/${v.card.vram_budget_gb || v.card.vram_total_gb} GB free `
-                    + `(${v.card.vram_reserved_gb ?? 0} GB reserved by tenants, card ${v.card.vram_total_gb} GB), `
-                    + `${Math.round(v.card.field_gmac_per_s)} G-MAC/s` : ''));
-    } else {
-      log(`shielded GPU UNAVAILABLE (probe exit ${code}); the box keeps serving CPU work`);
-    }
-    if (code === 0 && v && v.ok && v.card) startShieldedRefresh(host, port, VERDICT, clearVerdict);
-  });
+          // The compute fraction the host's MPS cap enforces on the worker
+          // (enclave-metal.mjs computeShare). Rides the verdict like the price:
+          // config, not a probe result, but only meaningful for a card the
+          // probe passed. The supervisor caps its pool's computeFree with it.
+          const computeShare = Number(sw.computeShare) > 0 && Number(sw.computeShare) < 1
+            ? Number(sw.computeShare) : 0;
+          writeVerdict({
+            ...v.card, endpoint: `${host}:${port}`,
+            ...(vsockPort ? { vsockPort } : {}),
+            ...(Object.keys(tenantEnv).length ? { tenantEnv } : {}),
+            ...(priceSec6 ? { pricePerSec6: priceSec6 } : {}),
+            ...(computeShare ? { compute_share: computeShare } : {}),
+            exact: v.exact, verified: v.verified, lie_rejected: v.lie_rejected,
+            denylist_refused: v.denylist_refused,
+            round_trip_ms: v.round_trip_ms, at: new Date().toISOString(),
+            ...(sw.deviceUuid ? { deviceUuid: sw.deviceUuid } : {}),
+          });
+        } catch (e) { log(`shielded verdict not written: ${e.message}`); }
+      } else {
+        clearVerdict();
+      }
+      if (code === 0 && v) {
+        log(`shielded GPU OK: ${v.worker?.device} at ${host}:${port} — exact=${v.exact} `
+          + `verified=${v.verified} lie_rejected=${v.lie_rejected} denylist=${v.denylist_refused} `
+          + `corr=${v.transcript_correlation} chi2=${v.transcript_chi2} `
+          + `rt=${v.round_trip_ms}ms warm (${v.cold_round_trip_ms}ms cold, kernel compile)`
+          + (v.waited_ms > 1000 ? ` after waiting ${(v.waited_ms / 1000).toFixed(1)}s for the worker` : '')
+          + (v.card ? ` — advertising ${v.card.vram_free_gb}/${v.card.vram_budget_gb || v.card.vram_total_gb} GB free `
+                      + `(${v.card.vram_reserved_gb ?? 0} GB reserved by tenants, card ${v.card.vram_total_gb} GB), `
+                      + `${Math.round(v.card.field_gmac_per_s)} G-MAC/s` : ''));
+      } else {
+        log(`shielded GPU UNAVAILABLE (probe exit ${code}); the box keeps serving CPU work`);
+      }
+      if (code === 0 && v && v.ok && v.card) startShieldedRefresh(host, port, readVerdict, writeVerdict, clearVerdict, startProbe);
+      else setTimeout(startProbe, 30_000).unref?.();
+    });
+  };
+  startProbe();
 }
 
 // --- keeping the advertised card HONEST between probes ------------------------
@@ -585,7 +605,7 @@ if (fw.shieldedWorker && fw.shieldedWorker.port) {
 // advertising, which is the outcome that matters.
 const SHIELDED_REFRESH_MS = Number(process.env.SHIELDED_REFRESH_MS || 30_000);
 const SHIELDED_REFRESH_STRIKES = 3;   // ~90 s of silence before the card comes down
-function startShieldedRefresh(host, port, VERDICT, clearVerdict) {
+function startShieldedRefresh(host, port, readVerdict, writeVerdict, clearVerdict, reprobe) {
   let strikes = 0;
   const tick = async () => {
     let link = null;
@@ -596,7 +616,8 @@ function startShieldedRefresh(host, port, VERDICT, clearVerdict) {
       const hello = JSON.parse((await link.call(CMD.HELLO, (() => {
         const b = Buffer.alloc(4); b.writeUInt32LE(1, 0); return b;   // protocol major; the 4-byte form reserves nothing
       })())).toString());
-      const cur = JSON.parse(fs.readFileSync(VERDICT, 'utf8'));
+      const cur = readVerdict();
+      if (!cur) throw new Error('card needs another full probe');
       const next = { ...cur, at: new Date().toISOString() };
       // vram_free_gb = min(budget - reserved by live tenants, driver free):
       // what this box can still sell, see shieldedCardGb. A budget the host can
@@ -614,14 +635,15 @@ function startShieldedRefresh(host, port, VERDICT, clearVerdict) {
         next.contended = next.field_gmac_best > 0 && hello.field_gmac_per_s < 0.5 * next.field_gmac_best;
       }
       if (Number.isFinite(hello.card_tflops)) next.card_tflops = hello.card_tflops;
-      fs.writeFileSync(VERDICT, JSON.stringify(next));
+      writeVerdict(next);
       strikes = 0;
     } catch (e) {
       if (++strikes >= SHIELDED_REFRESH_STRIKES) {
         clearVerdict();
         log(`shielded GPU withdrawn after ${strikes} failed refreshes (${e.message}); `
           + `the box keeps serving CPU work`);
-        strikes = 0;
+        clearInterval(t);
+        setTimeout(reprobe, 5000).unref?.();
       }
     } finally { try { link?.close(); } catch {} }
   };

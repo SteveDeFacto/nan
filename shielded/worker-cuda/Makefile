@@ -12,14 +12,14 @@
 CUDA_HOME ?= $(HOME)/.cache/sd-gpu-repro/cuda-home
 CUDACXX   ?= clang++
 FIELD_DIR := ../../wasm/ggml-shielded
-ARCHS     ?= --cuda-gpu-arch=sm_80 --cuda-gpu-arch=sm_86 --cuda-gpu-arch=sm_89 --cuda-gpu-arch=sm_90
+ARCHS     ?= --cuda-gpu-arch=sm_70 --cuda-gpu-arch=sm_80 --cuda-gpu-arch=sm_86 --cuda-gpu-arch=sm_89 --cuda-gpu-arch=sm_90
 
 all: shielded-worker
 
 shielded-field.o: $(FIELD_DIR)/shielded-field.c $(FIELD_DIR)/shielded-field.h
 	$(CC) -O2 -ffp-contract=off -fPIC -I$(FIELD_DIR) -c $< -o $@
 
-worker.o: worker.cu $(FIELD_DIR)/shielded-field.h
+worker.o: worker.cu $(FIELD_DIR)/shielded-field.h Makefile
 	$(CUDACXX) -O3 -std=c++17 -x cuda --cuda-path=$(CUDA_HOME) --no-cuda-version-check $(ARCHS) \
 	  -ffp-contract=off -I$(FIELD_DIR) -c worker.cu -o $@
 

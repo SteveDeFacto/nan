@@ -170,6 +170,29 @@ passthrough, so it works with a consumer card — the reference measurements are
 "shieldedWorker": { "port": 9500, "vramGb": 6.5 }
 ```
 
+For multiple cards, use `shieldedWorkers` instead of `shieldedWorker`. Give each
+worker a distinct GPU UUID (from `nvidia-smi -L`) and TCP/vsock port. Keep the array
+order stable: it defines card IDs, and a live lease stays bound to its card.
+
+```json
+"shieldedWorkers": [
+  { "device": "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "port": 9500, "vramGb": 6.5, "computeShare": 0.5, "priceUsdHr": 0.05 },
+  { "device": "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "port": 9501, "vramGb": 31, "priceUsdHr": 0.05 },
+  { "device": "GPU-cccccccc-cccc-cccc-cccc-cccccccccccc", "port": 9502, "vramGb": 31, "priceUsdHr": 0.05 }
+]
+```
+
+Each worker receives its own `CUDA_VISIBLE_DEVICES`, probe, VRAM reservations,
+and inference fairness queue. Volta/V100 (`sm_70`) is included in the CUDA worker's
+default build. Rebuild the worker and update the measured guest image before
+activating multiple cards. TCP/vsock are supported; the shared-memory ring is
+currently single-worker only. A failed probe withdraws just that card's capacity.
+`/availability.shieldedCards` and `/v1/gpu` report the individual cards; legacy
+single-card sizing fields retain the smallest card's capacity. Each tenant uses
+one card; their VRAM is not combined. Node CPU admission still applies across all
+cards. Choose the same price for every card: the registry currently posts one
+shielded card-hour price for the node.
+
 `vramGb` is the part of the card dedicated to Enclave: the fleet sees a card of exactly
 that size, and the worker refuses to start if the card is smaller. It is held only as
 tenants reserve it: the worker takes no device memory for it at start-up, each tenant

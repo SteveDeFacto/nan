@@ -2473,14 +2473,22 @@ const ctxOverheadGb = () => (_shieldedAdopted ? 0 : CTX_OVERHEAD_GB);
 // reserve an arbitrary slice on a single card (best-fit on VRAM) PLUS the
 // deployment's cpuShare from the node pool — both or neither. VRAM overhead is
 // reserved on top of the cap so the sum of live workers never exceeds physical.
+const cardVram = c => c.vramTotal ?? CARD_VRAM_GB;
+const cardFreeVram = c => c.shielded
+  ? (c.available ? Math.min(c.vramFree, c.proof?.vramFreeGb || 0) : 0)
+  : c.vramFree;
 function allocGpu(vramGb, computeShare, cpuShare) {
-  const needV = vramGb + ctxOverheadGb();
+  const need = c => c.shielded
+    ? Math.max(vramGb, Math.ceil(computeShare * cardVram(c) / GRANULARITY_GB) * GRANULARITY_GB)
+    : vramGb + ctxOverheadGb();
   if (cpuPool.shareFree < cpuShare - 1e-9) return null;
   const fit = gpuCards
-    .filter(c => c.vramFree >= needV - 1e-9 && c.computeFree >= computeShare - 1e-9)
-    .sort((a, b) => (a.vramFree - needV) - (b.vramFree - needV));
+    .filter(c => cardFreeVram(c) >= need(c) - 1e-9 && c.computeFree >= computeShare - 1e-9)
+    .sort((a, b) => (cardFreeVram(a) - need(a)) - (cardFreeVram(b) - need(b)));
   const card = fit[0];
   if (!card) return null;
+  const needV = need(card);
+  if (card.shielded) vramGb = needV;
   card.vramFree -= needV; card.computeFree -= computeShare;
   cpuPool.shareFree -= cpuShare;
   return { cardId: card.id, vramGb, computeShare, cpuShare, _needV: needV };
@@ -2490,15 +2498,15 @@ function releaseGpu(h) {
   if (h.cpu) { cpuPool.shareFree = Math.min(1, cpuPool.shareFree + h.share); return; }
   cpuPool.shareFree = Math.min(1, cpuPool.shareFree + (h.cpuShare || 0));
   const card = gpuCards[h.cardId]; if (!card) return;
-  card.vramFree = Math.min(CARD_VRAM_GB, card.vramFree + h._needV);
+  card.vramFree = Math.min(cardVram(card), card.vramFree + h._needV);
   card.computeFree = Math.min(1, card.computeFree + h.computeShare);
 }
 // largest slice a single card can still take (VRAM net of overhead; compute share)
-const maxFreeVram    = () => Math.max(0, ...gpuCards.map(c => c.vramFree - ctxOverheadGb()));
+const maxFreeVram    = () => Math.max(0, ...gpuCards.map(c => cardFreeVram(c) - ctxOverheadGb()));
 const maxFreeCompute = () => Math.max(0, ...gpuCards.map(c => c.computeFree));
 // largest GPU share a single card can still take (vram + compute must fit together)
 const maxFreeGpuShare = () => !IS_GPU ? 0 : Math.max(0, ...gpuCards.map(c =>
-  Math.min(c.computeFree, (c.vramFree - ctxOverheadGb()) / CARD_VRAM_GB)));
+  Math.min(c.computeFree, (cardFreeVram(c) - ctxOverheadGb()) / cardVram(c) || 0)));
 
 const _applyGpu = (text) => {
   let got = 0; const totals = [];
@@ -2737,7 +2745,7 @@ function reconcilePools() {
   };
   apply(cpuPool, "shareFree", Math.max(0, Math.min(1, 1 - held.cpu)), "cpu share", round3);
   gpuCards.forEach((card, i) => {
-    apply(card, "vramFree", Math.max(0, Math.min(CARD_VRAM_GB, CARD_VRAM_GB - held.cards[i].vram)), `card${i} vramGb`, round1);
+    apply(card, "vramFree", Math.max(0, Math.min(cardVram(card), cardVram(card) - held.cards[i].vram)), `card${i} vramGb`, round1);
     apply(card, "computeFree", Math.max(0, Math.min(1, 1 - held.cards[i].compute)), `card${i} compute`, round3);
   });
   if (fixed.length) console.warn(`[pool] reconciled drift - dead reservations reclaimed (${fixed.join(", ")})`);
@@ -3129,6 +3137,8 @@ function toBytes(s) {
 // contract, and `launchSpec` is the only thing that builds one.
 function launchSpecFrom(rec, sec, hosts) {
   return { deploymentId: rec.id,
+    cardId: rec._gpu?.cardId ?? rec.resources?.cardId ?? 0,
+    gpuVramGb: rec._gpu?.vramGb,
     gpuShare: rec.resources.gpuShare || 0, cpuShare: rec.resources.cpuShare,
     image: { reference: rec.appWasm || (rec.image && rec.image.reference) },
     appPort: rec.network.port, ports: rec.firewall,
@@ -3149,7 +3159,7 @@ if (process.env.LAUNCH_SPEC_SELFTEST) {
   })));
   process.exit(0);
 }
-async function spawnContainer({ deploymentId, gpuShare, cpuShare, image, appPort, ports, config, configCid, secrets, hosts }) {
+async function spawnContainer({ deploymentId, gpuShare, cpuShare, cardId, gpuVramGb, image, appPort, ports, config, configCid, secrets, hosts }) {
   // Two backends. "vm": hand the app reference to the app manager on VMMGR_URL
   // (the wasm-manager runs it as a `wasmtime serve` process; cpuShare is its
   // admission unit and sets the guest memory cap — cpuShare × node RAM;
@@ -3175,16 +3185,12 @@ async function spawnContainer({ deploymentId, gpuShare, cpuShare, image, appPort
     // the flag unconditionally is safe -- a manager that predates it ignores an
     // unknown field, and on such a manager gpuShare would simply fail to launch,
     // which is the correct outcome rather than a silently unshielded tenant.
-    const shieldedCard = g > 0 ? shieldedCapacity() : null;
+    const shieldedCard = g > 0 ? shieldedCapacity(cardId ?? 0) : null;
+    const shieldedSpec = g > 0 && _shieldedAdopted ? shieldedLaunchSpec(cardId, g, gpuVramGb) : null;
     const r = await vmReq("POST", "/vms",
       { image: ref, cpuShare: c, gpuShare: g,
-        ...(shieldedCard ? { shielded: { endpoint: shieldedCard.endpoint,
-                                         vramGb: round1(g * CARD_VRAM_GB),
-                                         // vsock to the worker, when the guest probe found the device
-                                         ...(shieldedCard.vsockPort ? { vsockPort: shieldedCard.vsockPort } : {}),
-                                         // SHIELDED_* tuning from the host's config (e.g. SHIELDED_SPIN_US)
-                                         ...(Object.keys(shieldedCard.tenantEnv || {}).length ? { tenantEnv: shieldedCard.tenantEnv } : {}) } } : {}),
-        gpuTflops: round1(g * CARD_TFLOPS), cpuGflops: Math.round(c * NODE_GFLOPS),
+        ...(shieldedSpec ? { shielded: shieldedSpec } : {}),
+        gpuTflops: round1(g * (shieldedCard?.cardTflops || CARD_TFLOPS)), cpuGflops: Math.round(c * NODE_GFLOPS),
         // cpuTflops: legacy field for managers pinned before the GFLOPS switch
         cpuTflops: round3(c * NODE_GFLOPS / 1000),
         appPort: appPort || 8080, name: deploymentId, ports: ports || [],
@@ -4608,65 +4614,56 @@ if (RELAY_SERVICES)
 // tenants mid-lease over a probe that may simply be restarting.
 // (`_shieldedAdopted` is declared with the card pool above, because the pool
 // math reads it and the POOL_SELFTEST seam runs before this point.)
-function adoptShieldedCard(v) {
-  if (_shieldedAdopted || !v) return;
+function adoptShieldedCards(values) {
+  if (!values.length) return;
   _shieldedAdopted = true;
-  GPU_COUNT = 1;
   IS_GPU = true;
-  CARD_VRAM_GB = v.vramBudgetGb > 0 ? v.vramBudgetGb : v.vramGb;
   CARD_VRAM_SRC = "shielded-probe";
-  // CARD_TFLOPS is a SIZING UNIT, not a performance claim: gpuShareOf divides an
-  // app's declared TFLOPS by it to decide what share the app must buy. So it has
-  // to be on the SAME BASIS as every other box, all of which quote the vendor's
-  // dense fp16 tensor figure (GPU_TFLOPS, 989 for an H200).
-  //
-  // It used to be the worker's MEASURED masked throughput, which is ~25x smaller
-  // and made this box uncomparable AND unusable: at 1.6 TFLOPS an app declaring
-  // 5 computed a 312% share and could not be placed here at all, while the fleet
-  // saw a card 600x weaker than kryptos rather than the ~25x it really is.
-  //
-  // The measured figure has not gone anywhere -- it rides in the shielded block
-  // as gmacPerSec, where it describes what the masked path actually delivers.
-  // These are two different questions and they now have two different fields.
-  //
-  // The DEDICATED SLICE is this enclave's card, and the worker's own report
-  // already IS the slice: under the host MPS cap (computeShare →
-  // CUDA_MPS_ACTIVE_THREAD_PERCENTAGE, enclave-metal.mjs) the driver hands the
-  // worker a capped device — cudaGetDeviceProperties on metal0 at 50% returns
-  // 22 SMs / 20.4 rated TFLOPS, not 46 / 42.7. So take the figures VERBATIM.
-  // Scaling by computeShare here books the cap twice — shipped briefly in
-  // v0.5.533 and the box advertised a 10.2-TFLOPS quarter-card. Verbatim is
-  // also right when MPS is down (fail-open): the worker then sees — and
-  // genuinely has — the whole card, and the box advertises what it can burn.
-  // A tenant's gpuShare is a fraction of the slice, still on the vendor-rated
-  // basis (5 declared TFLOPS buys 5 rated TFLOPS of silicon here exactly as
-  // on kryptos). computeShare rides the shielded block as config context.
-  // VRAM is NOT MPS-capped: vramBudgetGb is its own dedicated-VRAM knob.
-  if (v.cardTflops > 0) CARD_TFLOPS = round1(v.cardTflops);
-  else if (v.gmacPerSec > 0) CARD_TFLOPS = round1(v.gmacPerSec * 2 / 1000);   // older probe: no rated figure
-  if (v.smCount > 0) SM_TOTAL = v.smCount;
-  if (v.pricePerSec6 > 0) SELL_GPU_PRICE6 = v.pricePerSec6;
-  if (gpuCards.length === 0)
-    gpuCards.push({ id: 0, uuid: null, vramFree: CARD_VRAM_GB, computeFree: 1 });
-  console.log(`[gpu] adopting the SHIELDED card as this enclave's card: ${v.card} `
-            + `${CARD_VRAM_GB} GB, ${CARD_TFLOPS} TFLOPS rated`
-            + (v.computeShare > 0 && v.computeShare < 1 ? ` (the ${Math.round(v.computeShare * 100)}% dedicated slice, as the driver reports it)` : "")
-            + ` (masked path measured ${v.gmacPerSec} G-MAC/s), at ${v.endpoint} on the untrusted host`);
+  for (const card of gpuCards) if (card.shielded) card.available = false;
+  for (const v of values) {
+    while (gpuCards.length <= v.id)
+      gpuCards.push({ id: gpuCards.length, uuid: null, vramFree: 0, computeFree: 1,
+                      vramTotal: 0, shielded: true, available: false });
+    const card = gpuCards[v.id];
+    const budget = v.vramBudgetGb > 0 ? v.vramBudgetGb : v.vramGb;
+    const old = card.vramTotal ?? CARD_VRAM_GB;
+    card.vramFree = Math.max(0, card.vramFree + budget - old);
+    card.vramTotal = budget;
+    card.shielded = true;
+    card.available = true;
+    card.proof = v;
+    card.uuid = v.deviceUuid || card.uuid;
+  }
+  GPU_COUNT = gpuCards.length;
+  // Legacy consumers have one sizing unit. Use a conservative per-card floor;
+  // each actual allocation and launch uses the selected card's own budget.
+  const known = gpuCards.filter(c => c.shielded && c.vramTotal > 0);
+  CARD_VRAM_GB = Math.min(...known.map(c => c.vramTotal));
+  const rated = known.map(c => c.proof?.cardTflops || (c.proof?.gmacPerSec || 0) * 2 / 1000).filter(v => v > 0);
+  if (rated.length) CARD_TFLOPS = round1(Math.min(...rated));
+  const sms = known.map(c => c.proof?.smCount || 0).filter(v => v > 0);
+  if (sms.length) SM_TOTAL = Math.min(...sms);
+  const prices = known.map(c => c.proof?.pricePerSec6 || 0).filter(v => v > 0);
+  if (prices.length) SELL_GPU_PRICE6 = Math.min(...prices);
 }
 
 const SHIELDED_VERDICT = process.env.SHIELDED_VERDICT || "/run/shielded-gpu.json";
-let _shieldedCache = { at: 0, val: null };
-function shieldedCapacity() {
+let _shieldedCache = { at: 0, cards: [] };
+function shieldedCapacity(cardId = null) {
   const now = Date.now();
-  if (now - _shieldedCache.at < 10_000) return _shieldedCache.val;
-  let val = null;
-  try {
-    const v = JSON.parse(readFileSync(SHIELDED_VERDICT, "utf8"));
-    // Every claim the probe makes must hold. A partial pass is not a pass: a card
-    // whose product came back exact but whose worker accepted a denylisted op is
-    // not one this box should be selling access to.
-    if (v && v.exact && v.verified && v.lie_rejected && v.denylist_refused && v.vram_total_gb > 0) {
-      val = {
+  if (now - _shieldedCache.at >= 10_000) {
+    const cards = [], ids = new Set(), endpoints = new Set(), devices = new Set();
+    try {
+      const raw = JSON.parse(readFileSync(SHIELDED_VERDICT, "utf8"));
+      for (const v of Array.isArray(raw?.cards) ? raw.cards : [raw]) {
+        const id = v?.id === undefined ? 0 : Number(v.id);
+        if (!v || !v.exact || !v.verified || !v.lie_rejected || !v.denylist_refused || !(v.vram_total_gb > 0)) continue;
+        if (!Number.isInteger(id) || id < 0 || id >= 16 || ids.has(id) || !v.endpoint || endpoints.has(v.endpoint)) continue;
+        if (v.deviceUuid && devices.has(String(v.deviceUuid).toLowerCase())) continue;
+        ids.add(id); endpoints.add(v.endpoint); if (v.deviceUuid) devices.add(String(v.deviceUuid).toLowerCase());
+        cards.push({
+        id,
+        deviceUuid: String(v.deviceUuid || ""),
         card: String(v.name || "gpu").slice(0, 64),
         vramGb: Number(v.vram_total_gb) || 0,
         // vram_free_gb is what the card can still be SOLD for: the budget minus
@@ -4697,12 +4694,55 @@ function shieldedCapacity() {
         tenantEnv: Object.fromEntries(Object.entries((v.tenantEnv && typeof v.tenantEnv === "object") ? v.tenantEnv : {})
           .filter(([k, val]) => /^SHIELDED_[A-Z0-9_]{0,63}$/.test(k) && typeof val === "string" && val.length <= 256)
           .slice(0, 32)),
-      };
+      });
+      }
+    } catch {} // An absent or malformed verdict withdraws capacity, not leases.
+    for (const card of gpuCards) if (card.shielded) card.available = false;
+    adoptShieldedCards(cards);
+    _shieldedCache = { at: now, cards };
+  }
+  return cardId == null ? (_shieldedCache.cards[0] || null)
+    : (_shieldedCache.cards.find(c => c.id === Number(cardId)) || null);
+}
+
+function shieldedLaunchSpec(cardId, gpuShare, vramGb) {
+  const card = shieldedCapacity(cardId ?? 0);
+  if (!card) throw new Error(`Shielded GPU ${cardId ?? 0} is unavailable; refusing to route its lease to another card`);
+  return {
+    endpoint: card.endpoint, cardId: card.id,
+    vramGb: vramGb ?? round1(gpuShare * (card.vramBudgetGb || card.vramGb)),
+    ...(card.vsockPort ? { vsockPort: card.vsockPort } : {}),
+    ...(Object.keys(card.tenantEnv || {}).length ? { tenantEnv: card.tenantEnv } : {}),
+  };
+}
+
+// Exercise the production allocator and launch routing against a changing
+// verdict without starting services or touching a real device.
+if (process.env.SHIELDED_POOL_SELFTEST) {
+  const actions = JSON.parse(process.env.SHIELDED_POOL_SELFTEST), handles = new Map(), results = [];
+  shieldedCapacity();
+  for (const action of actions) {
+    if (action.verdict) {
+      writeFileSync(SHIELDED_VERDICT, JSON.stringify(action.verdict));
+      _shieldedCache.at = 0; shieldedCapacity();
     }
-  } catch { val = null; }        // absent on every box that has no shielded card
-  if (val) adoptShieldedCard(val);
-  _shieldedCache = { at: now, val };
-  return val;
+    let handle, route, error;
+    if (action.alloc) {
+      const q = normalizeGpuReq(action.alloc.gpu, action.alloc.cpu);
+      handle = allocGpu(q.vramGb, q.computeShare, q.cpuShare);
+      if (handle) { handles.set(action.alloc.name, handle); deployments.set(action.alloc.name, { status: 'running', _gpu: handle }); }
+    }
+    if (action.launch) {
+      const h = handles.get(action.launch);
+      try { route = shieldedLaunchSpec(h.cardId, h.computeShare, h.vramGb); }
+      catch (e) { error = e.message; }
+    }
+    if (action.release) { releaseGpu(handles.get(action.release)); handles.delete(action.release); deployments.delete(action.release); }
+    if (action.reconcile) reconcilePools();
+    results.push({ handle, route, error, free: maxFreeGpuShare(), cpu: maxFreeCpu(),
+      cards: gpuCards.map(c => ({ id: c.id, total: cardVram(c), free: c.vramFree, available: c.available })) });
+  }
+  console.log(JSON.stringify(results)); process.exit(0);
 }
 
 // SHIELDED_SELFTEST=1 with SHIELDED_VERDICT pointing at a verdict file: parse
@@ -4711,9 +4751,9 @@ function shieldedCapacity() {
 // above (test/shielded-capacity.test.mjs drives it).
 if (process.env.SHIELDED_SELFTEST) {
   const sh = shieldedCapacity();
-  const gpuFree = !sh ? 0
-    : Math.min(maxFreeGpuShare(), CARD_VRAM_GB > 0 ? sh.vramFreeGb / CARD_VRAM_GB : 0);
+  const gpuFree = !sh ? 0 : maxFreeGpuShare();
   console.log(JSON.stringify({ shielded: sh, cardVramGb: _shieldedAdopted ? CARD_VRAM_GB : 0,
+                               cards: _shieldedCache.cards,
                                cardTflops: _shieldedAdopted ? CARD_TFLOPS : 0,
                                smTotal: _shieldedAdopted ? SM_TOTAL : 0, gpuShareFree: round3(gpuFree),
                                vramFreeGb: _shieldedAdopted ? round1(gpuFree * CARD_VRAM_GB) : 0 }));
@@ -4762,6 +4802,9 @@ app.get("/availability", async (_req, res) => {
       // inside the block, because that is where every price consumer already
       // looks. The block carries what the card IS; the ask is what it costs.
       return { shielded: sh,
+               shieldedCards: _shieldedCache.cards.map(v => ({ ...v,
+                 gpuShareFree: round3(Math.max(0, Math.min(gpuCards[v.id].computeFree,
+                   cardFreeVram(gpuCards[v.id]) / cardVram(gpuCards[v.id])))) })),
                ...(sh.pricePerSec6 > 0 ? { askShieldedPricePerSec6: sh.pricePerSec6 } : {}) };
     })(),   // a card on the UNTRUSTED host, reached by masked offload; NOT `gpu` — see shieldedCapacity()
     ...(RELAY_SERVICES ? { relay: RELAY_SERVICES } : {}),   // network this box carries for the fleet; see the block above
@@ -4824,8 +4867,7 @@ app.get("/availability", async (_req, res) => {
     // advertise no free capacity, without retracting the card itself.
     const shNow = shieldedCapacity();
     const gpuFree = !IS_GPU ? 0
-      : shNow ? Math.min(maxFreeGpuShare(),
-                         CARD_VRAM_GB > 0 ? shNow.vramFreeGb / CARD_VRAM_GB : 0)
+      : shNow ? maxFreeGpuShare()
       : _shieldedAdopted ? 0
       : PROVISION_BACKEND === "vm" ? Math.min(maxFreeGpuShare(), c.gpuShareFree ?? Infinity)
       : (c.gpuShareFree ?? c.maxShare ?? maxFreeGpuShare());
@@ -4928,6 +4970,15 @@ app.get("/availability", async (_req, res) => {
 // backend's ledger AND the device-measured count beside the worker view, so
 // no caller can mistake one container's empty ledger for an empty card.
 app.get("/v1/gpu", async (_req, res) => {
+  shieldedCapacity();
+  if (_shieldedAdopted) return res.json({
+    ok: true, role: "shielded", cards: gpuCards.filter(c => c.shielded).map(c => ({
+      ...c.proof, id: c.id, available: !!c.available,
+      vramBudgetGb: cardVram(c), vramLedgerFreeGb: round3(c.vramFree),
+      vramFreeGb: round3(Math.max(0, cardFreeVram(c))),
+      gpuShareFree: round3(Math.max(0, Math.min(c.computeFree, cardFreeVram(c) / cardVram(c) || 0))),
+    })),
+  });
   if (!IS_GPU) return fail(res, 404, "no_gpu", "This is a CPU-only enclave: no GPU is attached.");
   try {
     const h = await mgrHealth(5000);
