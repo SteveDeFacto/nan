@@ -6073,6 +6073,7 @@ class _CpuProfile:
     SIGUSR2 toggles the library, so duplicate requests must never re-signal.
     """
     LIB = "/usr/lib/x86_64-linux-gnu/libprofiler.so.0"
+    OMP_LIB = "/opt/enclave/shielded/libenclave-omp-profile.so"
     MAX_BYTES = 16 * 1024 * 1024
 
     def __init__(self):
@@ -6097,8 +6098,10 @@ class _CpuProfile:
             raise ValueError("CPU profiler is unavailable in this runtime")
         if not pathlib.Path("/proc/self/status").is_file() or not pathlib.Path("/proc/self/maps").is_file():
             raise ValueError("CPU profiling requires native procfs (status and mappings)")
+        if not pathlib.Path(cls.OMP_LIB).is_file():
+            raise ValueError("OpenMP timing companion is unavailable in this runtime")
         profile = cls()
-        env["LD_PRELOAD"] = " ".join(filter(None, [cls.LIB, env.get("LD_PRELOAD")]))
+        env["LD_PRELOAD"] = " ".join(filter(None, [cls.LIB, cls.OMP_LIB, env.get("LD_PRELOAD")]))
         env.update(CPUPROFILE=str(profile.directory / "capture"),
                    CPUPROFILESIGNAL=str(signal.SIGUSR2), CPUPROFILE_FREQUENCY="49")
         env.pop("CPUPROFILE_REALTIME", None)

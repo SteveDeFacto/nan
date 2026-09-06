@@ -14,6 +14,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <dlfcn.h>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -339,6 +340,17 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
     if (loc)  *loc  += s.local_nodes;
     if (macs) *macs += s.macs;
     if (vf)   *vf   += s.verify_fail;
+    }
+    if (getenv("SHIELDED_PROFILE")) {
+        using snapshot_fn = void (*)(uint64_t *);
+        static auto snapshot = reinterpret_cast<snapshot_fn>(dlsym(RTLD_DEFAULT, "enclave_omp_profile_snapshot"));
+        if (snapshot) {
+            uint64_t values[3] = {};
+            snapshot(values);
+            if (values[0]) fprintf(stderr, "[shielded] omp-profile: regions=%llu wall=%.3fms caller=%.3fms entry-exit=%.3fms\n",
+                    (unsigned long long)values[0], values[1] / 1e6, values[2] / 1e6,
+                    (values[1] - values[2]) / 1e6);
+        }
     }
 }
 

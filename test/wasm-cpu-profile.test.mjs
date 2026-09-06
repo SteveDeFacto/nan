@@ -30,7 +30,7 @@ with patch.object(pathlib.Path, 'is_file', return_value=True):
  assert p.directory.parent == m.LOG_DIR
  assert p.directory.stat().st_mode & 0o777 == 0o700
  assert env['CPUPROFILE'] == str(p.directory / 'capture')
- assert env['LD_PRELOAD'] == m._CpuProfile.LIB
+ assert env['LD_PRELOAD'] == m._CpuProfile.LIB + ' ' + m._CpuProfile.OMP_LIB
  assert p.read()['state'] == 'idle'
  p.cleanup()
  assert not p.directory.exists()
@@ -150,6 +150,10 @@ test("real gperftools signal capture produces a readable file and leaves process
   { skip: !nativeLib }, () => {
   python(`
 m._CpuProfile.LIB = ${JSON.stringify(nativeLib)}
+m._CpuProfile.OMP_LIB = str(pathlib.Path(tmp) / 'libenclave-omp-profile.so')
+subprocess.run(['cc', '-std=c11', '-O2', '-fPIC', '-shared',
+ ${JSON.stringify(new URL('../wasm/ggml-shielded/shielded-omp-profile.c', import.meta.url).pathname)},
+ '-ldl', '-lpthread', '-o', m._CpuProfile.OMP_LIB], check=True)
 env = dict(os.environ)
 p = m._CpuProfile.prepare('{"nnCpuProfile":true}', env)
 proc = subprocess.Popen(['sleep', '10'], env=env, stderr=subprocess.DEVNULL)

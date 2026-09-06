@@ -351,6 +351,11 @@ function buildShieldedBackend(dstRoot) {
              '-L' + libDir, '-lggml-base', '-lpthread', '-lm',
              '-Wl,-rpath,/usr/local/lib']);
   fs.chmodSync(so, 0o755);
+  const ompProfileSrc = path.join(SHIELDED_CODE, 'shielded-omp-profile.c');
+  const ompProfileSo = path.join(dstRoot, 'libenclave-omp-profile.so');
+  sh('cc', [...base, '-std=c11', '-shared', ompProfileSrc, '-ldl', '-lpthread', '-o', ompProfileSo]);
+  sources.push({ name: 'shielded-omp-profile.c', sha256: sha256File(ompProfileSrc) });
+  fs.chmodSync(ompProfileSo, 0o755);
   const ver = (c) => { try { return out(c, ['--version']).split('\n')[0].trim(); } catch { return 'unknown'; } };
   return { ggml: have, cc: ver('cc'), cxx: ver('c++'), sources,
            vendoredHeaders: fs.readdirSync(vendorDir).filter((f) => /\.h$/.test(f)).sort()
@@ -377,6 +382,7 @@ if (fs.existsSync(SHIELDED_SRC)) {
 
   shieldedBuild = buildShieldedBackend(dstRoot);          // throws rather than shipping stale code
   record(path.join(dstRoot, 'libggml-shielded.so'), 'libggml-shielded.so');
+  record(path.join(dstRoot, 'libenclave-omp-profile.so'), 'libenclave-omp-profile.so');
   console.log(`[build]   built from source against ggml ${shieldedBuild.ggml} (${shieldedBuild.cc})`);
 
   // DATA ONLY from the overlay directory. A .so found here is ignored and said
