@@ -1,7 +1,8 @@
 // Real-model regression for device sampling after prefix-cache slot expansion.
 // Build wasm/ggml-shielded/bench-spec against the shim under test, then set
 // ENCLAVE_MTP_TEST_BENCH and ENCLAVE_MTP_TEST_MODEL (a small MTP GGUF).
-// LD_LIBRARY_PATH selects the matching engine/shim; no GPU is required.
+// LD_LIBRARY_PATH selects the matching engine/shim. Set BACKENDS to that
+// release's libggml-cpu.so (the bench loads modules explicitly); no GPU is required.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
