@@ -795,12 +795,12 @@ static int ell_mtp_bind(void) {
     return ell_nextn_set != NULL && ell_nextn_ith != NULL;
 }
 
-/* device-sampling: at most this many head sequences get a backend sampler
- * chain (they must outlive the context, so the chains live on ell_mtp) */
-#define ELL_MTP_MAX_SMPL 8
+/* Every head sequence needs a sampler, including IDs used by prefix parks.
+ * The chains must outlive the context, so ell_mtp owns the array. */
 struct ell_mtp {
     int32_t dev_sample;
-    struct llama_sampler *smpl[ELL_MTP_MAX_SMPL];
+    struct llama_sampler **smpl;
+    int32_t n_smpl;
     struct llama_context *head;
     void *model;
     int32_t n_embd;
@@ -820,7 +820,7 @@ int32_t ell_mtp_available(void *model) {
 void *ell_mtp_new(void *model, void *target_ctx, uint32_t n_ctx, uint32_t n_batch,
                   uint32_t n_seq_max, int32_t type_k, int32_t type_v, int32_t flash_attn) {
     struct llama_model *lm = (struct llama_model *)model;
-    if (llama_model_n_layer_nextn(lm) <= 0 || !ell_mtp_bind()) {
+    if (n_seq_max > INT32_MAX || llama_model_n_layer_nextn(lm) <= 0 || !ell_mtp_bind()) {
         return NULL;
     }
     struct llama_context_params p = llama_context_default_params();
@@ -853,9 +853,13 @@ void *ell_mtp_new(void *model, void *target_ctx, uint32_t n_ctx, uint32_t n_batc
     const char *ds_env = getenv("ENCLAVE_MTP_DEV_SAMPLE");
     int32_t want_dev = (ds_env && *ds_env == '1') ? 1 : 0;
     int32_t ns_dev = (int32_t)(n_seq_max ? n_seq_max : 1);
-    if (ns_dev > ELL_MTP_MAX_SMPL) { ns_dev = ELL_MTP_MAX_SMPL; }
-    struct llama_sampler *chains[ELL_MTP_MAX_SMPL] = {0};
-    struct llama_sampler_seq_config scfg[ELL_MTP_MAX_SMPL];
+    struct llama_sampler **chains = NULL;
+    struct llama_sampler_seq_config *scfg = NULL;
+    if (want_dev) {
+        chains = calloc((size_t)ns_dev, sizeof(*chains));
+        scfg = calloc((size_t)ns_dev, sizeof(*scfg));
+        if (!chains || !scfg) { want_dev = 0; }
+    }
     if (want_dev) {
         for (int32_t s = 0; s < ns_dev; s++) {
             struct llama_sampler_chain_params cp = llama_sampler_chain_default_params();
@@ -881,14 +885,23 @@ void *ell_mtp_new(void *model, void *target_ctx, uint32_t n_ctx, uint32_t n_batc
         want_dev = 0;
         head = llama_init_from_model(lm, p);
     }
-    if (!head) {
-        for (int32_t s = 0; s < ns_dev; s++) { if (chains[s]) { llama_sampler_free(chains[s]); } }
-        return NULL;
+    free(scfg);
+    struct ell_mtp *m = head ? calloc(1, sizeof(*m)) : NULL;
+    if (!m && head) { llama_free(head); head = NULL; }
+    if (!m || !want_dev) {
+        if (chains) {
+            for (int32_t s = 0; s < ns_dev; s++) { if (chains[s]) { llama_sampler_free(chains[s]); } }
+            free(chains);
+            chains = NULL;
+        }
+        if (!m) {
+            return NULL;
+        }
     }
-    struct ell_mtp *m = calloc(1, sizeof(*m));
     m->head = head;
     m->dev_sample = want_dev;
-    for (int32_t s = 0; s < ELL_MTP_MAX_SMPL; s++) { m->smpl[s] = chains[s]; }
+    m->smpl = chains;
+    m->n_smpl = want_dev ? ns_dev : 0;
     m->model = model;
     m->n_embd = llama_model_n_embd(lm);
     m->n_seq = (int32_t)(n_seq_max ? n_seq_max : 1);
@@ -917,9 +930,10 @@ void ell_mtp_free(void *mp) {
     m->batch.token = NULL;
     llama_batch_free(m->batch);
     llama_free(m->head);
-    for (int32_t s = 0; s < ELL_MTP_MAX_SMPL; s++) {
+    for (int32_t s = 0; s < m->n_smpl; s++) {
         if (m->smpl[s]) { llama_sampler_free(m->smpl[s]); m->smpl[s] = NULL; }
     }
+    free(m->smpl);
     for (int32_t s = 0; s < m->n_seq; s++) { free(m->verify_h[s]); }
     free(m->verify_h);
     free(m->verify_rows);

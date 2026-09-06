@@ -41,16 +41,6 @@
 
 static int env_int(const char *k, int d) { const char *v = getenv(k); return v ? atoi(v) : d; }
 
-/* Mirror of enclave_llama.c's `struct ell_mtp` head, only to reach the head
- * context and give it the same thread count as the target (the shim leaves
- * it at llama's default 4). Validated before use: the pointer must be a
- * context of THIS model with the n_ctx we asked for, else we leave it alone. */
-struct ell_mtp_mirror {
-    int32_t dev_sample;
-    struct llama_sampler *smpl[8];
-    struct llama_context *head;
-};
-
 static void json_text(const std::string &s) {
     for (char c : s) { if (c == '"') printf("\\\""); else if (c == '\\') printf("\\\\"); else if (c == '\n') printf(" "); else if ((unsigned char)c >= 32) putchar(c); }
 }
@@ -63,8 +53,14 @@ int main(int argc, char **argv) {
     const int   K     = env_int("K", 4);
     const float p_min = getenv("P_MIN") ? (float)atof(getenv("P_MIN")) : 0.0f;
     const int   threads = env_int("THREADS", 8);
+    const int   seq = env_int("SEQ_ID", 0);
+    const int   n_seqs = env_int("N_SEQS", seq + 1);
     const uint32_t n_ctx = 1024, n_batch = 1024;
     if (K < 1 || K > 16) { fprintf(stderr, "K must be 1..16\n"); return 2; }
+    if (seq < 0 || seq >= n_seqs || n_seqs > 1024) { fprintf(stderr, "invalid SEQ_ID/N_SEQS\n"); return 2; }
+    /* The shim's supported setting reaches both contexts; do not inspect its
+     * private struct layout to find the head. High IDs exercise prefix parks. */
+    { char b[16]; snprintf(b, sizeof b, "%d", threads); setenv("ENCLAVE_GGML_N_THREADS", b, 1); }
     /* the no-branch verify needs K snapshots of recurrent state (see header) */
     if (!getenv("ENCLAVE_GGML_N_RS_SEQ")) { char b[8]; snprintf(b, sizeof b, "%d", K); setenv("ENCLAVE_GGML_N_RS_SEQ", b, 1); }
 
@@ -95,7 +91,7 @@ int main(int argc, char **argv) {
             ell_mtp_available(model), llama_model_n_layer_nextn((llama_model *)model), ell_model_recurrent(model));
     if (!ell_mtp_available(model)) { fprintf(stderr, "no MTP head in this GGUF (n_layer_nextn=0)\n"); return 4; }
 
-    void *ctx = ell_new_server(model, n_ctx, n_batch, 1, 0, 0, 0);
+    void *ctx = ell_new_server(model, n_ctx, n_batch, n_seqs, 0, 0, 0);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 2; }
     llama_set_n_threads((llama_context *)ctx, threads, threads);
     const int depth = ell_rewind_depth(ctx);
@@ -121,7 +117,7 @@ int main(int argc, char **argv) {
     double plain_ms = 0, plain_prefill_ms = 0;
     {
         const int64_t a = ggml_time_us();
-        if (ell_decode_seq_full(ctx, model, 0, 0, toks.data(), n, plog.data())) { fprintf(stderr, "plain prefill failed\n"); return 2; }
+        if (ell_decode_seq_full(ctx, model, seq, 0, toks.data(), n, plog.data())) { fprintf(stderr, "plain prefill failed\n"); return 2; }
         const int64_t b = ggml_time_us();
         plain_prefill_ms = (b - a) / 1e3;
         int t = argmax(plog.data() + (size_t)(n - 1) * nv);
@@ -129,31 +125,25 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_predict; i++) {
             plain.push_back(t);
             if (llama_vocab_is_eog(vocab, t)) break;
-            if (ell_decode_seq_full(ctx, model, 0, pos, &t, 1, logits.data())) { fprintf(stderr, "plain decode failed\n"); return 2; }
+            if (ell_decode_seq_full(ctx, model, seq, pos, &t, 1, logits.data())) { fprintf(stderr, "plain decode failed\n"); return 2; }
             pos++;
             t = argmax(logits.data());
         }
         plain_ms = (ggml_time_us() - b) / 1e3;
-        ell_seq_remove(ctx, 0);
+        ell_seq_remove(ctx, seq);
     }
     const int plain_gen = (int)plain.size();
 
     /* ---- 2. speculative ---- */
-    void *mtp = ell_mtp_new(model, ctx, n_ctx, n_batch, 1, 0, 0, 0);
+    void *mtp = ell_mtp_new(model, ctx, n_ctx, n_batch, n_seqs, 0, 0, 0);
     if (!mtp) { fprintf(stderr, "ell_mtp_new failed\n"); return 2; }
-    {
-        ell_mtp_mirror *mm = (ell_mtp_mirror *)mtp;
-        if (mm->head && llama_get_model(mm->head) == (llama_model *)model && llama_n_ctx(mm->head) == n_ctx)
-            llama_set_n_threads(mm->head, threads, threads);
-        else fprintf(stderr, "[bench] head context not reachable; head stays at llama's default threads\n");
-    }
     std::vector<int32_t> spec; std::string text;
     int rounds = 0, drafted = 0, accepted = 0, obs_fail = 0;
     double draft_ms = 0, verify_ms = 0, spec_ms = 0, spec_prefill_ms = 0;
     {
         const int64_t a = ggml_time_us();
-        if (ell_decode_seq_full(ctx, model, 0, 0, toks.data(), n, plog.data())) { fprintf(stderr, "spec prefill failed\n"); return 2; }
-        ell_mtp_harvest(mtp, ctx, 0, n);
+        if (ell_decode_seq_full(ctx, model, seq, 0, toks.data(), n, plog.data())) { fprintf(stderr, "spec prefill failed\n"); return 2; }
+        ell_mtp_harvest(mtp, ctx, seq, n);
         const int64_t b = ggml_time_us();
         spec_prefill_ms = (b - a) / 1e3;
         int id_last = argmax(plog.data() + (size_t)(n - 1) * nv);
@@ -166,28 +156,28 @@ int main(int argc, char **argv) {
         spec.push_back(id_last);
         while ((int)spec.size() < n_predict && !llama_vocab_is_eog(vocab, id_last)) {
             const int64_t d0 = ggml_time_us();
-            int k = ell_mtp_draft2(mtp, 0, id_last, n_past, K, p_min, drafts.data(),
+            int k = ell_mtp_draft2(mtp, seq, id_last, n_past, K, p_min, drafts.data(),
                                    obs_pos0, obs.data(), (int)obs.size());
             const int64_t d1 = ggml_time_us();
             draft_ms += (d1 - d0) / 1e3;
             if (k == 0 && !obs.empty()) {
                 /* draft2 returns 0 on a failed observe: re-sync explicitly
                  * (the engine's recovery path) and take a plain step */
-                if (ell_mtp_observe(mtp, 0, obs_pos0, obs.data(), (int)obs.size()) != 0) obs_fail++;
+                if (ell_mtp_observe(mtp, seq, obs_pos0, obs.data(), (int)obs.size()) != 0) obs_fail++;
             }
             ids.assign(1, id_last);
             ids.insert(ids.end(), drafts.begin(), drafts.begin() + k);
             const int64_t v0 = ggml_time_us();
-            if (ell_decode_seq_full(ctx, model, 0, n_past, ids.data(), (int)ids.size(), logits.data())) {
+            if (ell_decode_seq_full(ctx, model, seq, n_past, ids.data(), (int)ids.size(), logits.data())) {
                 fprintf(stderr, "verify decode failed at round %d\n", rounds); return 2;
             }
-            ell_mtp_harvest(mtp, ctx, 0, (int)ids.size());
+            ell_mtp_harvest(mtp, ctx, seq, (int)ids.size());
             verify_ms += (ggml_time_us() - v0) / 1e3;
             int acc = 0;
             for (; acc < k; acc++) if (argmax(logits.data() + (size_t)acc * nv) != drafts[acc]) break;
             const int t_new = argmax(logits.data() + (size_t)acc * nv);
             /* drop the rejected tail; the next decode continues at n_past+acc+1 */
-            if (acc < k && ell_seq_rewind(ctx, 0, n_past + acc + 1) != 0) {
+            if (acc < k && ell_seq_rewind(ctx, seq, n_past + acc + 1) != 0) {
                 fprintf(stderr, "rewind refused at round %d (acc %d of %d)\n", rounds, acc, k); return 2;
             }
             obs.assign(ids.begin(), ids.begin() + acc + 1);
