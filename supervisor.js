@@ -1614,7 +1614,9 @@ if (process.env.REACH_SELFTEST) {
 function sweepPartition(ledger, enclaveId, nowMs, isLocallyServing) {
   const own = [], rest = [];
   for (const d of ledger) {
-    const ours = Number(d.leaseUntil) * 1000 > nowMs && d.runner === enclaveId
+    // A stopped deployment may still have an unexpired orphan lease. It
+    // cannot resume, so it must not hold new claims until that lease expires.
+    const ours = d.active !== false && Number(d.leaseUntil) * 1000 > nowMs && d.runner === enclaveId
       && !isLocallyServing(d.id);
     (ours ? own : rest).push(d);
   }
@@ -9541,4 +9543,3 @@ if (DOMAINS_API) {
   refreshCustomDomains().catch(() => {});
   console.log(`[domains] custom hostnames via ${DOMAINS_API}`);
 }
-

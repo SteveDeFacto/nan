@@ -58,6 +58,19 @@ test("no own leases -> nothing to resume, nothing held", async () => {
   assert.deepEqual(r.rest, ["a", "b"]);
 });
 
+test("a deactivated orphan lease does not hold new claims after a restart", async () => {
+  const r = await partition({
+    enclaveId: US, nowMs: NOW, serving: [],
+    ledger: [
+      { id: "stopped", runner: US, leaseUntil: LIVE, active: false },
+      { id: "new", runner: NONE, leaseUntil: 0, active: true },
+      { id: "resume", runner: US, leaseUntil: LIVE, active: true },
+    ],
+  });
+  assert.deepEqual(r.own, ["resume"], "only resumable leases hold the sweep");
+  assert.deepEqual(r.rest, ["stopped", "new"], "considerClaim still refuses the stopped record");
+});
+
 test("unregistered enclave (null id) owns nothing", async () => {
   const r = await partition({
     enclaveId: null, nowMs: NOW, serving: [],
