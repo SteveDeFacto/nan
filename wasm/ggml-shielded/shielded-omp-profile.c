@@ -30,7 +30,8 @@ static void resolve_parallel(void) {
     if (lib) real_parallel = (parallel_fn)dlsym(lib, "GOMP_parallel");
     if (!real_parallel) {
         static const char message[] = "OpenMP profile: libgomp ABI unavailable\n";
-        (void)write(STDERR_FILENO, message, sizeof message - 1);
+        const ssize_t written = write(STDERR_FILENO, message, sizeof message - 1);
+        (void)written;
         _exit(127);
     }
 }

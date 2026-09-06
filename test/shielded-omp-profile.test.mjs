@@ -12,7 +12,7 @@ test('OpenMP wall profiling preserves local-library work and excludes inactive/n
   const source = new URL('../wasm/ggml-shielded/shielded-omp-profile.c', import.meta.url).pathname;
   try {
     const library = join(dir, 'profile.so');
-    execFileSync('cc', ['-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-fPIC', '-shared', source,
+    execFileSync('cc', ['-std=c11', '-O2', '-D_FORTIFY_SOURCE=2', '-Wall', '-Wextra', '-Werror', '-fPIC', '-shared', source,
       '-ldl', '-lpthread', '-o', library]);
     writeFileSync(join(dir, 'task.c'), `
 #define _DEFAULT_SOURCE
