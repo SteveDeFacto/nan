@@ -6697,6 +6697,24 @@ app.get("/v1/deployments/:id/logs", authed, async (req, res) => {
   return fail(res, 501, "logs_unavailable", "Log retrieval is only available for wasm (vm) deployments.");
 });
 
+// Native CPU profiles contain process mappings. Apply the same strict owner
+// boundary as logs, including for public apps; never proxy arbitrary paths.
+for (const method of ["get", "post"]) {
+  app[method]("/v1/deployments/:id/cpu-profile", authed, async (req, res) => {
+    const rec = deployments.get(req.params.id);
+    if (!rec || rec.owner !== req.address) return fail(res, 404, "not_found", "No such deployment.");
+    if (PROVISION_BACKEND !== "vm")
+      return fail(res, 501, "profile_unavailable", "CPU profiling requires a wasm deployment.");
+    if (!rec._vmId) return fail(res, 409, "no_instance", "No app instance provisioned here.");
+    try {
+      const r = await vmReq(method.toUpperCase(), `/vms/${encodeURIComponent(rec._vmId)}/cpu-profile`,
+        method === "post" ? req.body : null, 15000);
+      res.set("Cache-Control", "no-store");
+      return res.status(r.status).json(r.body);
+    } catch (e) { return fail(res, 502, "profile_error", String(e.message || "").slice(0, 300)); }
+  });
+}
+
 // Owner restart: stop the app instance and relaunch it in place — same
 // version, same lease, same balance (app state is ephemeral by design). The
 // remedy for a wedged instance the crash detector can't see: the process is

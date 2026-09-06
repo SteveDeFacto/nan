@@ -30,7 +30,7 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu24.04@sha256:39b73679081ed376dbc0a6a
 # gdb: the nn readiness probe captures symbol-level stacks of a hung GPU
 # init (spawns the e2e wasmtime UNDER gdb, interrupts, thread apply all bt)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 ca-certificates curl gdb libgomp1 \
+      python3 ca-certificates curl gdb libgomp1 libgoogle-perftools4 \
     && rm -rf /var/lib/apt/lists/*
 
 # rclone: the encrypted-volumes engine (crypt over S3, driven by the manager's

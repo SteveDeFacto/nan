@@ -45,6 +45,7 @@ Notes:
   ("<prefix>-NNNNN-of-MMMMM.gguf"); the whole family is staged together so
   models larger than HF's 50GB per-file cap load as one graph.
 """
+import base64
 import collections
 import functools
 import hashlib
@@ -5622,13 +5623,19 @@ def _spawn_and_wait(rec, ctx):
         env.update(egress_env)
     logf = open(log_path, "wb")
     try:
+        if nn:
+            rec["_cpu_profile"] = _CpuProfile.prepare(enclave_config, env)
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=logf,
                                 stderr=logf, preexec_fn=_preexec, env=env)
     except Exception as e:
+        if rec.get("_cpu_profile"):
+            rec["_cpu_profile"].cleanup()
         rec["status"], rec["error"] = "failed", f"spawn: {e}"
         logf.close()
         return rec
     rec["_proc"] = proc
+    if rec.get("_cpu_profile"):
+        rec["_cpu_profile"].proc = proc
     # CPU fair-share proportional to the purchased share (on by default) plus
     # the opt-in hard cap. See _apply_cpu_cgroup.
     cg = _apply_cpu_cgroup(rec["id"], proc.pid, float(rec.get("cpuShare") or 0))
@@ -6042,6 +6049,128 @@ def _log_tail(path, n=800) -> str:
         return ""
 
 
+class _CpuProfile:
+    """One bounded, owner-requested gperftools capture per process generation.
+
+    The native library is opt-in and idle until signalled. Its files live
+    outside every WASI preopen; the app cannot replace them with symlinks.
+    SIGUSR2 toggles the library, so duplicate requests must never re-signal.
+    """
+    LIB = "/usr/lib/x86_64-linux-gnu/libprofiler.so.0"
+    MAX_BYTES = 16 * 1024 * 1024
+
+    def __init__(self):
+        self.directory = pathlib.Path(tempfile.mkdtemp(prefix="cpu-profile-", dir=LOG_DIR))
+        self.path = self.directory / "capture.0"  # signal mode adds the capture index
+        self.proc = None
+        self.lock = threading.Lock()
+        self.state = "idle"
+        self.timer = None
+        self.seconds = None
+
+    @classmethod
+    def prepare(cls, config, env):
+        try:
+            enabled = json.loads(config or "{}").get("nnCpuProfile") is True
+        except (ValueError, AttributeError):
+            enabled = False
+        if not enabled:
+            return None
+        if not pathlib.Path(cls.LIB).is_file():
+            raise ValueError("CPU profiler is unavailable in this runtime")
+        profile = cls()
+        env["LD_PRELOAD"] = " ".join(filter(None, [cls.LIB, env.get("LD_PRELOAD")]))
+        env.update(CPUPROFILE=str(profile.directory / "capture"),
+                   CPUPROFILESIGNAL=str(signal.SIGUSR2), CPUPROFILE_FREQUENCY="49")
+        env.pop("CPUPROFILE_REALTIME", None)
+        return profile
+
+    def _open(self):
+        for fd in pathlib.Path(f"/proc/{self.proc.pid}/fd").iterdir():
+            try:
+                if os.readlink(fd) == str(self.path):
+                    return True
+            except FileNotFoundError:
+                pass
+        return False
+
+    def _signal(self, opening):
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError("Profile process has exited")
+        # Never deliver the default terminating action during process startup.
+        status = pathlib.Path(f"/proc/{self.proc.pid}/status").read_text()
+        caught = re.search(r"^SigCgt:\s*([0-9a-f]+)$", status, re.M)
+        if not caught or not (int(caught[1], 16) & (1 << (signal.SIGUSR2 - 1))):
+            raise RuntimeError("CPU profiler signal handler is not ready")
+        self.proc.send_signal(signal.SIGUSR2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("Profile process exited during capture")
+            if self._open() == opening:
+                return
+            time.sleep(0.01)
+        raise RuntimeError("CPU profiler did not acknowledge the signal")
+
+    def start(self, seconds):
+        if type(seconds) is not int or not 1 <= seconds <= 60:
+            raise ValueError("seconds must be an integer from 1 to 60")
+        with self.lock:
+            if self.state != "idle":
+                return self._metadata()
+            self.seconds = seconds
+            # Arm the stop before signalling: even an uncertain acknowledgement
+            # must not leave an unbounded capture running.
+            self.state = "active"
+            self.timer = threading.Timer(seconds, self.stop)
+            self.timer.daemon = True
+            self.timer.start()
+            try:
+                self._signal(True)
+            except (OSError, RuntimeError):
+                self.state = "uncertain"
+                raise
+            return self._metadata()
+
+    def stop(self):
+        with self.lock:
+            if self.state in ("active", "uncertain"):
+                try:
+                    if self.proc is None or self.proc.poll() is not None:
+                        self.state = "incomplete"
+                    elif self._open():
+                        self._signal(False)
+                        self.state = "complete"
+                    else:
+                        self.state = "incomplete"
+                except (OSError, RuntimeError):
+                    self.state = "incomplete"
+            if self.timer:
+                self.timer.cancel()
+            return self._metadata()
+
+    def _metadata(self):
+        return {"state": self.state, "seconds": self.seconds, "frequencyHz": 49,
+                "format": "gperftools", "oneCapturePerProcess": True}
+
+    def read(self):
+        with self.lock:
+            result = self._metadata()
+            if self.state == "complete":
+                with self.path.open("rb") as f:
+                    data = f.read(self.MAX_BYTES + 1)
+                if len(data) > self.MAX_BYTES:
+                    raise ValueError("CPU profile exceeds the download limit")
+                result.update(bytes=len(data), data=base64.b64encode(data).decode("ascii"))
+            return result
+
+    def cleanup(self):
+        self.stop()
+        with self.lock:
+            self.state = "removed"
+            shutil.rmtree(self.directory, ignore_errors=True)
+
+
 def _kill(rec):
     p = rec.get("_proc")
     if p is None:
@@ -6050,6 +6179,8 @@ def _kill(rec):
         if MOCK:
             p.shutdown()
             return
+        if rec.get("_cpu_profile"):
+            rec["_cpu_profile"].stop()
         os.killpg(p.pid, signal.SIGTERM)
         try:
             p.wait(timeout=5)
@@ -6060,6 +6191,8 @@ def _kill(rec):
 
 
 def _rm_fsdir(rec):
+    if rec.get("_cpu_profile"):
+        rec["_cpu_profile"].cleanup()
     d = rec.get("_fsdir")
     if d:
         shutil.rmtree(d, ignore_errors=True)   # ephemeral scratch: nothing to preserve
@@ -6126,6 +6259,31 @@ _b = lambda s: (s or "").encode("utf-8", "surrogateescape")
 
 # ---- HTTP contract --------------------------------------------------------- #
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _cpu_profile_route(self, vid, body=None):
+        with _lock:
+            rec = _apps.get(vid)
+        if not rec:
+            return self._json(404, {"error": "not found"})
+        profile = rec.get("_cpu_profile")
+        if not profile:
+            return self._json(409, {"error": "Launch with nnCpuProfile: true to enable a capture"})
+        try:
+            if body is None:
+                result = profile.read()
+            elif not isinstance(body, dict):
+                raise ValueError("JSON object required")
+            elif body.get("action") == "start":
+                result = profile.start(body.get("seconds", 30))
+            elif body.get("action") == "stop":
+                result = profile.stop()
+            else:
+                raise ValueError("action must be start or stop")
+            return self._json(200, result)
+        except ValueError as e:
+            return self._json(422, {"error": str(e)})
+        except (OSError, RuntimeError) as e:
+            return self._json(409, {"error": str(e)})
+
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
         self.send_response(code)
@@ -6378,6 +6536,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "exited": exit_code is not None,
                                     "exitCode": exit_code,
                                     "status": rec.get("status"), "error": rec.get("error")})
+        m = re.fullmatch(r"/vms/([^/?]+)/cpu-profile", self.path)
+        if m:
+            return self._cpu_profile_route(m.group(1))
         if self.path.startswith("/vms/"):
             vid = self.path[len("/vms/"):]
             with _lock:
@@ -6396,6 +6557,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         if not self._ctrl_authed():
             return self._json(401, {"error": "control token required"})
+        m = re.fullmatch(r"/vms/([^/?]+)/cpu-profile", self.path)
+        if m:
+            return self._cpu_profile_route(m.group(1), self._body())
         # Order an MPS bounce (operator lever, proxied by the supervisor at
         # POST /v1/admin/gpu/bounce-mps): the reclaim for device memory a dead
         # tenant generation's MPS servers still hold. 202 = the order is on

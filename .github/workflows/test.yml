@@ -47,7 +47,7 @@ jobs:
           # script uses only long-stable array APIs, and apt avoids PEP 668's
           # externally-managed-environment refusal that plain `pip install` hits
           # on current runner images.
-          sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools python3-numpy
+          sudo apt-get update -qq && sudo apt-get install -y -qq libarchive-tools python3-numpy libgoogle-perftools4
           npm ci --no-audit --no-fund
           (cd relay && npm ci --no-audit --no-fund)
       - name: node --test
