@@ -1,8 +1,9 @@
 /* Refill oracle: every AVX-512 refill path (the four-row kernel and the
  * row-blocked kernel a batch past four rows takes) against a scalar exact
  * product, over the shapes that matter: K below, at and past the 64-byte
- * vector, the 2048-byte slab boundary, the real 5120/17408 widths and a
- * width past 65536; N from one column to a full tile plus one; batches 1..33
+ * vector, the 2048-byte slab boundary (and exact multiples of it, which the
+ * production 6144/10240 widths are), the real 5120/6144/17408 widths and a
+ * width past 65536; N from one column through one and two full tiles; batches 1..33
  * (every four-row tail and a blocked batch past two tiles); random planes
  * plus the three extreme fillings (alternating-sign rows, all-max, all-min)
  * that overflow a naive accumulator. A mismatch aborts; exit 77 means this
@@ -44,10 +45,11 @@ int main(void) {
     __builtin_cpu_init();
     if (!__builtin_cpu_supports("avx512vnni") || !__builtin_cpu_supports("avx512bw") ||
         !__builtin_cpu_supports("avx512dq") || !__builtin_cpu_supports("avx512vl")) return 77;
-    const int sizes[] = {1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257, 5119, 5120, 17408, 70000};
+    const int sizes[] = {1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257, 2048, 4096, 5119, 5120, 6144, 17408, 70000};
+    const int widths[] = {1, 2, 3, 10, 16, 17, 32}; /* partial tiles, one full tile, two full tiles */
     for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++)
         for (int b = 1; b <= 33; b++)
             for (int extremes = 0; extremes <= 3; extremes++)
-                for (int n = 1; n <= 17; n += (n < 3 ? 1 : 7)) check(sizes[i], n, b, extremes);
+                for (unsigned j = 0; j < sizeof widths / sizeof *widths; j++) check(sizes[i], widths[j], b, extremes);
     return 0;
 }
