@@ -284,48 +284,46 @@ static inline void refill_rows4(const uint8_t *planes, int b, int b0,
                                 const int8_t *W, int64_t K, int64_t N, int32_t *acc /* [3][4][N] */) {
     const int64_t K64 = K & ~(int64_t)63;
     const __mmask64 tail = (K & 63) ? ((__mmask64)1 << (K & 63)) - 1 : 0;
-    const uint8_t *pl[3][4];
-    for (int p = 0; p < 3; p++)
-        for (int r = 0; r < 4; r++) {
-            const int row = b0 + r < b ? b0 + r : b - 1;          /* clamp: duplicates are discarded */
-            pl[p][r] = planes + ((size_t)p * b + row) * K;
-        }
-    /* Two output columns share the twelve plane loads. Keep their 24
-     * accumulators independent: no change to the exact field arithmetic,
-     * mask issue count, output layout, or four-row weight reuse. */
-    for (int64_t j = 0; j < N; j += 2) {
-        const int8_t *w0 = W + j * K;
-        const int8_t *w1 = W + (j + 1 < N ? j + 1 : j) * K;
-        __m512i a[2][3][4];
-        for (int c = 0; c < 2; c++)
-            for (int p = 0; p < 3; p++)
-                for (int r = 0; r < 4; r++) a[c][p][r] = _mm512_setzero_si512();
-        int64_t k = 0;
-        for (; k < K64; k += 64) {
-            const __m512i x0 = _mm512_loadu_si512((const void *)(w0 + k));
-            const __m512i x1 = _mm512_loadu_si512((const void *)(w1 + k));
-            for (int p = 0; p < 3; p++)
-                for (int r = 0; r < 4; r++) {
-                    const __m512i v = _mm512_loadu_si512((const void *)(pl[p][r] + k));
-                    a[0][p][r] = _mm512_dpbusd_epi32(a[0][p][r], v, x0);
-                    a[1][p][r] = _mm512_dpbusd_epi32(a[1][p][r], v, x1);
-                }
-        }
-        if (tail) {
-            const __m512i x0 = _mm512_maskz_loadu_epi8(tail, w0 + k);
-            const __m512i x1 = _mm512_maskz_loadu_epi8(tail, w1 + k);
-            for (int p = 0; p < 3; p++)
-                for (int r = 0; r < 4; r++) {
-                    const __m512i v = _mm512_maskz_loadu_epi8(tail, pl[p][r] + k);
-                    a[0][p][r] = _mm512_dpbusd_epi32(a[0][p][r], v, x0);
-                    a[1][p][r] = _mm512_dpbusd_epi32(a[1][p][r], v, x1);
-                }
-        }
-        for (int p = 0; p < 3; p++)
+    /* Traverse one residue plane at a time and share four input loads across
+     * four output columns. The four mask rows and four weight rows occupy
+     * 40 KiB at K=5120, rather than traversing all twelve mask rows (60 KiB)
+     * at once. Extra passes over this small weight tile reduce input loads
+     * and keep sixteen independent accumulators within the register file.
+     * Field arithmetic, four-row weight reuse and output layout are unchanged. */
+    for (int64_t j = 0; j < N; j += 4) {
+        const int8_t *wp[4];
+        for (int c = 0; c < 4; c++) wp[c] = W + (j + c < N ? j + c : j) * K;
+        for (int p = 0; p < 3; p++) {
+            const uint8_t *pl[4];
             for (int r = 0; r < 4; r++) {
-                acc[(p * 4 + r) * N + j] = _mm512_reduce_add_epi32(a[0][p][r]);
-                if (j + 1 < N) acc[(p * 4 + r) * N + j + 1] = _mm512_reduce_add_epi32(a[1][p][r]);
+                const int row = b0 + r < b ? b0 + r : b - 1; /* duplicates are discarded */
+                pl[r] = planes + ((size_t)p * b + row) * K;
             }
+            __m512i a[4][4];
+            for (int c = 0; c < 4; c++)
+                for (int r = 0; r < 4; r++) a[c][r] = _mm512_setzero_si512();
+            int64_t k = 0;
+            for (; k < K64; k += 64) {
+                __m512i x[4];
+                for (int c = 0; c < 4; c++) x[c] = _mm512_loadu_si512((const void *)(wp[c] + k));
+                for (int r = 0; r < 4; r++) {
+                    const __m512i v = _mm512_loadu_si512((const void *)(pl[r] + k));
+                    for (int c = 0; c < 4; c++) a[c][r] = _mm512_dpbusd_epi32(a[c][r], v, x[c]);
+                }
+            }
+            if (tail) {
+                __m512i x[4];
+                for (int c = 0; c < 4; c++) x[c] = _mm512_maskz_loadu_epi8(tail, wp[c] + k);
+                for (int r = 0; r < 4; r++) {
+                    const __m512i v = _mm512_maskz_loadu_epi8(tail, pl[r] + k);
+                    for (int c = 0; c < 4; c++) a[c][r] = _mm512_dpbusd_epi32(a[c][r], v, x[c]);
+                }
+            }
+            for (int c = 0; c < 4; c++)
+                if (j + c < N)
+                    for (int r = 0; r < 4; r++)
+                        acc[(p * 4 + r) * N + j + c] = _mm512_reduce_add_epi32(a[c][r]);
+        }
     }
 }
 #elif defined(SH_SIMD_NEON)
