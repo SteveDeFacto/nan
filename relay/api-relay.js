@@ -93,6 +93,8 @@ import { handleSecrets, initSecrets, secretsEnabled, startSecretsSweep } from ".
 import { handleDomains, initDomains, domainsEnabled, startDomainSweep, domainDeployment, tlsAskAllowed } from "./domains.js";
 import { handleCerts, initCerts } from "./certs.js";
 import { createTunnelHub } from "./tunnel.js";
+import { createPadsLedger, PADS_EPOCH } from "./pads.mjs";
+import { dataDir } from "./store.js";
 import { boxOrigin, boxLabelOfHost } from "./boxhost.js";
 installProcessGuards("api-relay");
 
@@ -158,6 +160,16 @@ async function tunnelNameOwner(name) {
   const e = await c.readContract({ address: REGISTRY_ADDRESS, abi: GET_ABI, functionName: "get", args: [id] });
   const op = String(e?.operator || "");
   return e?.active && !/^0x0{40}$/i.test(op) ? op.toLowerCase() : null;
+}
+// Dealt pads ledger: created on first use so the data dir and the hub exist.
+let padsLedgerInstance;
+function padsLedger() {
+  if (padsLedgerInstance === undefined) {
+    const d = dataDir();
+    padsLedgerInstance = d ? createPadsLedger({ dir: d, hub: tunnelHub, masterSeed: process.env.PADS_MASTER_SEED || null }) : null;
+    if (!padsLedgerInstance) console.log("[pads] no data dir: the pads ledger is disabled");
+  }
+  return padsLedgerInstance;
 }
 const tunnelHub = createTunnelHub({
   allow: [...DEFAULT_METAL_ALLOW, ...ENV_METAL_ALLOW],
@@ -1598,6 +1610,27 @@ async function gateway(u, req, res) {
     if (!rlUpload(address)) return json(res, 429, { error: "rate_limited", message: "Too many upload authorizations from this wallet; retry later." }, req);
     const token = createHmac("sha256", UPLOAD_KEY).update(`${address}:${hash}:${expiry}`).digest("hex");
     return json(res, 200, { token, address, expiry }, req);
+  }
+
+  // Dealt pads (relay/pads.mjs, shielded/dealer/PLAN.md): the ledger key, a
+  // pVM's seed, and reserve-before-use windows, each authenticated by the
+  // attested tunnel's own transport key rather than an account session.
+  if (p.startsWith("/v1/pads/")) {
+    const L = padsLedger();
+    if (!L) return json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }, req);
+    if (p === "/v1/pads/key" && req.method === "GET") return json(res, 200, { key: L.key(), epoch: PADS_EPOCH }, req);
+    if (p === "/v1/pads/ledger" && req.method === "GET") {
+      const m = L.mark(u.searchParams.get("seed_id") || "");
+      return m ? json(res, 200, m, req) : json(res, 404, { error: "unknown_seed" }, req);
+    }
+    if ((p === "/v1/pads/seed" || p === "/v1/pads/reserve") && req.method === "POST") {
+      let body;
+      try { body = JSON.parse((await readBody(req, 8192)).toString("utf8") || "{}"); }
+      catch (e) { return json(res, e.message === "body too large" ? 413 : 400, { error: "bad_json", message: e.message }, req); }
+      const r = p === "/v1/pads/seed" ? L.seed(body || {}) : L.reserve(body || {});
+      return json(res, r.status, r.body, req);
+    }
+    return json(res, 404, { error: "not_found" }, req);
   }
 
   if (p === "/v1/claim-hint" && req.method === "POST") {

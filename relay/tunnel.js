@@ -172,7 +172,10 @@ export function createTunnelHub({ allow = [], attest = null, reqTimeoutMs = 3000
     const prev = tunnels.get(name);
     if (prev && prev.ws !== ws) { try { prev.ws.terminate(); } catch {} }   // newest wins
     const t = { ws, pending: new Map(), streams: new Map(), lastSeen: Date.now(), mode: meta.mode || "", publicUrl: "",
-                measurement: meta.measurement || null, keyFp: meta.keyFp || "" };
+                measurement: meta.measurement || null, keyFp: meta.keyFp || "",
+                // dealt pads (relay/pads.mjs): the attested transport SPKI signs
+                // ledger requests, the X25519 pad key receives the pVM's seed
+                spki: meta.spki || "", padKey: meta.padKey || "" };
     tunnels.set(name, t);
     console.log(`[tunnel] ${name} attached via ${meta.via || "token"} (${tunnels.size} enclave${tunnels.size === 1 ? "" : "s"})`);
     try { onChange("attach", name); } catch {}   // refresh discovery so it lands in `live` now, not on the next slow poll
@@ -366,8 +369,10 @@ export function createTunnelHub({ allow = [], attest = null, reqTimeoutMs = 3000
               return deny("that name is held by another enclave");
             clearTimeout(timer); settled = true;
             try { ws.send(JSON.stringify({ t: "attest-result", ok: true, measurement: res.measurement })); } catch {}
+            const padKey = /^[0-9a-f]{64}$/.test(String(f.rad.padKey || "")) ? f.rad.padKey : "";
             bind(name, ws, { via: isAvf ? "attestation(avf)" : res.vcekVerified ? "attestation" : "attestation(measurement-only)",
-                             measurement: res.measurement, mode: isAvf ? "avf" : "snp", keyFp });
+                             measurement: res.measurement, mode: isAvf ? "avf" : "snp", keyFp,
+                             spki: spki ? spki.toString("base64") : "", padKey });
           } catch (e) { deny(`verify error: ${e.message}`); }
           finally { verifying = false; }
         });
@@ -455,6 +460,9 @@ export function createTunnelHub({ allow = [], attest = null, reqTimeoutMs = 3000
   return {
     handleUpgrade,
     isTunnel: (origin) => NAME_RE.test(String(origin || "")),
+    // One attached tunnel's identity, for modules that authenticate a tunnel's
+    // own requests (relay/pads.mjs): null when nothing by that name is attached.
+    info: (name) => { const t = tunnels.get(name); return t ? { name, mode: t.mode, keyFp: t.keyFp, spki: t.spki, padKey: t.padKey } : null; },
     nameOf: (origin) => (String(origin || "").match(NAME_RE) || [])[1] || null,
     // synthetic registry rows for the attached tunnels (bypass the dial-based
     // discovery filters; auth already happened at attach time). `endpoint`
