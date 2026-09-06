@@ -1059,3 +1059,17 @@ The engine half is done and measured. The remaining sequence:
    defend: it deliberately implements less than the full SET proposal (see
    "Sharedness, stated exactly") and trades completeness for provable
    soundness.
+
+## Per-deployment inference compute threads
+
+`nnThreads` in the deployment configuration sets the ggml compute-thread count
+for that instance. The manager caps it at the instance's purchased CPU share
+(rounding up to a whole vCPU). Omitting it preserves the engine default. For
+example, `"nnThreads": 4` on a 53% share of a 16-vCPU node uses four compute
+threads; requesting 16 is capped at 9.
+
+This controls the CPU operations surrounding GPU inference. The shielded
+backend's background masking workers have a separate bounded pool, so reducing
+the compute pool can reduce contention while the GPUs perform the matrix
+operations. Benchmark the setting with the same model, context and prompt. It
+does not allocate additional CPUs, alter the model, or reduce the context.

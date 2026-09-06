@@ -72,3 +72,18 @@ test("tracks the node size it is told about", () => {
   assert.equal(mgr("m._available_parallelism_for(0.5)", { NODE_VCPUS: "64" }), 32);
   assert.equal(mgr("m._available_parallelism_for(0.5)", { NODE_VCPUS: "2" }), 1);
 });
+
+test("ggml thread tuning leaves room for GPU helpers without exceeding the tenant share", () => {
+  const e = { NODE_VCPUS: "16" };
+  assert.equal(mgr(`m._nn_threads_for('{"nnThreads":4}', 0.53)`, e), 4);
+  assert.equal(mgr(`m._nn_threads_for('{"nnThreads":16}', 0.53)`, e), 9);
+  assert.equal(mgr(`m._nn_threads_for('{"nnThreads":512}', 0.01)`, e), 1);
+  assert.equal(mgr(`m._nn_threads_for('{"nnThreads":512}', 1.0)`, e), 16);
+});
+
+test("omitted or invalid ggml thread tuning preserves the engine default", () => {
+  for (const config of ['{}', '{"nnThreads":0}', '{"nnThreads":-1}',
+    '{"nnThreads":513}', '{"nnThreads":true}', '{"nnThreads":"4"}', '[]', 'invalid']) {
+    assert.equal(mgr(`m._nn_threads_for(${JSON.stringify(config)}, 0.53)`, { NODE_VCPUS: "16" }), null);
+  }
+});

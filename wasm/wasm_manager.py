@@ -3496,6 +3496,19 @@ def _available_parallelism_for(cpu_share: float) -> int:
     if cpu_share <= 0:
         return 1
     return max(1, min(NODE_VCPUS, math.ceil(cpu_share * NODE_VCPUS)))
+
+
+def _nn_threads_for(enclave_config, cpu_share: float):
+    """Optional ggml compute-thread limit, bounded by this tenant's CPU share.
+
+    Shielded GPU inference also runs background mask-refill threads. A smaller
+    compute pool can leave those threads time to prepare the next GPU call.
+    Absent/invalid configuration preserves the engine's existing default.
+    """
+    requested = _nn_cfg_int(enclave_config, "nnThreads", 1, 512)
+    return min(requested, _available_parallelism_for(cpu_share)) if requested is not None else None
+
+
 _cpu_cgroup_parent = None      # resolved lazily on first launch; False once known-unavailable
 
 
@@ -5482,6 +5495,9 @@ def _spawn_and_wait(rec, ctx):
     # inherits — no -Sinherit-env — so a guest-facing value set here would
     # reach nothing.)
     if nn and enclave_config:
+        nt = _nn_threads_for(enclave_config, cpu_share)
+        if nt is not None:
+            env["ENCLAVE_GGML_N_THREADS"] = str(nt)
         # Recurrent-snapshot depth for speculative rewind (the shim's
         # ENCLAVE_GGML_N_RS_SEQ, read at ggml server-context creation):
         # deployment-config `nnRsSeq`, wasmtime PROCESS env like the MPS
