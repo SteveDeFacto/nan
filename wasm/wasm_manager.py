@@ -5602,6 +5602,21 @@ def _spawn_and_wait(rec, ctx):
         if nc is not None:
             env = env if env is not None else dict(os.environ)
             env["ENCLAVE_GGML_N_CTX"] = str(nc)
+        # Prefill batch sizes: `nnBatch` is the most tokens one llama_decode
+        # takes (the backend's ENCLAVE_GGML_N_BATCH, default 512) and
+        # `nnUbatch` the physical micro-batch the graph is built for (the
+        # shim's ENCLAVE_GGML_N_UBATCH, default llama's 512; the shim raises
+        # n_batch to it). A wider micro-batch streams each weight once per
+        # more rows during prefill at the price of compute buffers that
+        # scale with it (~1 MiB per row on a 27B).
+        nb = _nn_cfg_int(enclave_config, "nnBatch", 32, 8192)
+        if nb is not None:
+            env = env if env is not None else dict(os.environ)
+            env["ENCLAVE_GGML_N_BATCH"] = str(nb)
+        nub = _nn_cfg_int(enclave_config, "nnUbatch", 32, 8192)
+        if nub is not None:
+            env = env if env is not None else dict(os.environ)
+            env["ENCLAVE_GGML_N_UBATCH"] = str(nub)
         # MTP-head opt-out (`nnLoadMtp: false` -> the shim skips loading the
         # nextn tensors, reclaiming their VRAM for deployments that draft
         # via prompt-lookup or not at all). Engines predating the env read

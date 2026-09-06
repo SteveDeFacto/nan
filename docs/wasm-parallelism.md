@@ -1082,6 +1082,14 @@ four measured as contention, while prefill runs in the enclave on cores by
 policy and scales with them. Omitting it keeps prefill on the `nnThreads`
 count, so existing configurations do not change.
 
+`nnBatch` (32–8192, default 512) is the most tokens one decode call takes
+and `nnUbatch` (32–8192, default 512) the physical micro-batch the graph is
+built for; the engine raises the first to at least the second. A wider
+micro-batch streams each weight once per more prompt rows during prefill,
+at the price of compute buffers that scale with it, about 1 MiB per row on a
+27B. Measure before raising them: past a few hundred rows the matmuls are
+compute-bound and the gain is small.
+
 `nnShieldedPadWaitUs` optionally waits up to 0–50000 microseconds for an
 already-reserved privacy-mask batch before generating missing masks on the
 request thread. It defaults to zero. Waiting does not add workers or reuse

@@ -28,3 +28,11 @@ test("every llama context the shim creates takes the batch thread count separate
   assert.equal((shim.match(/p\.n_threads = p\.n_threads_batch = /g) || []).length, 0, "no context may tie prefill threads to decode threads");
   assert.match(shim, /static int32_t ell_n_threads_batch\(void\) \{[\s\S]*?return ell_n_threads\(\);\n\}/, "unset = the decode count (no behaviour change for old configs)");
 });
+
+test("nnBatch and nnUbatch reach the backend and the shim as the batch-size envs", () => {
+  assert.match(manager, /_nn_cfg_int\(enclave_config, "nnBatch", 32, 8192\)[\s\S]*?env\["ENCLAVE_GGML_N_BATCH"\] = str\(nb\)/, "nnBatch -> ENCLAVE_GGML_N_BATCH");
+  assert.match(manager, /_nn_cfg_int\(enclave_config, "nnUbatch", 32, 8192\)[\s\S]*?env\["ENCLAVE_GGML_N_UBATCH"\] = str\(nub\)/, "nnUbatch -> ENCLAVE_GGML_N_UBATCH");
+  assert.match(shim, /getenv\("ENCLAVE_GGML_N_UBATCH"\)/, "the shim reads the micro-batch env");
+  const patch = fs.readFileSync(path.join(ROOT, "wasm/wasmtime-nn-ggml.patch"), "utf8");
+  assert.match(patch, /env_u32\("ENCLAVE_GGML_N_BATCH", 512\)/, "the backend reads the batch env");
+});
