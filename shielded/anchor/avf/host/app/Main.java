@@ -64,6 +64,7 @@ public class Main extends Activity {
         String relay = null; String name = "phone-anchor";
         String model = "/data/local/tmp/anchor/gg/model.gguf"; String prompt = "The capital of France is"; int n = 8; int threads = 4; long storageMib = 0;
         String shapes = "256,256,1,30,0;896,896,1,30,0;896,4864,2,12,0";
+        String pads = "";                    // dealt pads: bank dir of .pads files on this phone; "" = the VM mints its own
         static Plan from(Intent i) {
             Plan p = new Plan(); if (i == null) return p;
             if (i.getStringExtra("payload") != null) p.payload = i.getStringExtra("payload");
@@ -75,6 +76,7 @@ public class Main extends Activity {
             if (i.getStringExtra("name") != null) p.name = i.getStringExtra("name");
             if (i.getStringExtra("model") != null) p.model = i.getStringExtra("model");
             if (i.getStringExtra("prompt") != null) p.prompt = i.getStringExtra("prompt");
+            if (i.getStringExtra("pads") != null) p.pads = i.getStringExtra("pads");     // dealt pads: a bank dir of .pads files on this phone ("" = off)
             p.n = i.getIntExtra("n", p.n); p.threads = i.getIntExtra("threads", p.threads); p.storageMib = i.getIntExtra("storage", (int) p.storageMib);
             if (p.mode.equals("engine")) {                                         // the model lives in the VM
                 if (i.getIntExtra("mem", 0) == 0) p.memMib = 4096;
@@ -193,6 +195,7 @@ public class Main extends Activity {
     }
 
     private static volatile boolean sEnded;
+    static boolean ended() { return sEnded; }
     static void control(Object vm, Plan plan) {
         sEnded = false;
         ParcelFileDescriptor pfd = connect(vm, CTRL_PORT, 50);
@@ -207,10 +210,15 @@ public class Main extends Activity {
             String first = r.readLine();
             byte[] spki = first != null && first.startsWith("SPKI ") ? RelayAttach.unhex(first.substring(5).trim()) : null;
             say("VSOCK " + first);
+            // 1b. its pad key (dealt pads): the platform boxes the VM's seed to it
+            String second = r.readLine();
+            String padKey = second != null && second.startsWith("PADKEY ") ? second.substring(7).trim() : "";
+            if (second != null) say("VSOCK " + second);
             // 2. the challenge: the relay's, bound to the transport key, or a local one
             String chal, boundHex = "";
             if (plan.relay != null && spki != null) {
                 relay = new RelayAttach(plan.relay, plan.name, spki);
+                relay.padKey = padKey;
                 try { chal = relay.challenge(); boundHex = RelayAttach.hex(relay.bound); }
                 catch (Exception e) { say("RELAY dial failed: " + e + " (continuing with a local challenge)"); relay = null; byte[] c = new byte[32]; new SecureRandom().nextBytes(c); chal = RelayAttach.hex(c); }
             } else { byte[] c = new byte[32]; new SecureRandom().nextBytes(c); chal = RelayAttach.hex(c); }
@@ -235,14 +243,19 @@ public class Main extends Activity {
                 if (res != null && res.optBoolean("ok")) { final RelayAttach rr = relay; new Thread(() -> rr.serve(android.os.Build.MODEL), "relay-serve").start(); }
                 else { relay.close(); relay = null; }
             }
+            // 4b. dealt pads: once the tunnel is bound, fetch the VM's seed through the platform's ledger
+            boolean pads = false;
+            if (relay != null && !padKey.isEmpty() && !plan.pads.isEmpty())
+                pads = PadsClient.bootstrap(PadsClient.httpBase(plan.relay), plan.name, out, r);
             // 5. the run plan
             StringBuilder cmd = new StringBuilder();
             if (plan.mode.equals("engine")) {
                 long bytes = new java.io.File(plan.model).length();
                 String sha = RelayAttach.hex(fileSha256(plan.model));
                 cmd.append("ENGINE model_bytes=").append(bytes).append(" model_sha256=").append(sha).append(" n=").append(plan.n).append(" threads=").append(plan.threads)
-                   .append(" prompt=").append(RelayAttach.hex(plan.prompt.getBytes("UTF-8"))).append('\n');
-                say("ENGINE plan: " + plan.model + " (" + (bytes >> 20) + " MiB), " + plan.n + " tokens, " + plan.threads + " threads");
+                   .append(" prompt=").append(RelayAttach.hex(plan.prompt.getBytes("UTF-8"))).append(pads ? " pads=1" : "").append('\n');
+                say("ENGINE plan: " + plan.model + " (" + (bytes >> 20) + " MiB), " + plan.n + " tokens, " + plan.threads + " threads" + (pads ? ", dealt pads from " + plan.pads : ""));
+                if (pads) { final java.io.File bank = new java.io.File(plan.pads); new Thread(() -> PadsClient.streamBank(vm, bank), "vsock-pads").start(); }
             }
             if (plan.mode.equals("echo")) { cmd.append("ECHO\n"); new Thread(() -> echoBench(vm), "vsock-echo").start(); }
             cmd.append("WORKER ").append(plan.mode.equals("engine") ? "bridge" : plan.mode).append('\n');
@@ -250,7 +263,11 @@ public class Main extends Activity {
             cmd.append("RUN\n");
             out.write(cmd.toString().getBytes()); out.flush();
             int n = 0;
-            while ((line = r.readLine()) != null) { say("VSOCK " + line); n++; if (line.equals("END")) break; }
+            while ((line = r.readLine()) != null) {
+                say("VSOCK " + line); n++;
+                if (line.startsWith("PADWIN ")) PadsClient.onWindow(line, plan.name, out);   // the engine asks for a ledger window
+                if (line.equals("END")) break;
+            }
             say("CONTROL closed after " + n + " lines");
         } catch (Exception e) {
             say("CONTROL error " + e);

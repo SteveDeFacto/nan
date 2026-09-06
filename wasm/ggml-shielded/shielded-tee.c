@@ -206,24 +206,10 @@ static bool os_random(void *buf, size_t n) {
     a += b, d ^= a, d = ROTL32(d, 8),  \
     c += d, b ^= c, b = ROTL32(b, 7))
 
-static void chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]) {
-    static const uint32_t C[4] = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
-    uint32_t s[16];
-    s[0] = C[0]; s[1] = C[1]; s[2] = C[2]; s[3] = C[3];
-    for (int i = 0; i < 8; i++) s[4 + i] = key[i];
-    s[12] = (uint32_t)counter; s[13] = (uint32_t)(counter >> 32);
-    s[14] = 0; s[15] = 0;
-    uint32_t x[16]; memcpy(x, s, sizeof x);
-    for (int i = 0; i < 10; i++) {
-        QR(x[0], x[4], x[ 8], x[12]); QR(x[1], x[5], x[ 9], x[13]);
-        QR(x[2], x[6], x[10], x[14]); QR(x[3], x[7], x[11], x[15]);
-        QR(x[0], x[5], x[10], x[15]); QR(x[1], x[6], x[11], x[12]);
-        QR(x[2], x[7], x[ 8], x[13]); QR(x[3], x[4], x[ 9], x[14]);
-    }
-    for (int i = 0; i < 16; i++) out[i] = x[i] + s[i];
-}
-/* The same block, for the dealt-pad derivation (shielded-pads.c). */
-void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]) { chacha20_block(key, counter, out); }
+/* ChaCha20 block: one definition, in shielded-pads.c (the dealt-pad derivation
+ * and the mask bank must draw the same stream). */
+void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]);
+#define chacha20_block sh_chacha20_block
 
 typedef struct {
     pthread_mutex_t mu;

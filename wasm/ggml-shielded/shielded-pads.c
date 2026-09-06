@@ -15,11 +15,30 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* The engine's ChaCha20 block (shielded-tee.c), exported for the derivation. */
-void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]);
+/* ChaCha20 block with a 64-bit counter and a zero nonce: the mask bank's stream
+ * (shielded-tee.c) and the dealt-pad derivation draw from this one definition. */
+#define B_ROTL32(v, c) (((v) << (c)) | ((v) >> (32 - (c))))
+#define B_QR(a, b, c, d) (a += b, d ^= a, d = B_ROTL32(d, 16), c += d, b ^= c, b = B_ROTL32(b, 12), a += b, d ^= a, d = B_ROTL32(d, 8), c += d, b ^= c, b = B_ROTL32(b, 7))
+void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]) {
+    static const uint32_t C[4] = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
+    uint32_t s[16];
+    s[0] = C[0]; s[1] = C[1]; s[2] = C[2]; s[3] = C[3];
+    for (int i = 0; i < 8; i++) s[4 + i] = key[i];
+    s[12] = (uint32_t)counter; s[13] = (uint32_t)(counter >> 32);
+    s[14] = 0; s[15] = 0;
+    uint32_t x[16]; memcpy(x, s, sizeof x);
+    for (int i = 0; i < 10; i++) {
+        B_QR(x[0], x[4], x[ 8], x[12]); B_QR(x[1], x[5], x[ 9], x[13]);
+        B_QR(x[2], x[6], x[10], x[14]); B_QR(x[3], x[7], x[11], x[15]);
+        B_QR(x[0], x[5], x[10], x[15]); B_QR(x[1], x[6], x[11], x[12]);
+        B_QR(x[2], x[7], x[ 8], x[13]); B_QR(x[3], x[4], x[ 9], x[14]);
+    }
+    for (int i = 0; i < 16; i++) out[i] = x[i] + s[i];
+}
 
-/* TweetNaCl's entropy hook: the OS, as everywhere else in the trusted half. */
-void randombytes(unsigned char *p, unsigned long long n) {
+/* TweetNaCl's entropy hook: the OS, as everywhere else in the trusted half.
+ * Weak, so a host that already defines one (the pVM payload) keeps its own. */
+__attribute__((weak)) void randombytes(unsigned char *p, unsigned long long n) {
     while (n) {
         ssize_t r = getrandom(p, n, 0);
         if (r < 0) { if (errno == EINTR) continue; abort(); }

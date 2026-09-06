@@ -153,11 +153,28 @@ bank must be sized for the largest prompt burst, not the decode rate.
   dealt engine vs self-minting engine produce identical tokens, and a
   tampered `u` row fails the Freivalds check.
 
-### P2. Ledger window, attestation-gated release, pad key in the binding
-- relay: `/v1/pads/reserve` (seed_id, W) -> signed window; `/v1/pads/ship`
-  gated on the pVM's accepted attestation; the pVM announces its X25519 pad
-  key beside the transport key in the `BOUND` line (anchor phase 4).
-- pVM: window client, refuse without a window, restart at `mark`.
+### P2. Ledger window, attestation-gated release, pad key in the binding - BUILT 2026-09-06 (device test pending)
+- relay (`relay/pads.mjs`, routes in api-relay.js): `/v1/pads/key` (the
+  Ed25519 ledger key), `/v1/pads/seed` (the pVM's seed, derived
+  HKDF(master, keyFp, epoch), boxed X25519 -> HKDF-SHA512 -> ChaCha20-Poly1305
+  to the pad key the tunnel bound), `/v1/pads/reserve` (reserve-before-use
+  window, signed), `/v1/pads/ledger` (the mark). Requests are signed by the
+  attested transport key; `tunnel.js` keeps spki + padKey per tunnel.
+- trusted half (`shielded-pads.c`): opens the seed box, verifies windows,
+  signs requests; `sh_link_set_window_provider` replaces the ledger file.
+  `test/pads-ledger.test.mjs`, `test/pads-interop.test.mjs` (Node <-> C).
+- pVM (`shielded/anchor/avf`): the payload mints an X25519 pad key at boot
+  (PADKEY after SPKI), opens PADSEED, signs PADSIGN, receives shipments on
+  vsock 7780 into the bank dir (tmp-then-rename), and runs the engine with
+  `SHIELDED_PAD_*` set and an `anchor_pads` context; `engine.cpp` installs a
+  window provider that writes PADWIN on the control socket and verifies the
+  reply; the owner app (`PadsClient.java`) presents padKey with the
+  attestation, bootstraps the seed after ACCEPTED, relays PADWIN, and streams
+  `.pads` files from `--es pads <dir>`. Compile-checked (arm64 payload links,
+  Java builds); no device attached to run it. AOSP's `vm_payload.h`/map are
+  vendored in `avfref/` so the build is reproducible.
+- Still to do here: the pad check (`u.s~ == r.(W s~)`), the shipment digest
+  pinned from the calib in the pVM, and the seed epoch rotation.
 
 ### P3. Operator bank and prefetch
 - Owner app: pad bridge on vsock 7779; NVMe store on the GPU box's agent;

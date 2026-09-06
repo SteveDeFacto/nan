@@ -1,0 +1,8 @@
+vm_payload.h, vm_main.h and libvm_payload.map.txt are from the Android Open Source
+Project, packages/modules/Virtualization (libs/libvm_payload), fetched
+2026-09-06 from android.googlesource.com, Copyright (C) 2022 The Android
+Open Source Project, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). They are here so the anchor
+payload builds reproducibly: the header declares the Microdroid payload API
+the guest is compiled against and the map generates the link-time stub of
+libvm_payload.so (build.sh). Neither ships in the APK.

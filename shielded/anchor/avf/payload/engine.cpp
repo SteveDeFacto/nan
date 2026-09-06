@@ -42,8 +42,54 @@ typedef void (*stats_fn)(uint64_t *offloaded, uint64_t *local, uint64_t *macs, u
 typedef void (*adopt_fn)(int fd);
 typedef ggml_threadpool *(*tp_new_fn)(ggml_threadpool_params *);
 
+/* ---- dealt pads: ledger windows through the owner app --------------------
+ * The engine never talks to the platform itself; it writes a signed PADWIN
+ * request on the control socket (the owner app POSTs it to /v1/pads/reserve)
+ * and verifies the signed window the app relays back. The control socket is
+ * ours to read for the whole run: the payload's loop is parked in engine_main. */
+#include "anchor_pads.h"
+#include "shielded-pads.h"
+#include <sys/random.h>
+typedef int (*win_fn)(void *, uint64_t, uint64_t *, uint64_t *);
+typedef void (*set_win_fn)(win_fn, void *);
+static int ctl_read_line(char *buf, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        char c; ssize_t r = read(g_ctl, &c, 1);
+        if (r <= 0) return -1;
+        if (c == '\n') break;
+        buf[n++] = c;
+    }
+    buf[n] = 0;
+    return (int)n;
+}
+static int pads_window(void *ctx, uint64_t want, uint64_t *lo, uint64_t *hi) {
+    const anchor_pads *p = (const anchor_pads *)ctx;
+    uint8_t nb[16]; if (getrandom(nb, sizeof nb, 0) != (ssize_t)sizeof nb) return -1;
+    char nonce[33], wants[24], sig_hex[129]; uint8_t sig[64];
+    sh_pads_bin2hex(nb, 16, nonce);
+    snprintf(wants, sizeof wants, "%llu", (unsigned long long)want);
+    const char *fields[3] = { p->name, p->seed_id_hex, wants };
+    sh_pads_request_sign(p->transport_sk, "reserve", fields, 3, nonce, sig);
+    sh_pads_bin2hex(sig, 64, sig_hex);
+    outf("PADWIN %s %s %s", wants, nonce, sig_hex);
+    /* the app answers PADWIN <lo> <hi> <iat> <sig> (or PADWIN fail <why>); other lines are the app's chatter */
+    for (int tries = 0; tries < 64; tries++) {
+        char line[512];
+        if (ctl_read_line(line, sizeof line) < 0) return -1;
+        if (strncmp(line, "PADWIN ", 7)) continue;
+        unsigned long long l = 0, h = 0, iat = 0; char sh[129] = "";
+        if (sscanf(line + 7, "%llu %llu %llu %128s", &l, &h, &iat, sh) != 4) { outf("ENGINE pads: window refused: %s", line + 7); return -1; }
+        uint8_t wsig[64];
+        if (!sh_pads_hex2bin(sh, wsig, 64) || !sh_pads_window_verify(p->ledger_pk, p->seed_id_hex, l, h, iat, wsig)) { outf("ENGINE pads: window signature REJECTED"); return -1; }
+        *lo = l; *hi = h;
+        return 0;
+    }
+    return -1;
+}
+
 extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *lib_dir, const char *calib_path,
-                           const char *prompt, int n_predict, int n_threads) {
+                           const char *prompt, int n_predict, int n_threads, const anchor_pads *pads) {
     g_ctl = ctl_fd;
     setvbuf(stdout, NULL, _IONBF, 0);
     llama_log_set(quiet_log, nullptr);
@@ -60,6 +106,12 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     adopt_fn adopt = sh_h ? (adopt_fn)dlsym(sh_h, "sh_pipe_adopt_fd") : nullptr;
     if (!adopt) { outf("ENGINE the shielded module has no sh_pipe_adopt_fd (built without the hook?)"); return 2; }
     adopt(worker_fd);                                 /* the first sh_pipe_open (inside the first graph) gets this */
+    if (pads) {
+        set_win_fn set_win = sh_h ? (set_win_fn)dlsym(sh_h, "ggml_backend_shielded_set_window_provider") : nullptr;
+        if (!set_win) { outf("ENGINE pads: the shielded module has no window provider hook"); return 2; }
+        set_win(pads_window, (void *)pads);
+        outf("ENGINE dealt pads: seed %s, windows through the owner (%s)", pads->seed_id_hex, getenv("SHIELDED_PAD_SOURCE") ? getenv("SHIELDED_PAD_SOURCE") : "no bank dir");
+    }
     outf("ENGINE backends loaded, worker fd %d adopted, stats=%s, calib %s (%s)", worker_fd, stats ? "yes" : "no",
          access(calib_path, R_OK) == 0 ? "readable" : "MISSING", calib_path);
 

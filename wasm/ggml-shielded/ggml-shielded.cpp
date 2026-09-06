@@ -67,6 +67,7 @@ static int sh_af_delta_env() {
 }
 struct sh_state;
 static int sh_af_delta(const sh_state &s);
+static sh_window_fn g_win_fn; static void *g_win_ctx;   /* dealt pads: see ggml_backend_shielded_set_window_provider */
 
 /* --------------------------------------------------------------------------
  * Placement policy.
@@ -601,6 +602,7 @@ static bool sh_register(sh_state &s, const ggml_tensor *w) {
         int err = SH_OK;
         s.link = sh_link_open(s.host.c_str(), s.port, true, &err);
         if (!s.link) { s.link_failed = true; return false; }
+        if (g_win_fn) sh_link_set_window_provider(s.link, g_win_fn, g_win_ctx);
         if (s.explicit_link) {
             sh_link_configure(s.link, s.vsock_port, s.reserve_bytes, s.refill_threads);
             // Even an empty path is explicit: a global legacy SHM setting
@@ -1296,6 +1298,14 @@ ggml_backend_t ggml_backend_shielded_init(void) {
 #ifdef GGML_BACKEND_DL
 GGML_BACKEND_DL_IMPL(ggml_backend_shielded_reg)
 #endif
+
+/* Dealt pads: a host-supplied ledger-window provider (the pVM's owner-app
+ * path), installed on every link this backend opens from now on. */
+extern "C" void ggml_backend_shielded_set_window_provider(sh_window_fn fn, void *ctx) {
+    g_win_fn = fn; g_win_ctx = ctx;
+    sh_state &s = sh_get();
+    if (s.link) sh_link_set_window_provider(s.link, fn, ctx);
+}
 
 /* The dealer's entry (shielded/dealer/PLAN.md): with the model registered on
  * the legacy single link (SHIELDED_HOST/PORT; a pool splits groups over cards

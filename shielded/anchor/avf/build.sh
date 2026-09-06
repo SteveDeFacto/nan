@@ -23,7 +23,7 @@ NDK="$SDK/ndk/27.2.12479018"
 BT="$SDK/build-tools/35.0.0"
 API=35
 CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${API}-clang"
-HDR="${AVF_HDR:-/tmp/claude-1000/-home-steven-Projects-enclave/d6ba09ee-f1c1-4290-929f-320d5fb64e3a/scratchpad}"
+HDR="${AVF_HDR:-$HERE}"          # $HDR/avfref/{vm_payload.h,libvm_payload.map.txt}: vendored from AOSP (avfref/NOTICE)
 GG="$HERE/../../../wasm/ggml-shielded"
 CORE="$HERE/../core"
 OUT="$HERE/out"; STUB="$OUT/stub"; STAGE="$OUT/stage-$NAME"
@@ -54,7 +54,7 @@ if [ ! -f "$STUB/libvm_payload.so" ]; then
 fi
 
 # --- 2. the payload .so -----------------------------------------------------
-CFLAGS=(-O2 -fPIC -Wall -march=armv8.2-a+dotprod -I"$HDR" -I"$CORE" -I"$GG")
+CFLAGS=(-O2 -fPIC -Wall -march=armv8.2-a+dotprod -I"$HDR/avfref" -I"$CORE" -I"$GG")
 case "$NAME" in
   sink)  # the host side of a --debug none VM's vsock report channel (static, runs from adb shell)
          "$CLANG" -O2 -static -Wall -o "$OUT/vsock-sink" "$HERE/host/vsock-sink.c"
@@ -68,9 +68,11 @@ case "$NAME" in
          "$CLANG" "${PF[@]}" -ffp-contract=off -c "$GG/shielded-field.c" -o "$OUT/field.o"
          "$CLANG" "${PF[@]}" -c "$GG/shielded-wire.c" -o "$OUT/wire.o"
          "$CLANG" "${PF[@]}" -c "$GG/shielded-tee.c" -o "$OUT/tee.o"
-         "$CLANG" "${PF[@]}" -static -o "$OUT/shielded-probe" "$GG/shielded-probe.c" "$OUT/tee.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
+         "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$OUT/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+         "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$OUT/nacl.o"
+         "$CLANG" "${PF[@]}" -static -o "$OUT/shielded-probe" "$GG/shielded-probe.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/nacl.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
          printf '#include "shielded-simd.h"\n#include <stdio.h>\nint main(void){printf("simd=%%s\\n", sh_simd_get()->name);return 0;}\n' > "$OUT/simd-check.c"
-         "$CLANG" "${PF[@]}" -static -o "$OUT/simd-check" "$OUT/simd-check.c" "$OUT/tee.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
+         "$CLANG" "${PF[@]}" -static -o "$OUT/simd-check" "$OUT/simd-check.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/nacl.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
          echo "probe: $OUT/shielded-probe ($(stat -c %s "$OUT/shielded-probe") bytes), simd-check"; exit 0 ;;
   engine)  # the COMPLETE engine for the phone, normal world: libggml-shielded.so (the backend module),
            # ggml-test and shielded-run, against the arm64 llama.cpp from build-ggml-arm64.sh.
@@ -86,7 +88,9 @@ case "$NAME" in
            "$CLANG" "${PF[@]}" -ffp-contract=off -c "$GG/shielded-field.c" -o "$E/field.o"
            "$CLANG" "${PF[@]}" -c "$GG/shielded-wire.c" -o "$E/wire.o"
            "$CLANG" "${PF[@]}" -c "$GG/shielded-tee.c" -o "$E/tee.o"
-           CORE=("$E/tee.o" "$E/field.o" "$E/wire.o" "$E/simd-neon.o" "$E/simd-generic.o")
+           "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$E/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+           "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$E/nacl.o"
+           CORE=("$E/tee.o" "$E/pads.o" "$E/nacl.o" "$E/field.o" "$E/wire.o" "$E/simd-neon.o" "$E/simd-generic.o")
            "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED "${INC[@]}" -I"$GG" -c "$GG/ggml-shielded.cpp" -o "$E/ggml-shielded-dl.o"
            # bionic does not resolve a dlopened module's symbols against the executable's other libraries: link libggml too
            "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "${CORE[@]}" -L"$GA/lib" -lggml -lggml-base -lm
@@ -107,9 +111,11 @@ case "$NAME" in
            "$CLANG" "${PF[@]}" -ffp-contract=off -c "$GG/shielded-field.c" -o "$E/field.o"
            "$CLANG" "${PF[@]}" -c "$HERE/../harness/wire-fd.c" -o "$E/wire-fd.o"                       # shielded-wire.c + sh_pipe_open_fd + the hook
            "$CLANG" "${PF[@]}" -Dsh_pipe_open=sh_pipe_open_hook -c "$GG/shielded-tee.c" -o "$E/tee.o"    # the trusted half dials through the hook
+           "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$E/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+           "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$E/nacl.o"
            "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED "${INC[@]}" -I"$GG" -c "$GG/ggml-shielded.cpp" -o "$E/ggml-shielded-dl.o"
-           "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "$E/tee.o" "$E/field.o" "$E/wire-fd.o" "$E/simd-neon.o" "$E/simd-generic.o" -L"$GA/lib" -lggml -lggml-base -lm -Wl,-soname,libggml-shielded.so
-           "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 "${INC[@]}" -shared -o "$E/libengine.so" "$HERE/payload/engine.cpp" -L"$GA/lib" -lllama -lggml -lggml-base -llog -ldl -Wl,-soname,libengine.so
+           "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "$E/tee.o" "$E/pads.o" "$E/nacl.o" "$E/field.o" "$E/wire-fd.o" "$E/simd-neon.o" "$E/simd-generic.o" -L"$GA/lib" -lggml -lggml-base -lm -Wl,-soname,libggml-shielded.so
+           "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 "${INC[@]}" -shared -o "$E/libengine.so" "$HERE/payload/engine.cpp" "$E/pads.o" "$E/nacl.o" -L"$GA/lib" -lllama -lggml -lggml-base -llog -ldl -Wl,-soname,libengine.so
            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$E/libggml-shielded.so" | grep -E ' T (sh_pipe_adopt_fd|sh_pipe_open_hook|ggml_backend_shielded_stats)$' | sed 's/^/  /'
            echo "engine-pvm: $E/libggml-shielded.so ($(stat -c %s "$E/libggml-shielded.so") B), libengine.so ($(stat -c %s "$E/libengine.so") B)"; exit 0 ;;
   attest_probe) SRCS=("$HERE/payload/attest_probe.c") ;;
@@ -118,7 +124,7 @@ case "$NAME" in
                 # shielded-simd.c is built twice, generic and -DSH_SIMD_NEON; the core's refill is pointed at SDOT.
                 "$CLANG" -O3 -fPIC -march=armv8.2-a+dotprod -DSH_SIMD_NEON -I"$GG" -c "$GG/shielded-simd.c" -o "$OUT/simd-neon-pic.o"
                 SRCS=("$HERE/payload/anchor_payload.c" "$CORE/anchor-core.c" "$GG/shielded-simd.c" "$GG/shielded-field.c"
-                      "$HERE/../harness/worker-client.c" "$HERE/../harness/wire-fd.c"
+                      "$HERE/../harness/worker-client.c" "$HERE/../harness/wire-fd.c" "$GG/shielded-pads.c"
                       "$HERE/payload/third_party/tweetnacl.c" "$OUT/simd-neon-pic.o")
                 CFLAGS+=(-ffp-contract=off -I"$HERE/../harness" -DAN_REFILL=sh_simd_neon_refill)
                 # the engine rides along when it has been built (build.sh engine-pvm): six libraries + the calibration

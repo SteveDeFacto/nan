@@ -25,6 +25,7 @@ import java.util.TreeMap;
 public final class RelayAttach {
     final String url, name; final byte[] spki;
     Ws ws; byte[] nonce, bound; String challengeHex;
+    String padKey = "";                       // the VM's X25519 pad key (PADKEY), presented with the attestation
 
     RelayAttach(String url, String name, byte[] spki) { this.url = url; this.name = name; this.spki = spki; }
 
@@ -54,6 +55,7 @@ public final class RelayAttach {
         if (!sig.isEmpty()) ev.put("signature", b64(unhex(String.join("", sig.values()))));
         JSONObject rad = new JSONObject().put("format", "android-avf-pvm/v1").put("body", b64(ev.toString().getBytes("UTF-8")))
             .put("transportKey", b64(spki)).put("transportKeyFp", hex(sha256(spki))).put("name", name);
+        if (!padKey.isEmpty()) rad.put("padKey", padKey);
         ws.sendText(new JSONObject().put("t", "attest").put("rad", rad).toString());
         Main.say("RELAY presented chain=" + chain.length() + " certs signature=" + (sig.isEmpty() ? "none" : "yes"));
         String f; JSONObject res = null;

@@ -54,6 +54,8 @@ typedef struct {
     uint8_t  pad[256 - 8 - 4 - 4 - 32 - 16 - 8 - 8 - 8 - 8 - 32 - 48 - 80];
 } sh_pads_hdr;
 
+/* The engine's ChaCha20 block (64-bit counter, zero nonce). */
+void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]);
 /* r for (seed, group, index): ChaCha20 keyed by the seed, block counter
  * (group << 48) | (index << 24) | block, values uniform over [0, M) by the
  * same uint64 draw the engine's own mask bank uses. Both sides call this. */

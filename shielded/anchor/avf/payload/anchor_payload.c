@@ -32,6 +32,7 @@
 #include <math.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,7 @@ void randombytes(unsigned char *p, unsigned long long n) {
 static const uint8_t ED25519_SPKI_PREFIX[12] = { 0x30,0x2a,0x30,0x05,0x06,0x03,0x2b,0x65,0x70,0x03,0x21,0x00 };
 #define WORKER_PORT 7778
 #define MODEL_PORT  7779
+#define PADS_PORT   7780     /* owner -> guest: dealt-pad shipments into the bank dir (PADS <name> <bytes>\n, bytes) */
 #define ECHO_PORT   7780
 #define MAX_SHAPES  16
 
@@ -272,8 +274,54 @@ static int receive_model(int ls_model, uint64_t bytes, int *out_fd) {
     OUT("ENGINE model %" PRIu64 " MiB received in %.1f s", got >> 20, (now_us() - t0) / 1e6);
     *out_fd = fd; return 0;
 }
-typedef int (*engine_main_fn)(int, int, int, const char *, const char *, const char *, int, int);
-static void run_engine(int ls_wk, int ls_model, const char *prompt, int n_predict, int threads, uint64_t model_bytes) {
+/* ---- dealt pads (shielded/dealer/PLAN.md, anchor_pads.h) -------------------
+ * The VM mints an X25519 pad key at boot and announces it (PADKEY) right after
+ * the transport key; the owner presents it to the relay with the attestation.
+ * The platform's seed comes back boxed to that key (PADSEED); requests the
+ * owner relays are signed here with the transport key (PADSIGN); windows the
+ * engine asks for go out as PADWIN and come back verified against the ledger
+ * key (PADLEDGER). Shipments stream in on PADS_PORT into the bank directory. */
+#include "anchor_pads.h"
+#include "shielded-pads.h"
+static uint8_t g_ppk[32], g_psk[32], g_ledger_pk[32], g_seed[32], g_seed_id[16];
+static char g_seed_id_hex[33] = "", g_pad_name[64] = "", g_pads_dir[512] = "";
+static int g_have_ledger = 0, g_have_seed = 0;
+static void pads_dir(char *out, size_t cap) {
+    const char *es = AVmPayload_getEncryptedStoragePath();
+    if (es) snprintf(out, cap, "%s/pads", es); else snprintf(out, cap, "/data/anchor-pads");
+    mkdir(out, 0700);
+}
+/* One shipment per connection: "PADS <name> <bytes>\n" then the bytes, written
+ * tmp-then-rename so the engine's reader never sees a partial file. */
+static void *pads_receiver(void *arg) {
+    int ls = (int)(intptr_t)arg;
+    for (;;) {
+        int c = vs_accept(ls, 3600000);
+        if (c < 0) continue;
+        char hdr[256]; size_t n = 0;
+        while (n + 1 < sizeof hdr) { char ch; if (read(c, &ch, 1) != 1) { n = 0; break; } if (ch == '\n') break; hdr[n++] = ch; }
+        hdr[n] = 0;
+        char name[128] = ""; unsigned long long bytes = 0;
+        if (n == 0 || sscanf(hdr, "PADS %127s %llu", name, &bytes) != 2 || strchr(name, '/') || strstr(name, "..")) { close(c); continue; }
+        char tmp[700], fin[700]; snprintf(tmp, sizeof tmp, "%s/.%s.tmp", g_pads_dir, name); snprintf(fin, sizeof fin, "%s/%s", g_pads_dir, name);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        unsigned long long got = 0; static char buf[1 << 16];
+        while (fd >= 0 && got < bytes) {
+            size_t want = bytes - got < sizeof buf ? (size_t)(bytes - got) : sizeof buf;
+            ssize_t r = read(c, buf, want); if (r <= 0) break;
+            if (write(fd, buf, (size_t)r) != r) break;
+            got += (unsigned long long)r;
+        }
+        if (fd >= 0) { fsync(fd); close(fd); }
+        if (got == bytes && rename(tmp, fin) == 0) { (void)!write(c, "K", 1); OUT("PADS %s %llu bytes", name, got); }
+        else { unlink(tmp); (void)!write(c, "E", 1); OUT("PADS %s FAILED at %llu of %llu", name, got, bytes); }
+        close(c);
+    }
+    return NULL;
+}
+
+typedef int (*engine_main_fn)(int, int, int, const char *, const char *, const char *, int, int, const anchor_pads *);
+static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt, int n_predict, int threads, uint64_t model_bytes, int with_pads) {
     const char *apk = AVmPayload_getApkContentsPath();
     char lib_dir[512], calib[512]; snprintf(lib_dir, sizeof lib_dir, "%s/lib/arm64-v8a", apk); snprintf(calib, sizeof calib, "%s/assets/model.calib", apk);
     int worker_fd = vs_accept(ls_wk, 60000);
@@ -289,8 +337,21 @@ static void run_engine(int ls_wk, int ls_model, const char *prompt, int n_predic
     }
     engine_main_fn em = (engine_main_fn)dlsym(h, "engine_main");
     if (!em) { OUT("ENGINE libengine.so has no engine_main"); return; }
+    anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex };
+    const anchor_pads *pp = NULL;
+    if (with_pads) {
+        if (!g_have_seed || !g_have_ledger) { OUT("ENGINE pads requested but no seed/ledger from the owner; refusing to mint for myself"); close(worker_fd); close(model_fd); return; }
+        pads_dir(g_pads_dir, sizeof g_pads_dir);
+        char hs[65], hid[33], hsk[65];
+        sh_pads_bin2hex(g_seed, 32, hs); sh_pads_bin2hex(g_seed_id, 16, hid); sh_pads_bin2hex(g_psk, 32, hsk);
+        setenv("SHIELDED_PAD_SOURCE", g_pads_dir, 1); setenv("SHIELDED_PAD_SEED", hs, 1); setenv("SHIELDED_PAD_SEED_ID", hid, 1); setenv("SHIELDED_PAD_SK", hsk, 1);
+        memset(hs, 0, sizeof hs); memset(hsk, 0, sizeof hsk);
+        pthread_t th; pthread_create(&th, NULL, pads_receiver, (void *)(intptr_t)ls_pads); pthread_detach(th);
+        pp = &pads;
+        OUT("ENGINE dealt pads on: bank %s, seed %s", g_pads_dir, g_seed_id_hex);
+    }
     OUT("ENGINE libraries loaded from %s; starting", lib_dir);
-    int rc = em(g_ctl, worker_fd, model_fd, lib_dir, calib, prompt, n_predict, threads);
+    int rc = em(g_ctl, worker_fd, model_fd, lib_dir, calib, prompt, n_predict, threads, pp);
     OUT("ENGINE exit %d", rc);
     close(model_fd);
 }
@@ -376,14 +437,17 @@ static void run_shape(int64_t K, int64_t N, int n_nodes, int iters, int xmax, in
 
 int AVmPayload_main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    int ls_ctl = vs_bind(CTRL_PORT), ls_wk = vs_bind(WORKER_PORT), ls_model = vs_bind(MODEL_PORT);
+    int ls_ctl = vs_bind(CTRL_PORT), ls_wk = vs_bind(WORKER_PORT), ls_model = vs_bind(MODEL_PORT), ls_pads = vs_bind(PADS_PORT);
     crypto_sign_keypair(g_tpk, g_tsk);
+    crypto_box_keypair(g_ppk, g_psk);                 /* the pad key: the platform's seed is boxed to it */
     AVmPayload_notifyPayloadReady();
     g_ctl = vs_accept(ls_ctl, 20000);
     {   /* the first thing the owner hears is the transport key it will present to the relay */
         uint8_t spki[44]; memcpy(spki, ED25519_SPKI_PREFIX, 12); memcpy(spki + 12, g_tpk, 32);
         char hx[89]; for (int i = 0; i < 44; i++) sprintf(hx + 2 * i, "%02x", spki[i]); hx[88] = 0;
         OUT("SPKI %s", hx);
+        char pk[65]; sh_pads_bin2hex(g_ppk, 32, pk);
+        OUT("PADKEY %s", pk);
     }
     OUT("ANCHOR start in pVM apk=%s control=%s", AVmPayload_getApkContentsPath(), g_ctl >= 0 ? "owner-connected" : "none");
     {
@@ -396,12 +460,33 @@ int AVmPayload_main(void) {
     /* the owner's instructions; without an owner (a vm-tool run) the built-in local self-test */
     int bridge = 0, n_shapes = 0; int64_t SK[MAX_SHAPES], SN[MAX_SHAPES]; int Snode[MAX_SHAPES], Siter[MAX_SHAPES], Sx[MAX_SHAPES];
     int engine = 0, eng_n = 8, eng_threads = 4; uint64_t eng_model = 0; static char eng_prompt[2048] = "The capital of France is";
-    int echo = 0;
+    int echo = 0, with_pads = 0;
     if (g_ctl >= 0) {
         char l[2400]; static char bound[2100] = "";
         while (read_line(g_ctl, l, sizeof l) >= 0) {
             if (!strncmp(l, "BOUND ", 6)) { strncpy(bound, l + 6, sizeof bound - 1); bound[sizeof bound - 1] = 0; }
             else if (!strncmp(l, "CHAL ", 5)) attest(l + 5, bound);
+            else if (!strncmp(l, "PADLEDGER ", 10)) {  /* the relay's ledger key: windows are verified against it */
+                g_have_ledger = sh_pads_hex2bin(l + 10, g_ledger_pk, 32);
+                OUT("PADLEDGER %s", g_have_ledger ? "ok" : "fail");
+            }
+            else if (!strncmp(l, "PADSEED ", 8)) {     /* PADSEED <name> <seed_id> <epoch> <epk> <nonce> <box> */
+                char name[64] = "", sid[33] = "", epk_h[65] = "", nonce_h[25] = "", box_h[97] = ""; unsigned epoch = 0;
+                uint8_t epk[32], nonce[12], box[48];
+                if (sscanf(l + 8, "%63s %32s %u %64s %24s %96s", name, sid, &epoch, epk_h, nonce_h, box_h) == 6 &&
+                    sh_pads_hex2bin(sid, g_seed_id, 16) && sh_pads_hex2bin(epk_h, epk, 32) && sh_pads_hex2bin(nonce_h, nonce, 12) && sh_pads_hex2bin(box_h, box, 48) &&
+                    sh_pads_seed_open(epk, nonce, box, 48, g_psk, g_ppk, g_seed) == 0) {
+                    strncpy(g_pad_name, name, sizeof g_pad_name - 1); strncpy(g_seed_id_hex, sid, 32); g_have_seed = 1;
+                    OUT("PADSEED ok %s", sid);
+                } else { g_have_seed = 0; OUT("PADSEED fail"); }
+            }
+            else if (!strncmp(l, "PADSIGN ", 8)) {     /* PADSIGN <kind> <nonce> [fields...] -> PADSIG <hex> */
+                char *save = NULL, *kind = strtok_r(l + 8, " ", &save), *nonce = kind ? strtok_r(NULL, " ", &save) : NULL;
+                const char *fields[8]; size_t nf = 0; char *f;
+                while (nonce && nf < 8 && (f = strtok_r(NULL, " ", &save))) fields[nf++] = f;
+                if (kind && nonce) { uint8_t sig[64]; char hs[129]; sh_pads_request_sign(g_tsk, kind, fields, nf, nonce, sig); sh_pads_bin2hex(sig, 64, hs); OUT("PADSIG %s", hs); }
+                else OUT("PADSIG fail");
+            }
             else if (!strncmp(l, "WORKER ", 7)) bridge = !strcmp(l + 7, "bridge");
             else if (!strncmp(l, "ENGINE ", 7)) {          /* ENGINE model_bytes=N n=N threads=N prompt=<hex> */
                 engine = 1; char *q;
@@ -410,6 +495,7 @@ int AVmPayload_main(void) {
                 if ((q = strstr(l, " n="))) eng_n = atoi(q + 3);
                 if ((q = strstr(l, "threads="))) eng_threads = atoi(q + 8);
                 if ((q = strstr(l, "prompt="))) { size_t k = unhex(q + 7, (uint8_t *)eng_prompt, sizeof eng_prompt - 1); eng_prompt[k] = 0; }
+                with_pads = strstr(l, " pads=1") != NULL;
             }
             else if (!strncmp(l, "SHAPE ", 6) && n_shapes < MAX_SHAPES) {
                 long long k, n; int nd, it, xm;
@@ -430,7 +516,7 @@ int AVmPayload_main(void) {
     }
     if (engine) {
         OUT("ANCHOR engine mode: model %" PRIu64 " bytes, %d tokens, %d threads", eng_model, eng_n, eng_threads);
-        run_engine(ls_wk, ls_model, eng_prompt, eng_n, eng_threads, eng_model);
+        run_engine(ls_wk, ls_model, ls_pads, eng_prompt, eng_n, eng_threads, eng_model, with_pads);
         OUT("END");
         if (ls_model >= 0) close(ls_model); if (ls_wk >= 0) close(ls_wk); if (ls_ctl >= 0) close(ls_ctl);
         if (g_ctl >= 0) { shutdown(g_ctl, SHUT_WR); close(g_ctl); }

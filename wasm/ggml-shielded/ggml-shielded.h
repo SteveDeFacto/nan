@@ -30,6 +30,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "shielded-tee.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,9 @@ GGML_BACKEND_API int ggml_backend_shielded_pool_version(void);
 /* Dealt pads: mint one .pads shipment from the registered weights (single
  * link). Hex arguments: seed 64, seed_id 32, model digest 64, consumer X25519
  * public key 64. Returns SH_OK or an sh error. */
+/* Dealt pads: ledger windows from the host (a pVM's owner-app path) instead of
+ * SHIELDED_PAD_LEDGER. Install before the first graph. */
+GGML_BACKEND_API void ggml_backend_shielded_set_window_provider(sh_window_fn fn, void *ctx);
 GGML_BACKEND_API int ggml_backend_shielded_mint(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
                                                 uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path);
 
