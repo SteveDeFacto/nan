@@ -1,0 +1,5 @@
+poly1305-donna.c, poly1305-donna.h, poly1305-donna-32.h, poly1305-donna-64.h
+are poly1305-donna by Andrew Moon (https://github.com/floodyberry/poly1305-donna),
+released into the public domain (see the headers), fetched 2026-09-06. They
+authenticate dealt-pad cells (shielded-pads.c): TweetNaCl's Poly1305 measured
+97 MB/s per core, this one 2.8 GB/s, and a 27B row is 12.6 MB.

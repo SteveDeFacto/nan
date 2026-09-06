@@ -4,7 +4,7 @@
  * range of pad indices and every weight group of one model, the unblinding
  * vectors u; the mask r is never shipped - both the dealer and the consumer
  * derive it from a shared 32-byte seed with sh_pad_r(). Each (index, group)
- * cell is an independent XSalsa20-Poly1305 box under a per-shipment key that
+ * cell is an independent ChaCha20-Poly1305 box under a per-shipment key that
  * is itself boxed to the consumer's X25519 pad key, so an operator's bank
  * holds ciphertext and sizes only and a consumer can start on any row.
  *
@@ -24,7 +24,7 @@ extern "C" {
 #endif
 
 #define SH_PADS_MAGIC     "ENCLPAD1"
-#define SH_PADS_VERSION   1u
+#define SH_PADS_VERSION   2u          /* 2: ChaCha20-Poly1305 cells (1 was XSalsa20-Poly1305) */
 #define SH_PADS_NAME_MAX  64
 #define SH_PADS_CELL_TAG  16          /* Poly1305 */
 #define SH_PADS_HDR_BYTES 256
@@ -50,7 +50,7 @@ typedef struct {
     uint64_t row_bytes;               /* one index, all groups */
     uint8_t  dealer_pk[32];           /* ephemeral X25519 public key of this shipment */
     uint8_t  key_box[48];             /* crypto_box(shipment key) to the consumer's pad key */
-    uint8_t  hdr_box[80];             /* secretbox(sha512(header || groups)) */
+    uint8_t  hdr_box[80];             /* ChaCha20-Poly1305 of sha512(header || groups): tag || ct */
     uint8_t  pad[256 - 8 - 4 - 4 - 32 - 16 - 8 - 8 - 8 - 8 - 32 - 48 - 80];
 } sh_pads_hdr;
 

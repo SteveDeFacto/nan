@@ -4,6 +4,7 @@
 #include "shielded-field.h"
 #include "shielded-tee.h"
 #include "tweetnacl.h"
+#include "poly1305-donna.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -68,13 +69,19 @@ void sh_pad_r(const uint8_t seed[32], uint32_t group, uint64_t index, int64_t K,
 static void put_u64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 static void put_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 
-static void cell_nonce(uint8_t n[24], const uint8_t seed_id[16], uint64_t index, uint32_t group) {
-    memcpy(n, seed_id, 8); put_u64(n + 8, index); put_u32(n + 16, group); memset(n + 20, 0, 4);
-}
+/* Cells and the header are ChaCha20-Poly1305 (RFC 8439) under the shipment
+ * key: the shipment key is fresh per file, so the 96-bit nonce only has to be
+ * unique within it - (index, group) is, and the header takes an all-0xEE
+ * nonce no cell can have (group 0xEEEEEEEE is far past the 65,535 cap). The
+ * key wrap stays crypto_box (32 bytes; speed is irrelevant there). */
+static void cell_nonce(uint8_t n[12], uint64_t index, uint32_t group) { put_u64(n, index); put_u32(n + 8, group); }
+static void hdr_nonce(uint8_t n[12]) { memset(n, 0xEE, 12); }
 static void key_nonce(uint8_t n[24], const uint8_t seed_id[16]) { memcpy(n, seed_id, 16); memset(n + 16, 0xFF, 8); }
-static void hdr_nonce(uint8_t n[24], const uint8_t seed_id[16]) { memcpy(n, seed_id, 16); memset(n + 16, 0xEE, 8); }
 
 static uint64_t cell_bytes(uint64_t u_len) { return SH_PADS_CELL_TAG + 3 * u_len; }
+static void chacha_ietf_block(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t out[64]);
+static int  aead_seal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *msg, size_t n, uint8_t *out /* n + 16 */);
+static int  aead_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *box /* n + 16 */, size_t n, uint8_t *out);
 
 /* Serialise the fixed header + table, with key_box/hdr_box zeroed, and hash it. */
 static void header_hash(const sh_pads_hdr *h, const sh_pads_group *groups, uint32_t n, uint8_t out[64]) {
@@ -166,10 +173,10 @@ sh_pads_writer *sh_pads_writer_open(const char *path, const uint8_t model_digest
     if (secretbox_seal(h->key_box, w->key, 32, nonce, shared) != SH_OK) { *err = SH_ERR_NOMEM; goto fail; }
     memset(esk, 0, sizeof esk); memset(shared, 0, sizeof shared);
 
-    uint8_t digest[64];
+    uint8_t digest[64], hn[12];
     header_hash(h, w->groups, n_groups, digest);
-    hdr_nonce(nonce, seed_id);
-    if (secretbox_seal(h->hdr_box, digest, 64, nonce, w->key) != SH_OK) { *err = SH_ERR_NOMEM; goto fail; }
+    hdr_nonce(hn);
+    if (aead_seal(w->key, hn, digest, 64, h->hdr_box) != SH_OK) { *err = SH_ERR_NOMEM; goto fail; }
 
     w->fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (w->fd < 0) { *err = SH_ERR_IO; goto fail; }
@@ -194,9 +201,9 @@ int sh_pads_writer_cell(sh_pads_writer *w, uint64_t index, uint32_t group, const
         if (v < 0 || v >= SH_M_MOD) return SH_ERR_RANGE;
         p[3 * j] = (uint8_t)v; p[3 * j + 1] = (uint8_t)(v >> 8); p[3 * j + 2] = (uint8_t)(v >> 16);
     }
-    uint8_t nonce[24];
-    cell_nonce(nonce, w->hdr.seed_id, index, group);
-    int rc = secretbox_seal(w->cell, p, (size_t)(3 * u_len), nonce, w->key);
+    uint8_t nonce[12];
+    cell_nonce(nonce, index, group);
+    int rc = aead_seal(w->key, nonce, p, (size_t)(3 * u_len), w->cell);
     if (rc != SH_OK) return rc;
     const uint64_t off = w->hdr.data_off + (index - w->hdr.index0) * w->hdr.row_bytes + w->group_off[group];
     const size_t n = (size_t)cell_bytes(u_len);
@@ -272,10 +279,10 @@ static int file_open(sh_pads_reader *r, const char *path, sh_pads_file *f) {
     memset(shared, 0, sizeof shared);
     if (rc != SH_OK) { file_close(f); return SH_ERR_VERIFY; }
 
-    uint8_t want[64], got[64];
+    uint8_t want[64], got[64], hn[12];
     header_hash(h, f->groups, h->group_count, want);
-    hdr_nonce(nonce, h->seed_id);
-    if (secretbox_open(got, h->hdr_box, 64, nonce, f->key) != SH_OK || memcmp(want, got, 64)) { file_close(f); return SH_ERR_VERIFY; }
+    hdr_nonce(hn);
+    if (aead_open(f->key, hn, h->hdr_box, 64, got) != SH_OK || memcmp(want, got, 64)) { file_close(f); return SH_ERR_VERIFY; }
 
     uint64_t row = 0;
     for (uint32_t g = 0; g < h->group_count; g++) {
@@ -388,9 +395,10 @@ int sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int32
     if (!cell || !plain) rc = SH_ERR_NOMEM;
     else if (pread(fd, cell, n, (off_t)off) != (ssize_t)n) rc = SH_ERR_IO;
     else {
-        uint8_t nonce[24];
-        cell_nonce(nonce, seed_id, index, (uint32_t)g);
-        rc = secretbox_open(plain, cell, (size_t)(3 * u_len), nonce, key);
+        uint8_t nonce[12];
+        cell_nonce(nonce, index, (uint32_t)g);
+        (void)seed_id;
+        rc = aead_open(key, nonce, cell, (size_t)(3 * u_len), plain);
         for (uint64_t j = 0; rc == SH_OK && j < u_len; j++) {
             const int64_t v = (int64_t)plain[3 * j] | ((int64_t)plain[3 * j + 1] << 8) | ((int64_t)plain[3 * j + 2] << 16);
             if (v >= SH_M_MOD) { rc = SH_ERR_VERIFY; break; }
@@ -503,24 +511,45 @@ static void chacha_ietf_block(const uint8_t key[32], uint32_t counter, const uin
     }
     for (int i = 0; i < 16; i++) { const uint32_t v = x[i] + s[i]; out[4 * i] = (uint8_t)v; out[4 * i + 1] = (uint8_t)(v >> 8); out[4 * i + 2] = (uint8_t)(v >> 16); out[4 * i + 3] = (uint8_t)(v >> 24); }
 }
-/* AEAD open with no AAD: tag over ct || pad16 || le64(0) || le64(ct_len) under
- * the one-time key from block 0; plaintext from blocks 1.. */
-static int chacha20poly1305_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *ct, size_t ct_len, const uint8_t tag[16], uint8_t *out) {
-    uint8_t blk[64], otk[32];
-    chacha_ietf_block(key, 0, nonce, blk); memcpy(otk, blk, 32);
-    const size_t pad = (16 - ct_len % 16) % 16, mlen = ct_len + pad + 16;
-    uint8_t *m = (uint8_t *)calloc(mlen, 1);
-    if (!m) return SH_ERR_NOMEM;
-    memcpy(m, ct, ct_len);
-    for (int i = 0; i < 8; i++) m[ct_len + pad + 8 + i] = (uint8_t)((uint64_t)ct_len >> (8 * i));
-    const int ok = crypto_onetimeauth_verify(tag, m, mlen, otk) == 0;
-    free(m); memset(otk, 0, sizeof otk);
-    if (!ok) return SH_ERR_VERIFY;
-    for (size_t off = 0, ctr = 1; off < ct_len; off += 64, ctr++) {
+/* RFC 8439 AEAD with no AAD, Poly1305 by poly1305-donna (incremental, so the
+ * tag runs over the ciphertext without a padded copy): tag over ct || pad16 ||
+ * le64(0) || le64(ct_len) under the one-time key from block 0, data from
+ * blocks 1.. Layout on the wire: 16-byte tag, then the ciphertext. */
+static void aead_tag(const uint8_t otk[32], const uint8_t *ct, size_t n, uint8_t tag[16]) {
+    static const uint8_t zeros[16] = {0};
+    poly1305_context st;
+    poly1305_init(&st, otk);
+    poly1305_update(&st, ct, n);
+    if (n % 16) poly1305_update(&st, zeros, 16 - n % 16);
+    uint8_t lens[16] = {0};
+    for (int i = 0; i < 8; i++) lens[8 + i] = (uint8_t)((uint64_t)n >> (8 * i));
+    poly1305_update(&st, lens, 16);
+    poly1305_finish(&st, tag);
+}
+static void aead_stream(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out) {
+    uint8_t blk[64];
+    for (size_t off = 0, ctr = 1; off < n; off += 64, ctr++) {
         chacha_ietf_block(key, (uint32_t)ctr, nonce, blk);
-        for (size_t i = 0; i < 64 && off + i < ct_len; i++) out[off + i] = ct[off + i] ^ blk[i];
+        const size_t take = n - off < 64 ? n - off : 64;
+        for (size_t i = 0; i < take; i++) out[off + i] = in[off + i] ^ blk[i];
     }
     memset(blk, 0, sizeof blk);
+}
+static int aead_seal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *msg, size_t n, uint8_t *out) {
+    uint8_t blk[64], otk[32];
+    chacha_ietf_block(key, 0, nonce, blk); memcpy(otk, blk, 32);
+    aead_stream(key, nonce, msg, n, out + 16);
+    aead_tag(otk, out + 16, n, out);
+    memset(otk, 0, sizeof otk);
+    return SH_OK;
+}
+static int aead_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *box, size_t n, uint8_t *out) {
+    uint8_t blk[64], otk[32], tag[16];
+    chacha_ietf_block(key, 0, nonce, blk); memcpy(otk, blk, 32);
+    aead_tag(otk, box + 16, n, tag);
+    memset(otk, 0, sizeof otk);
+    if (!poly1305_verify(tag, box)) return SH_ERR_VERIFY;
+    aead_stream(key, nonce, box + 16, n, out);
     return SH_OK;
 }
 
@@ -531,7 +560,8 @@ int sh_pads_seed_open(const uint8_t epk[32], const uint8_t nonce[12], const uint
     if (crypto_scalarmult(shared, pad_sk, epk) != 0) return SH_ERR_VERIFY;
     memcpy(salt, epk, 32); memcpy(salt + 32, pad_pk, 32);
     hkdf_sha512(shared, 32, salt, 64, "enclave-pads-seed-box", key, 32);
-    const int rc = chacha20poly1305_open(key, nonce, box, 32, box + 32, seed_out);
+    uint8_t laid[48]; memcpy(laid, box + 32, 16); memcpy(laid + 16, box, 32);   /* Node's ct||tag -> our tag||ct */
+    const int rc = aead_open(key, nonce, laid, 32, seed_out);
     memset(shared, 0, sizeof shared); memset(key, 0, sizeof key);
     return rc;
 }

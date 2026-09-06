@@ -186,10 +186,14 @@ bank must be sized for the largest prompt burst, not the decode rate.
   wholly below the mark. Measured on the 0.8B: 128 rows in 10.4 s including
   the load; a second pass at mark 70 pruned one and minted the next two.
 - Owner app streams `.pads` from a phone directory over vsock 7780 (P2).
+- DONE 2026-09-06: cells and the header are ChaCha20-Poly1305 (format 2):
+  the engine's ChaCha20 runs at 759 MB/s and poly1305-donna (vendored,
+  public domain) at 2.8 GB/s on one x86 core, against TweetNaCl's 53 MB/s
+  for XSalsa20-Poly1305, so a 27B row (12.6 MB) opens in ~20 ms and 20
+  rows/s cost a fraction of a core. Re-proved on the 0.8B end to end.
 - TODO: the bank on the GPU box (the agent stores what the dealer ships
   and the phone fetches over LAN/USB), prefetch depth from link rate and
-  the largest expected prompt, and a faster cell AEAD (TweetNaCl opens at
-  53 MB/s per core; the 27B needs ~250 MB/s at 20 rows/s).
+  the largest expected prompt.
 
 ### P4. Shared-prefix KV, receipts, billing
 - Prefix service signs KV for (model, public prefix); pVM loads instead of

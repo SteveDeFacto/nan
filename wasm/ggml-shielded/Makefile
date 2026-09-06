@@ -8,7 +8,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC
 LDLIBS  += -lm
 
-CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c tweetnacl.c
+CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c tweetnacl.c poly1305-donna.c
 CORE_OBJ := $(CORE_SRC:.c=.o) shielded-simd-avx512.o shielded-simd-generic.o
 LDLIBS   += -lpthread
 
@@ -114,7 +114,7 @@ bench: bench-batch bench-spec
 
 # The dealer: mint .pads shipments from a model; libllama for the load, the
 # backend module for the registration and the mint (shielded/dealer/PLAN.md).
-shielded-dealer: shielded-dealer.cpp shielded-pads.o tweetnacl.o shielded-tee.o shielded-field.o shielded-wire.o shielded-simd-avx512.o shielded-simd-generic.o
+shielded-dealer: shielded-dealer.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $(LLAMA_INC) $(GGML_INC) -I../llama-shim -o $@ $^ \
 	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 
