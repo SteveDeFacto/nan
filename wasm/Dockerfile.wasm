@@ -18,6 +18,30 @@
 ARG WASMTIME_IMAGE=ghcr.io/enclavehost/enclave-wasmtime:ac0772970b9ad2cd53866d95db69e26311fe3b75@sha256:d53061cfffb0dedbbfeebfe0f8455227d80616e6cf440886d0c514184c6140aa
 FROM ${WASMTIME_IMAGE} AS wasmtime
 
+# CPU-only engine changes do not require rebuilding wasmtime or CUDA. Rebuild
+# this dlopened module from the SAME llama revision and ABI flags as the pinned
+# toolchain; all other engine libraries still come from that toolchain image.
+FROM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS ggml-cpu-build
+ARG GGML_CPU_COMMIT=ddd4ec1428a6201e18975ea52b07c71e0f9aef26
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init -q /src/llama && cd /src/llama \
+    && git remote add origin https://github.com/ggml-org/llama.cpp \
+    && git fetch -q --depth 1 origin "${GGML_CPU_COMMIT}" && git checkout -q FETCH_HEAD
+COPY llamacpp-parallel-copy.patch /tmp/parallel-copy.patch
+RUN cd /src/llama && git apply /tmp/parallel-copy.patch \
+    && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+       -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
+       -DCMAKE_C_FLAGS=-DGGML_MAX_NAME=128 -DCMAKE_CXX_FLAGS=-DGGML_MAX_NAME=128 \
+       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_APP=OFF \
+    && cmake --build build --target ggml-cpu -j4
+# Resolve the module against the actual base library shipped by wasmtime,
+# not the copy CMake just built. Fail the image if the ABI does not link.
+COPY --from=wasmtime /lib/libggml-base.so.0.18.0 /tmp/toolchain-base/libggml-base.so.0
+RUN LD_LIBRARY_PATH=/tmp/toolchain-base ldd -r /src/llama/build/bin/libggml-cpu.so > /tmp/cpu-deps \
+    && ! grep -E 'not found|undefined symbol' /tmp/cpu-deps
+
 # Base pinned by DIGEST, not just the mutable tag: this image is part of the
 # MEASURED enclave TCB, and its sidecar digest is what enclaves/*/tinfoil-config.yml
 # commits to. An upstream repush of the same tag silently changes the measurement,
@@ -56,6 +80,7 @@ COPY --from=wasmtime /bin/wasmtime /usr/local/bin/wasmtime
 # metal guest sets to /usr/local/bin (hosted-fleet configs likewise).
 COPY --from=wasmtime /bin/ffmpeg /bin/ffprobe /usr/local/bin/
 COPY --from=wasmtime /lib/ /usr/local/lib/
+COPY --from=ggml-cpu-build /src/llama/build/bin/libggml-cpu.so /usr/local/lib/libggml-cpu.so
 # ggml (llama.cpp) compute backends are dlopened MODULES (GGML_BACKEND_DL) -
 # libggml-cpu/-cuda in /usr/local/lib are found via this env, not ldconfig.
 # Keeps libcuda.so.1 out of the wasmtime binary's DT_NEEDED: the driver lib
