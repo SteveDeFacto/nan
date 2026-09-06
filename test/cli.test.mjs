@@ -100,6 +100,7 @@ const S = {
   fleetRateCap: true,                          // availability.rateCap (fleet-AND for cap edits)
   fleet: null,                                 // GET /enclaves rows (per-box hardware; null = no fleet view)
   money: null,                                 // get(ID) rate/balance6 override ({rate,balance6}); null = the paid default
+  envelope: "", pinnedJson: [],
 };
 
 function apiServer() {
@@ -140,6 +141,7 @@ function apiServer() {
     if (u.pathname === "/availability")
       return json(200, { aggregate: true, enclaves: 2, gpuShareFree: 0.5, cpuShareFree: 0.9,
                          shareResize: S.fleetResize, rateCap: S.fleetRateCap,
+                         configOverride: true, configCidOverride: true, configEdit: true,
                          // rev-8 fleets post prices; the cheapest is what a new
                          // deployment pays and what its cap defaults to
                          cheapestCpuPricePerSec6: 556, cheapestGpuPricePerSec6: 1667 });
@@ -210,7 +212,7 @@ function apiServer() {
 // ABIs, and accepts real signed transactions (decoded + recorded for asserts)
 function rpcServer() {
   const depRecord = () => ({
-    id: ID, owner: OWNER, appRef: "catalog://" + "0x" + "cd".repeat(32) + "/0", ports: "http:8088", configCid: "",
+    id: ID, owner: OWNER, appRef: "catalog://" + "0x" + "cd".repeat(32) + "/0", ports: "http:8088", configCid: S.envelope,
     gpuMilli: 0, cpuMilli: 10, appPort: 8088, isPublic: true, active: S.active,
     createdAt: BigInt(Math.floor(Date.now() / 1000) - 60),
     // a free self-hosted record (rev 12) carries rate 0 and, correctly, an
@@ -313,6 +315,11 @@ function ipfsServer() {
   return http.createServer(async (req, res) => {
     const chunks = []; for await (const c of req) chunks.push(c);
     const buf = Buffer.concat(chunks);
+    if (req.url === "/add-json") {
+      S.pinnedJson.push(JSON.parse(buf.toString("utf8")));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ cid: CID }));
+    }
     if (req.url !== "/add-wasm") { res.writeHead(404); return res.end(); }
     if (buf.readUInt32LE(0) !== 0x6d736100 || (buf[6] | (buf[7] << 8)) !== 1) {
       res.writeHead(415); return res.end("not a component");
@@ -342,6 +349,7 @@ function run(cliArgs, { input, env } = {}) {
              ENCLAVE_API_BASE: `http://127.0.0.1:${apiPort}`,
              ENCLAVE_RPC: `http://127.0.0.1:${rpcPort}`,
              ENCLAVE_IPFS_UPLOAD: `http://127.0.0.1:${ipfsPort}/add-wasm`,
+             ENCLAVE_IPFS_JSON_UPLOAD: `http://127.0.0.1:${ipfsPort}/add-json`,
              ENCLAVE_ADDRESS_BOOK: "",   // opt out of the on-chain address book: the double must stay offline (and the 4s resolve cap × every invocation would blow the suite timeout)
              XDG_CONFIG_HOME: confDir,
              ...env },                   // per-test overrides (ENCLAVE_KEY: "" = the passkey-only, wallet-less user)
@@ -355,6 +363,56 @@ function run(cliArgs, { input, env } = {}) {
 }
 
 // ---- tests -----------------------------------------------------------------------
+test("deploy pins a large config and retains its routing manifest", async () => {
+  S.txs.length = 0; S.pinnedJson.length = 0; S.depRev = 5n; S.claimed = false;
+  const config = { volumes: ["model-q8"], system_prompt: "x".repeat(5000) };
+  try {
+    const r = await run(["deploy", "hello-world:1", "--config", JSON.stringify(config), "--fund", "2", "--no-wait"]);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(S.pinnedJson, [config]);
+    const tx = S.txs.find((t) => t.functionName === "create");
+    const envelope = JSON.parse(tx.args[6]);
+    assert.deepEqual(envelope, { config: { volumes: config.volumes }, configCid: CID });
+  } finally { S.depRev = 3n; S.claimed = false; S.pinnedJson.length = 0; }
+});
+
+test("config replacement supersedes an existing pinned config, large or small", async () => {
+  S.depRev = 5n;
+  const old = { configCid: "bafy-old-config", config: { volumes: ["old-model"] }, waf: { rps: 10 } };
+  try {
+    for (const config of [
+      { volumes: ["new-model"], system_prompt: "y".repeat(5000) },
+      { volumes: ["new-model"], temperature: 0.6 },
+    ]) {
+      S.envelope = JSON.stringify(old); S.txs.length = 0; S.pinnedJson.length = 0;
+      const r = await run(["config", "set", ID, JSON.stringify(config)]);
+      assert.equal(r.code, 0, r.err);
+      const tx = S.txs.find((t) => t.functionName === "setConfig");
+      const envelope = JSON.parse(tx.args[1]);
+      assert.deepEqual(envelope.waf, old.waf);
+      if (config.system_prompt) {
+        assert.deepEqual(S.pinnedJson, [config]);
+        assert.equal(envelope.configCid, CID);
+        assert.deepEqual(envelope.config, { volumes: config.volumes });
+      } else {
+        assert.equal(envelope.configCid, undefined);
+        assert.deepEqual(envelope.config, config);
+        assert.equal(S.pinnedJson.length, 0);
+      }
+    }
+  } finally { S.depRev = 3n; S.envelope = ""; S.pinnedJson.length = 0; }
+});
+
+test("upgrade honors the publisher's optional GPU requirement", async () => {
+  S.txs.length = 0; S.depRev = 6n; S.versionCount = 2;
+  S.v2 = { vramMb: 131072, gpuGflops: 100000, config: JSON.stringify({ gpuOptional: true }) };
+  try {
+    const r = await run(["upgrade", ID, "2", "--cpu", "0.5"]);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(S.txs.length > 0, "optional GPU does not prevent a CPU deployment upgrade");
+  } finally { S.depRev = 3n; S.versionCount = 1; S.v2 = null; }
+});
+
 test("whoami: address + balances from chain, SIWE login verified server-side", async () => {
   const r = await run(["whoami", "--json"]);
   assert.equal(r.code, 0, r.err);

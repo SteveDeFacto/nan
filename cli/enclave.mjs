@@ -778,8 +778,10 @@ function minShares(ver, pricing) {
                        axis(Number(ver.cpuGflops), node.gflops || 0));
   const gpu = Math.max(axis(Number(ver.vramMb), (card.vramGb || 0) * 1024),
                        axis(Number(ver.gpuGflops), (card.tflops || 0) * 1000));
+  let gpuOptional = false;
+  try { gpuOptional = JSON.parse(ver.config || "{}").gpuOptional === true; } catch {}
   const grain = (x) => Math.min(1000, Math.ceil(x * 100) * 10); // whole percents, in milli
-  return { gpuMilli: grain(gpu), cpuMilli: Math.max(10, grain(cpu)) };
+  return { gpuMilli: gpuOptional ? 0 : grain(gpu), cpuMilli: Math.max(10, grain(cpu)) };
 }
 // Changing the version or shares of a LEASED deployment is judged by ONE box:
 // the enclave holding the lease restarts the app in place and checks the new
@@ -1852,7 +1854,22 @@ async function cmdDeploy(rest) {
     }
     say("gpu: PREFERRED, not required — a GPU enclave claims it first; if every card is busy a CPU-only enclave runs it on cores and the ledger bills only the CPU share there");
   }
-  const envelope = Object.keys(envParts).length ? JSON.stringify(envParts) : "";
+  let envelope = Object.keys(envParts).length ? JSON.stringify(envParts) : "";
+  if (Buffer.byteLength(envelope) > 4096 && envParts.config) {
+    const body = JSON.stringify(envParts.config);
+    if (Buffer.byteLength(body) > CONFIG_MAX_BYTES)
+      throw new Error(`the config is ${Buffer.byteLength(body)} bytes; enclaves refuse anything over ${CONFIG_MAX_BYTES} at launch`);
+    const av = await api("GET", "/availability");
+    if (!av?.configCidOverride)
+      throw new Error("the live fleet does not support pinned config overrides; trim the config or update the fleet");
+    const manifest = {};
+    if (envParts.config.volumes !== undefined) manifest.volumes = envParts.config.volumes;
+    const cid = await pinJson(account, Buffer.from(body, "utf8"));
+    say(`config pinned at ${cid}; its volume list stays in the routing manifest`);
+    envParts.configCid = cid;
+    if (Object.keys(manifest).length) envParts.config = manifest; else delete envParts.config;
+    envelope = JSON.stringify(envParts);
+  }
   if (Buffer.byteLength(envelope) > 4096)
     throw new Error(`the options envelope (waf + config) is ${Buffer.byteLength(envelope)} bytes; runners refuse envelopes over 4096 bytes — trim the config override`);
   // --secrets '{"K":"V"}' / --secrets-file .env: PRIVATE env vars, staged on the
@@ -2639,6 +2656,9 @@ async function cmdConfig(rest) {
         throw new Error("the app config must be a JSON object - it replaces the version's config as this deployment's ENCLAVE_CONFIG ('{}' = explicitly empty)");
       if ("_media" in c) throw new Error("config._media is reserved for the catalog's store media and never reaches an app - remove it");
       next.config = c;
+      // A replacement must not retain the old pinned body: the runner gives
+      // that CID precedence over inline config, and a large edit must re-pin.
+      delete next.configCid;
     }
     if (f.waf !== undefined) {
       let w; try { w = JSON.parse(f.waf); } catch (e) { throw new Error("--waf must be a JSON object, e.g. --waf '{\"rps\":10}': " + e.message); }
