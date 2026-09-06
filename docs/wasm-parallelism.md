@@ -1080,3 +1080,19 @@ request thread. It defaults to zero. Waiting does not add workers or reuse
 masks; a timeout consumes only ready masks and generates the remainder as
 before. Compare TTFT, generation throughput, and the shielded profile's
 `waited`/`wait` counters before enabling it for a workload.
+
+Three more keys size the masking pool itself. Every pad is one row of
+`u = r·W` over a weight group, and the request path draws one pad per group
+per token row: speculative decode verifies and drafts about three rows per
+accepted token, so on a 27B even a single chat consumes most of the refill
+capacity, and the refill threads, not the compute pool, are the binding
+resource. `nnShieldedRefillBatch` (1–64, engine default 4) is how many rows
+one refill job computes; past four rows the engine's row-blocked kernel
+streams the group's weights once per job instead of once per four rows, which
+raises the aggregate refill rate but makes a drained group wait for a longer
+job. `nnShieldedPoolDepth` (16–4096, default four times the widest batch the
+graph presents, at least 16) is the pad ring per group; it must hold at least
+two refill jobs, and each 32 rows of depth cost up to about 1 GiB of enclave memory
+on a 27B. `nnShieldedRefillThreads` (1–64, default half the vCPUs) is the
+refill thread total, divided over the card links. Measure all three with the
+same model, prompt and context: the wins are workload-shaped.

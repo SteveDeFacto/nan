@@ -39,6 +39,7 @@ static inline long sh_lrintf_nolibm(float v) {
 #include <math.h>
 #define sh_lrintf(v) lrintf(v)
 #endif
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef SH_SIMD_AVX512
@@ -323,6 +324,97 @@ static inline void refill_rows4(const uint8_t *planes,int b,int b0,
             for(int r=0;r<4;r++)acc[(p*4+r)*N+j0+t*4+c]=_mm512_reduce_add_epi32(saved[t][p][c][r]);
     }
 }
+
+/* ROW-BLOCKED refill: every row of the batch against one weight tile before
+ * the next tile, so the weight stream is paid once per BATCH rather than once
+ * per four rows (the wrapper's four-row loop below re-read W for each group
+ * of four, so a 32-row batch streamed the matrix eight times). Sixteen output
+ * columns per tile, 2048-byte K slabs. Per slab the weight tile (32 KiB) stays
+ * in L1 across every (row group, plane); the four mask rows of one (row group,
+ * plane) (8 KiB) stay in L1 across the four column quads; the running int32
+ * sums round-trip L2 once per slab (2 KiB per 512 dpbusd). Each tile's sums
+ * are reduced and CRT-balanced straight into u, so no [3][4][N] accumulator is
+ * touched. Duplicate tail rows (b not a multiple of four) are computed against
+ * the last real row and never written. Field arithmetic, planes, tails and
+ * the output layout are those of refill_rows4. */
+#define SH_BLK_K 2048
+static void refill_rows_blocked(const uint8_t *planes, int b, const int8_t *W,
+        int64_t K, int64_t N, int32_t *u, int64_t u_stride) {
+    const int G = (b + 3) / 4;
+    const int64_t K64 = K & ~(int64_t)63;
+    const __mmask64 tail = (K & 63) ? (((__mmask64)1 << (K & 63)) - 1) : 0;
+    __m512i *saved = (__m512i *)aligned_alloc(64, (size_t)G * 3 * 4 * 16 * sizeof(__m512i));
+    if (!saved) { /* out of memory: fall back to the four-row path */
+        for (int b0 = 0; b0 < b; b0 += 4) {
+            int32_t *acc = (int32_t *)malloc((size_t)12 * N * sizeof(int32_t));
+            if (!acc) return;
+            refill_rows4(planes, b, b0, W, K, N, acc);
+            const int rows = b - b0 < 4 ? b - b0 : 4;
+            for (int r = 0; r < rows; r++) {
+                const int32_t *a0 = acc + (0 * 4 + r) * N, *a1 = acc + (1 * 4 + r) * N, *a2 = acc + (2 * 4 + r) * N;
+                int32_t *o = u + (int64_t)(b0 + r) * u_stride;
+                for (int64_t j = 0; j < N; j++) o[j] = crt_balanced(a0[j], a1[j], a2[j]);
+            }
+            free(acc);
+        }
+        return;
+    }
+    const uint8_t *pl[3][4];
+    for (int64_t j0 = 0; j0 < N; j0 += 16) {
+        const int8_t *wp[16];
+        for (int c = 0; c < 16; c++) wp[c] = W + (j0 + c < N ? j0 + c : j0) * K;
+        for (size_t i = 0; i < (size_t)G * 3 * 4 * 16; i++) saved[i] = _mm512_setzero_si512();
+        for (int64_t k0 = 0; k0 < K; k0 += SH_BLK_K) {
+            const int64_t k_end = k0 + SH_BLK_K < K64 ? k0 + SH_BLK_K : K64;
+            const int do_tail = tail && k0 <= K64 && K64 < k0 + SH_BLK_K;
+            for (int g = 0; g < G; g++) {
+                for (int p = 0; p < 3; p++) for (int r = 0; r < 4; r++) {
+                    const int row = g * 4 + r < b ? g * 4 + r : b - 1;
+                    pl[p][r] = planes + ((size_t)p * b + row) * K;
+                }
+                for (int p = 0; p < 3; p++) {
+                    for (int t = 0; t < 4; t++) {
+                        __m512i *sv = saved + (((size_t)g * 3 + p) * 4 + t) * 16;
+                        __m512i a[4][4];
+                        for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) a[c][r] = sv[c * 4 + r];
+                        int64_t k = k0;
+                        for (; k < k_end; k += 64) {
+                            __m512i x[4];
+                            for (int c = 0; c < 4; c++) x[c] = _mm512_loadu_si512((const void *)(wp[t * 4 + c] + k));
+                            for (int r = 0; r < 4; r++) {
+                                const __m512i v = _mm512_loadu_si512((const void *)(pl[p][r] + k));
+                                for (int c = 0; c < 4; c++) a[c][r] = _mm512_dpbusd_epi32(a[c][r], v, x[c]);
+                            }
+                        }
+                        if (do_tail) {
+                            __m512i x[4];
+                            for (int c = 0; c < 4; c++) x[c] = _mm512_maskz_loadu_epi8(tail, wp[t * 4 + c] + K64);
+                            for (int r = 0; r < 4; r++) {
+                                const __m512i v = _mm512_maskz_loadu_epi8(tail, pl[p][r] + K64);
+                                for (int c = 0; c < 4; c++) a[c][r] = _mm512_dpbusd_epi32(a[c][r], v, x[c]);
+                            }
+                        }
+                        for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) sv[c * 4 + r] = a[c][r];
+                    }
+                }
+            }
+        }
+        for (int g = 0; g < G; g++) for (int r = 0; r < 4; r++) {
+            const int row = g * 4 + r;
+            if (row >= b) break;
+            int32_t *o = u + (int64_t)row * u_stride;
+            for (int t = 0; t < 4; t++) for (int c = 0; c < 4; c++) {
+                const int64_t j = j0 + t * 4 + c;
+                if (j >= N) continue;
+                const int32_t a0 = _mm512_reduce_add_epi32(saved[(((size_t)g * 3 + 0) * 4 + t) * 16 + c * 4 + r]);
+                const int32_t a1 = _mm512_reduce_add_epi32(saved[(((size_t)g * 3 + 1) * 4 + t) * 16 + c * 4 + r]);
+                const int32_t a2 = _mm512_reduce_add_epi32(saved[(((size_t)g * 3 + 2) * 4 + t) * 16 + c * 4 + r]);
+                o[j] = crt_balanced(a0, a1, a2);
+            }
+        }
+    }
+    free(saved);
+}
 #elif defined(SH_SIMD_NEON)
 /* SDOT is signed x signed; the planes are unsigned residues. The exact identity
  *   sum_k x[k]*w[k] = sum_k (x[k]-128)*w[k] + 128*sum_k w[k]
@@ -376,6 +468,10 @@ static inline void refill_rows4(const uint8_t *planes, int b, int b0,
 
 void FN(refill)(const uint8_t *planes, int b, const int8_t *W, int64_t K, int64_t N,
                 int32_t *u, int64_t u_stride, int32_t *acc) {
+#ifdef SH_SIMD_AVX512
+    /* a batch past four rows: one weight stream for the whole batch */
+    if (b > 4) { refill_rows_blocked(planes, b, W, K, N, u, u_stride); return; }
+#endif
     for (int b0 = 0; b0 < b; b0 += 4) {
         const int rows = b - b0 < 4 ? b - b0 : 4;
 #ifdef SH_SIMD_AVX512

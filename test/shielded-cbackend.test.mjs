@@ -55,6 +55,16 @@ test("the C field encoding matches Python, subnormals included", (t) => {
     `${bad}/${got.length} encodings differ between wasm/ggml-shielded and shielded/field.py`);
 });
 
+// The refill kernels are the pad generator: a wrong column there is silent noise
+// after the unmasking subtraction, exactly like a wrong encoding. The oracle
+// covers the four-row path and the row-blocked path a wider batch takes.
+test("the AVX-512 refill kernels match a scalar exact product on every shape", (t) => {
+  if (!build()) return t.skip("no toolchain for the C backend");
+  const r = spawnSync(join(dir, "refill-selftest"), { encoding: "utf8", timeout: 600_000 });
+  if (r.status === 77) return t.skip("no AVX-512 VNNI on this host");
+  assert.equal(r.status, 0, `refill-selftest failed: ${r.signal || r.status} ${r.stderr || ""}`);
+});
+
 // The scales are half of THE encoding, so their fp32->fp16 conversion is part of
 // the contract too. Truncating instead of rounding to nearest-even lands one ulp
 // low on about half of all blocks and fails NOWHERE -- the two sides simply derive

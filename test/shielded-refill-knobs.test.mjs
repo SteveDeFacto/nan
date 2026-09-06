@@ -1,0 +1,45 @@
+// The two refill knobs a deployment config may set for the shielded engine,
+// pinned the way the other manager->engine env seams are: the config key, the
+// engine env it becomes, and the bounds (which match the engine's own clamps
+// in wasm/ggml-shielded/shielded-tee.c: SHIELDED_REFILL_BATCH 1..64,
+// SHIELDED_POOL_DEPTH -1..4096 with 16 the smallest useful ring).
+//
+//   run: node --test test/shielded-refill-knobs.test.mjs
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const manager = fs.readFileSync(path.join(ROOT, "wasm/wasm_manager.py"), "utf8");
+const tee = fs.readFileSync(path.join(ROOT, "wasm/ggml-shielded/shielded-tee.c"), "utf8");
+const backend = fs.readFileSync(path.join(ROOT, "wasm/ggml-shielded/ggml-shielded.cpp"), "utf8");
+
+test("nnShieldedRefillBatch reaches the engine as SHIELDED_REFILL_BATCH within the engine's bounds", () => {
+  const m = manager.match(/_nn_cfg_int\(enclave_config, "nnShieldedRefillBatch", (\d+), (\d+)\)[\s\S]*?env\["SHIELDED_REFILL_BATCH"\] = str\(rb\)/);
+  assert.ok(m, "the manager must map nnShieldedRefillBatch to SHIELDED_REFILL_BATCH");
+  const e = tee.match(/env_int\("SHIELDED_REFILL_BATCH", \d+, (\d+), (\d+)\)/);
+  assert.ok(e, "the engine must read SHIELDED_REFILL_BATCH with bounds");
+  assert.equal(m[1], e[1]); assert.equal(m[2], e[2]);
+});
+
+test("nnShieldedPoolDepth reaches the engine as SHIELDED_POOL_DEPTH, never below a useful ring", () => {
+  const m = manager.match(/_nn_cfg_int\(enclave_config, "nnShieldedPoolDepth", (\d+), (\d+)\)[\s\S]*?env\["SHIELDED_POOL_DEPTH"\] = str\(pd\)/);
+  assert.ok(m, "the manager must map nnShieldedPoolDepth to SHIELDED_POOL_DEPTH");
+  const e = tee.match(/env_int\("SHIELDED_POOL_DEPTH", -1, -1, (\d+)\)/);
+  assert.ok(e, "the engine must read SHIELDED_POOL_DEPTH");
+  assert.equal(m[2], e[1], "the upper bound is the engine's");
+  assert.ok(Number(m[1]) >= 16, "a ring shallower than 16 starves speculative decode");
+});
+
+test("nnShieldedRefillThreads reaches the engine as the SHIELDED_REFILL_THREADS total the backend splits over cards", () => {
+  const m = manager.match(/_nn_cfg_int\(enclave_config, "nnShieldedRefillThreads", (\d+), (\d+)\)[\s\S]*?env\["SHIELDED_REFILL_THREADS"\] = str\(rt\)/);
+  assert.ok(m, "the manager must map nnShieldedRefillThreads to SHIELDED_REFILL_THREADS");
+  const e = backend.match(/sh_env_int\("SHIELDED_REFILL_THREADS",[\s\S]*?std::min\((\d+), threads\)/);
+  assert.ok(e, "the backend must read SHIELDED_REFILL_THREADS as the process-wide total");
+  assert.equal(m[2], e[1], "the upper bound is the backend's");
+  assert.ok(Number(m[1]) >= 1, "zero refill threads would generate every pad on the request path");
+  assert.match(backend, /refill_threads = threads \/ \(int\)parsed\.size\(\)/, "the total is divided over the card links");
+});

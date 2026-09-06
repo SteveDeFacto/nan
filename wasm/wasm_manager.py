@@ -5552,6 +5552,25 @@ def _spawn_and_wait(rec, ctx):
         pw = _nn_cfg_int(enclave_config, "nnShieldedPadWaitUs", 0, 50000)
         if pw is not None:
             env["SHIELDED_PAD_WAIT_US"] = str(pw)
+        # Refill batching (2026-09-06): rows a refill thread prepares per pass
+        # over a weight group, and the pad ring depth per group. The engine's
+        # row-blocked kernel streams the weights ONCE per batch, so 16 rows
+        # cuts the refill's DRAM traffic to a quarter of the four-row default
+        # (+82% aggregate refill at 16 threads, rows-mt-bench); the depth must
+        # hold two batches per group. Engine bounds: batch 1..64, depth 16..4096.
+        rb = _nn_cfg_int(enclave_config, "nnShieldedRefillBatch", 1, 64)
+        if rb is not None:
+            env["SHIELDED_REFILL_BATCH"] = str(rb)
+        pd = _nn_cfg_int(enclave_config, "nnShieldedPoolDepth", 16, 4096)
+        if pd is not None:
+            env["SHIELDED_POOL_DEPTH"] = str(pd)
+        # The refill thread TOTAL (the engine divides it over the card links;
+        # absent = half the vCPUs). Speculative decode draws ~3 pad rows per
+        # token, so even one chat is refill-bound on a 27B: these threads are
+        # the binding resource, and the compute pool (nnThreads) is not.
+        rt = _nn_cfg_int(enclave_config, "nnShieldedRefillThreads", 1, 64)
+        if rt is not None:
+            env["SHIELDED_REFILL_THREADS"] = str(rt)
         env.update(_nn_shielded_transport_for(enclave_config))
         env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's
