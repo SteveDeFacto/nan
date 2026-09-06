@@ -303,11 +303,17 @@ struct GemmTab {
  * tied everywhere), 3 x MR x 4 accumulators. The launch bound asks for two
  * resident blocks per SM (<= 128 registers) up to m = 4; at m = 5..8 the 60-96
  * accumulators need the whole register file and a forced cap only spills
- * (m = 8 gate|up: 40 us at one block per SM, 44 with two). */
+ * (m = 8 gate|up: 40 us at one block per SM, 44 with two). On Volta, m = 3..4
+ * also benefits from the extra registers: the 27B m = 4 gate|up and down
+ * kernels took 40-54% less time in both V100 microbenchmarks. */
 static const int GEMM_WR = 4;
 template <int MR> struct RowsFor {
     static const int WR = GEMM_WR;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    static const int MINB = MR <= 2 ? 2 : 1;
+#else
     static const int MINB = MR <= 4 ? 2 : 1;
+#endif
 };
 static inline int gemm_rows_per_block(int mr, int g) { (void)mr; return GEMM_WR * g; }
 
