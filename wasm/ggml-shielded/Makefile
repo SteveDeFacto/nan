@@ -64,14 +64,14 @@ prepare-selftest: prepare-selftest.c shielded-field.o
 half-selftest: half-selftest.c shielded-field.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ggml-shielded.o: ggml-shielded.cpp ggml-shielded.h shielded-tee.h shielded-field.h shielded-simd.h
+ggml-shielded.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielded-tee.h shielded-field.h shielded-simd.h
 	$(CXX) $(CXXFLAGS) $(GGML_INC) -c $< -o $@
 
 ggml-test: ggml-test.cpp ggml-shielded.o $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $(GGML_INC) -o $@ $^ \
 	  -L$(GGML_LIB) -lggml -lggml-base -lggml-cpu $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 
-ggml-shielded-dl.o: ggml-shielded.cpp ggml-shielded.h shielded-tee.h shielded-field.h shielded-simd.h
+ggml-shielded-dl.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielded-tee.h shielded-field.h shielded-simd.h
 	$(CXX) $(CXXFLAGS) -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED $(GGML_INC) -c $< -o $@
 
 libggml-shielded.so: ggml-shielded-dl.o $(CORE_OBJ)
