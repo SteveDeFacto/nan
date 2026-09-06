@@ -40,10 +40,11 @@ static bool file_digest(const char *path, uint8_t out[32]) {
 
 int main(int argc, char **argv) {
     const char *model_path = argc > 1 ? argv[1] : nullptr;
-    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr;
+    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr, *ranges = nullptr;
     uint64_t index0 = 0, count = 64;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--out")) out = argv[i + 1];
+        else if (!strcmp(argv[i], "--ranges")) ranges = argv[i + 1];   /* i0:count,i0:count,...; --out is then a template with {index0} and {count} */
         else if (!strcmp(argv[i], "--seed")) seed = argv[i + 1];
         else if (!strcmp(argv[i], "--seed-id")) seed_id = argv[i + 1];
         else if (!strcmp(argv[i], "--pk")) pk = argv[i + 1];
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
     }
     const char *backend = getenv("SHIELDED_SO"), *calib = getenv("SHIELDED_CALIB");
     if (!model_path || !out || !seed || !seed_id || !pk || !backend || !calib) {
-        fprintf(stderr, "usage: SHIELDED_SO=.. GGML_CPU_SO=.. SHIELDED_CALIB=.. shielded-dealer model.gguf --out F --seed H64 --seed-id H32 --pk H64 [--index0 N] [--count N]\n");
+        fprintf(stderr, "usage: SHIELDED_SO=.. GGML_CPU_SO=.. SHIELDED_CALIB=.. shielded-dealer model.gguf --out F --seed H64 --seed-id H32 --pk H64 [--index0 N] [--count N] | [--ranges i0:n,i0:n --out template{index0}{count}]\n");
         return 2;
     }
     /* The weights register against a link that is never connected: a port
@@ -99,10 +100,29 @@ int main(int argc, char **argv) {
     uint8_t digest[32]; char digest_hex[65];
     if (!file_digest(calib, digest)) { fprintf(stderr, "cannot read calib %s\n", calib); return 2; }
     sh_pads_bin2hex(digest, 32, digest_hex);
-    const int rc = mint(seed, seed_id, digest_hex, index0, count, pk, out);
-    if (rc != 0) { fprintf(stderr, "mint failed: %d\n", rc); return 1; }
-    printf("minted %s: indices [%llu, %llu), model digest %s\n", out, (unsigned long long)index0,
-           (unsigned long long)(index0 + count), digest_hex);
+    /* One model load, any number of shipments: the loop that keeps a bank ahead
+     * of the ledger mints every missing range in one process. */
+    std::vector<std::pair<uint64_t, uint64_t>> plan;
+    if (ranges) {
+        std::string r = ranges;
+        for (size_t at = 0; at < r.size();) {
+            size_t comma = r.find(',', at); if (comma == std::string::npos) comma = r.size();
+            const std::string one = r.substr(at, comma - at); at = comma + 1;
+            const size_t colon = one.find(':');
+            if (colon == std::string::npos) { fprintf(stderr, "bad range %s\n", one.c_str()); return 2; }
+            plan.emplace_back(strtoull(one.substr(0, colon).c_str(), nullptr, 10), strtoull(one.substr(colon + 1).c_str(), nullptr, 10));
+        }
+    } else plan.emplace_back(index0, count);
+    for (auto &pr : plan) {
+        std::string path = out;
+        auto sub = [&](const char *key, uint64_t v) { for (size_t k; (k = path.find(key)) != std::string::npos;) path.replace(k, strlen(key), std::to_string(v)); };
+        sub("{index0}", pr.first); sub("{count}", pr.second);
+        const int rc = mint(seed, seed_id, digest_hex, pr.first, pr.second, pk, path.c_str());
+        if (rc != 0) { fprintf(stderr, "mint failed: %d\n", rc); return 1; }
+        printf("minted %s: indices [%llu, %llu), model digest %s\n", path.c_str(), (unsigned long long)pr.first,
+               (unsigned long long)(pr.first + pr.second), digest_hex);
+        fflush(stdout);
+    }
     llama_free(ctx);
     llama_model_free(model);
     return 0;

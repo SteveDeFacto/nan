@@ -156,6 +156,17 @@ export function createPadsLedger({ dir, hub, log = console.log, masterSeed = nul
       return { status: 200, body: { seed_id, lo, hi, iat, sig: wsig } };
     },
 
+    /* GET /v1/pads/pvm?name=: what a dealer needs to mint for an attached pVM -
+     * public keys only (the seed itself is derived from keyFp by whoever holds
+     * the master), plus the seed id and the mark so a bank can be planned. */
+    pvm(name) {
+      const t = hub && hub.info ? hub.info(name) : null;
+      if (!t || !t.keyFp) return null;
+      const { seed_id } = deriveSeed(master, t.keyFp, PADS_EPOCH);
+      const rec = seedRecord(seed_id);
+      return { name, keyFp: t.keyFp, padKey: t.padKey || "", seed_id, epoch: PADS_EPOCH, mark: rec ? rec.mark : 0, issued: !!rec };
+    },
+
     /* GET /v1/pads/ledger?seed_id= (operators and the dealer read the mark). */
     mark(seed_id) {
       const rec = seedRecord(seed_id);

@@ -1619,6 +1619,10 @@ async function gateway(u, req, res) {
     const L = padsLedger();
     if (!L) return json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }, req);
     if (p === "/v1/pads/key" && req.method === "GET") return json(res, 200, { key: L.key(), epoch: PADS_EPOCH }, req);
+    if (p === "/v1/pads/pvm" && req.method === "GET") {
+      const r = L.pvm(u.searchParams.get("name") || "");
+      return r ? json(res, 200, r, req) : json(res, 404, { error: "unknown_tunnel" }, req);
+    }
     if (p === "/v1/pads/ledger" && req.method === "GET") {
       const m = L.mark(u.searchParams.get("seed_id") || "");
       return m ? json(res, 200, m, req) : json(res, 404, { error: "unknown_seed" }, req);

@@ -95,4 +95,8 @@ test("reserve: windows advance the durable mark before they are signed; replay a
   const n4 = randomBytes(16).toString("hex");
   assert.equal(L.reserve({ ...req(a, "phone1", 8, n4), sig: "00" }).status, 403);
   assert.equal(L.mark(seed_id).mark, 72);
+  // the dealer's view: public identity + mark, never the seed
+  const v = L.pvm("phone1");
+  assert.equal(v.seed_id, seed_id); assert.equal(v.padKey, a.padKey); assert.equal(v.mark, 72); assert.ok(!("seed" in v));
+  assert.equal(L.pvm("nobody"), null);
 });

@@ -176,9 +176,20 @@ bank must be sized for the largest prompt burst, not the decode rate.
 - Still to do here: the pad check (`u.s~ == r.(W s~)`), the shipment digest
   pinned from the calib in the pVM, and the seed epoch rotation.
 
-### P3. Operator bank and prefetch
-- Owner app: pad bridge on vsock 7779; NVMe store on the GPU box's agent;
-  prefetch depth from link rate and the largest expected prompt.
+### P3. Operator bank and prefetch - IN PROGRESS
+- DONE 2026-09-06: `shielded/dealer/dealer-loop.py` keeps one pVM's bank
+  ahead of its ledger mark: reads `/v1/pads/pvm?name=` (public keys, seed
+  id, mark), derives the seed from the master exactly as the relay does
+  (`test/pads-dealer-loop.test.mjs` pins the parity), plans chunk-aligned
+  ranges over `[mark, mark+ahead)`, mints every missing range in ONE model
+  load (`shielded-dealer --ranges`, `--out` template), prunes shipments
+  wholly below the mark. Measured on the 0.8B: 128 rows in 10.4 s including
+  the load; a second pass at mark 70 pruned one and minted the next two.
+- Owner app streams `.pads` from a phone directory over vsock 7780 (P2).
+- TODO: the bank on the GPU box (the agent stores what the dealer ships
+  and the phone fetches over LAN/USB), prefetch depth from link rate and
+  the largest expected prompt, and a faster cell AEAD (TweetNaCl opens at
+  53 MB/s per core; the 27B needs ~250 MB/s at 20 rows/s).
 
 ### P4. Shared-prefix KV, receipts, billing
 - Prefix service signs KV for (model, public prefix); pVM loads instead of
