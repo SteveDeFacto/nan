@@ -1,0 +1,62 @@
+Large strided copies can have ne[1] == 1 while copying many MiB through
+ne[0], ne[2] or ne[3]. Partition those disjoint copies across existing CPU
+compute threads instead of assigning the entire operation to thread zero.
+The contiguous fast path and small/aliasing/overlapping layouts are unchanged.
+
+Based on llama.cpp ddd4ec1428a6201e18975ea52b07c71e0f9aef26.
+
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -323,6 +323,44 @@
+ }
+
+ // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
++// Split large copies over all tensor blocks, including a single long row.
++// Use existing compute threads; preserve the original path for aliases and
++// overlapping destination strides.
++static bool ggml_compute_forward_dup_bytes_parallel(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * src = dst->src[0];
++    if (params->nth <= 1 || src->type != dst->type || !ggml_are_same_shape(src, dst)) return false;
++    const size_t ts = ggml_type_size(src->type);
++    if (src->nb[0] != ts || dst->nb[0] != ts) return false;
++    const int64_t block = ggml_blck_size(src->type);
++    if (src->ne[0] <= 0 || src->ne[0] % block || src->ne[1] <= 0 || src->ne[2] <= 0 || src->ne[3] <= 0) return false;
++    const size_t row_bytes = ggml_row_size(src->type, src->ne[0]);
++    // Restrict writes to ordinary nonoverlapping strided rows. Other layouts
++    // retain the existing implementation and its ordering.
++    if (dst->nb[1] < row_bytes || dst->nb[2] / (size_t)dst->ne[1] < dst->nb[1] ||
++        dst->nb[3] / (size_t)dst->ne[2] < dst->nb[2]) return false;
++    const uintptr_t sa = (uintptr_t)src->data, da = (uintptr_t)dst->data;
++    if (sa <= da ? da - sa < ggml_nbytes(src) : sa - da < ggml_nbytes(dst)) return false;
++    const int64_t blocks_per_row = src->ne[0] / block;
++    const int64_t blocks = blocks_per_row * src->ne[1] * src->ne[2] * src->ne[3];
++    if ((uint64_t)blocks < (65536u + ts - 1) / ts) return false;
++    const int64_t chunk = (blocks + params->nth - 1) / params->nth;
++    int64_t at = chunk * params->ith;
++    const int64_t limit = std::min(at + chunk, blocks);
++    while (at < limit) {
++        const int64_t row = at / blocks_per_row;
++        const int64_t col = at % blocks_per_row;
++        const int64_t i1 = row % src->ne[1];
++        const int64_t i2 = row / src->ne[1] % src->ne[2];
++        const int64_t i3 = row / (src->ne[1] * src->ne[2]);
++        const int64_t count = std::min(limit - at, blocks_per_row - col);
++        memcpy((char *)dst->data + col*ts + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3],
++               (char *)src->data + col*ts + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3],
++               (size_t)count*ts);
++        at += count;
++    }
++    return true;
++}
++
+ static void ggml_compute_forward_dup_bytes(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -354,6 +392,7 @@
+     if (src0->type == dst->type &&
+         ggml_are_same_shape(src0, dst) &&
+         nb00 == type_size && nb0 == type_size) {
++        if (ggml_compute_forward_dup_bytes_parallel(params, dst)) return;
+         // copy by rows
+         const size_t rs = ggml_row_size(src0->type, ne00);
+         for (int64_t i03 = 0; i03 < ne03; i03++) {

@@ -160,6 +160,11 @@ jobs:
           git apply "$GITHUB_WORKSPACE/wasm/llamacpp-topk-rows.patch"
           grep -q "sampler_max_rows" src/llama-context.cpp || { echo "::error::topk-rows context hunk did not apply"; exit 1; }
           grep -q "sampler_graph_max_rows" src/llama-graph.cpp || { echo "::error::topk-rows graph hunk did not apply"; exit 1; }
+          # Large strided state copies may have just one ne[1] row. Spread
+          # their blocks over the existing compute threads instead of leaving
+          # every helper idle while thread zero copies the entire tensor.
+          git apply "$GITHUB_WORKSPACE/wasm/llamacpp-parallel-copy.patch"
+          grep -q "ggml_compute_forward_dup_bytes_parallel" ggml/src/ggml-cpu/ops.cpp || { echo "::error::parallel-copy patch did not apply"; exit 1; }
           # mm7 VERDICT (2026-08-02, canary with per-verb timing): shape-keyed
           # graph slots were retried (mm7 = mm4 + slot cap + kill-switch) after
           # topk sparse logits removed the sampling tax the mm5 revert blamed.
@@ -257,6 +262,11 @@ jobs:
           if ldd /tmp/libenclave_llama.so | grep -q libcuda; then
             echo "FATAL: libcuda leaked into the DT_NEEDED closure"; exit 1
           fi
+
+      - name: Check parallel copy against the pinned original
+        run: |
+          python3 scripts/test-parallel-copy.py --source /tmp/llama.cpp \
+            --library-dir /tmp/llama.cpp/build/bin --output /tmp/copy-check
 
       - name: Clone stable-diffusion.cpp (pinned)
         run: |
