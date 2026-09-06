@@ -222,7 +222,7 @@ new file mode 100644
 index 0000000..f121d0f
 --- /dev/null
 +++ b/crates/wasi-nn/src/backend/ggml.rs
-@@ -0,0 +1,3580 @@
+@@ -0,0 +1,3609 @@
 +//! A ggml/llama.cpp backend for wasi-nn — GGUF language models behind the
 +//! standard `wasi:nn` interface.
 +//!
@@ -1660,6 +1660,19 @@ index 0000000..f121d0f
 +        tokens: &[i32],
 +        mtp_for: Option<i32>,
 +    ) -> Result<RowsOut, String> {
++        self.submit_rows(seq_id, pos0, tokens, mtp_for, false)
++    }
++
++    /// Prompt prefill needs all unmasked nextn hidden rows, but only the
++    /// final vocabulary projection. Verification still requests every row.
++    fn submit_rows(
++        &self,
++        seq_id: i32,
++        pos0: i32,
++        tokens: &[i32],
++        mtp_for: Option<i32>,
++        last_only: bool,
++    ) -> Result<RowsOut, String> {
 +        if tokens.is_empty() {
 +            return Err("empty token batch".into());
 +        }
@@ -1692,14 +1705,30 @@ index 0000000..f121d0f
 +            }
 +        }
 +        let ph_t1 = std::time::Instant::now();
-+        let mut logits = vec![0f32; tokens.len() * self.n_vocab];
++        let n_rows = if last_only { 1 } else { tokens.len() };
++        let mut logits = vec![0f32; n_rows * self.n_vocab];
 +        let k_cap = self.dev_topk.max(0) as usize;
-+        let mut tk_ids = if k_cap > 0 { vec![0i32; tokens.len() * k_cap] } else { Vec::new() };
++        let mut tk_ids = if k_cap > 0 { vec![0i32; n_rows * k_cap] } else { Vec::new() };
 +        let mut k_eff = 0usize;
 +        let ph_alloc = ph_t1.elapsed().as_micros() as i64;
 +        let ph_t2 = std::time::Instant::now();
 +        let rc = if harvest_err.is_none() {
-+            if k_cap > 0 {
++            if last_only {
++                let count = tokens.len() as i32;
++                if k_cap > 0 {
++                    let r = unsafe {
++                        ell_decode_batch_topk(self.raw, self.model.raw, 1,
++                            &seq_id, &count, &pos0, tokens.as_ptr(), self.dev_topk,
++                            tk_ids.as_mut_ptr(), logits.as_mut_ptr())
++                    };
++                    if r > 0 { k_eff = r as usize; 0 } else { r }
++                } else {
++                    unsafe {
++                        ell_decode_batch(self.raw, self.model.raw, 1,
++                            &seq_id, &count, &pos0, tokens.as_ptr(), logits.as_mut_ptr())
++                    }
++                }
++            } else if k_cap > 0 {
 +                let r = unsafe {
 +                    ell_decode_seq_topk(self.raw, self.model.raw, seq_id, pos0,
 +                                        tokens.as_ptr(), tokens.len() as i32,
@@ -1759,7 +1788,7 @@ index 0000000..f121d0f
 +            return Err(decode_err(rc));
 +        }
 +        if k_eff > 0 {
-+            let n = tokens.len();
++            let n = n_rows;
 +            let mut ids = Vec::with_capacity(n * k_eff);
 +            let mut vals = Vec::with_capacity(n * k_eff);
 +            for i in 0..n {
@@ -2966,11 +2995,11 @@ index 0000000..f121d0f
 +            let pos0 = self.n_past;
 +            let flat = self
 +                .server
-+                .submit_full(self.seq_id, pos0, chunk, Some(self.seq_id))
++                .submit_rows(self.seq_id, pos0, chunk, Some(self.seq_id), true)
 +                .map_err(err)?;
 +            self.server.mtp_observe(self.seq_id, pos0, chunk).map_err(err)?;
 +            self.n_past += chunk.len() as i32;
-+            last = Some(self.last_of(&flat, chunk.len()));
++            last = Some(self.last_of(&flat, 1));
 +        }
 +        self.mark_diverged();
 +        last.ok_or_else(|| err("empty token feed"))

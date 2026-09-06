@@ -350,8 +350,8 @@ index 22403731ee..23545a7b2f 100644
 +        let _turn = crate::arbiter::turn(self.model.gpu && harvest_err.is_none());
 +        self.last_phases.lock().unwrap()[2] = ph_turn_t.elapsed().as_micros() as i64;
          let rc = if harvest_err.is_none() {
-             if k_cap > 0 {
-                 let r = unsafe {
+             if last_only {
+                 let count = tokens.len() as i32;
 @@ -1050,6 +1059,7 @@ impl GgmlServer {
                  self.last_phases.lock().unwrap()[4] = ph_t3.elapsed().as_micros() as i64;
              }

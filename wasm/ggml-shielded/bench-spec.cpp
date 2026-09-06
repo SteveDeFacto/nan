@@ -142,7 +142,14 @@ int main(int argc, char **argv) {
     double draft_ms = 0, verify_ms = 0, spec_ms = 0, spec_prefill_ms = 0;
     {
         const int64_t a = ggml_time_us();
-        if (ell_decode_seq_full(ctx, model, seq, 0, toks.data(), n, plog.data())) { fprintf(stderr, "spec prefill failed\n"); return 2; }
+        // MTP needs every hidden row during prefill, but only the final
+        // vocabulary projection. Unmasked nextn rows survive last-logit
+        // decoding; this switch checks that path against the plain oracle.
+        const int pos0 = 0;
+        const int prefill_rc = env_int("PREFILL_LAST", 0)
+            ? ell_decode_batch(ctx, model, 1, &seq, &n, &pos0, toks.data(), plog.data() + (size_t)(n - 1) * nv)
+            : ell_decode_seq_full(ctx, model, seq, 0, toks.data(), n, plog.data());
+        if (prefill_rc) { fprintf(stderr, "spec prefill failed\n"); return 2; }
         ell_mtp_harvest(mtp, ctx, seq, n);
         const int64_t b = ggml_time_us();
         spec_prefill_ms = (b - a) / 1e3;
