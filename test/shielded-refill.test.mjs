@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-test('partial AVX-512 refills match an int64 field oracle and preserve output strides', {
+test('AVX-512 refills match an int64 field oracle across row/column tails and output strides', {
   skip: process.arch !== 'x64',
 }, t => {
   const dir = mkdtempSync(join(tmpdir(), 'shielded-refill-'));
@@ -48,9 +48,11 @@ int main(void) {
     if (!__builtin_cpu_supports("avx512vnni") || !__builtin_cpu_supports("avx512bw") ||
         !__builtin_cpu_supports("avx512dq") || !__builtin_cpu_supports("avx512vl")) return 77;
     const int sizes[] = {1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 257, 5119, 5120, 17408, 70000};
+    const int widths[] = {1, 2, 3, 7, 8, 16, 17};
     for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++)
         for (int b = 1; b <= 9; b++)
-            for (int extremes = 0; extremes <= 3; extremes++) check(sizes[i], 7, b, extremes);
+            for (int extremes = 0; extremes <= 3; extremes++)
+                for (unsigned n = 0; n < sizeof widths / sizeof *widths; n++) check(sizes[i], widths[n], b, extremes);
     return 0;
 }
 `);

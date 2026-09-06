@@ -234,7 +234,7 @@ void FN(fv_prepare)(const int8_t *W, int64_t K, int64_t N, const int64_t *s, int
 /* A dry pool commonly needs only one or two pads for speculative decode.
  * Do not compute duplicate rows for those requests. Independent K lanes
  * retain enough accumulators to hide VNNI latency even at a single row. The
- * four-row background refill below keeps its existing weight-reuse path. */
+ * four-row background refill below also reuses each plane across columns. */
 #define SH_SMALL_REFILL(ROWS, LANES) \
 static inline void refill_rows##ROWS(const uint8_t *planes, int b, int b0, \
         const int8_t *W, int64_t K, int64_t N, int32_t *acc) { \
@@ -290,54 +290,42 @@ static inline void refill_rows4(const uint8_t *planes, int b, int b0,
             const int row = b0 + r < b ? b0 + r : b - 1;          /* clamp: duplicates are discarded */
             pl[p][r] = planes + ((size_t)p * b + row) * K;
         }
-    for (int64_t j = 0; j < N; j++) {
-        const int8_t *w = W + j * K;
-        __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
-        __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
-        __m512i a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+    /* Two output columns share the twelve plane loads. Keep their 24
+     * accumulators independent: no change to the exact field arithmetic,
+     * mask issue count, output layout, or four-row weight reuse. */
+    for (int64_t j = 0; j < N; j += 2) {
+        const int8_t *w0 = W + j * K;
+        const int8_t *w1 = W + (j + 1 < N ? j + 1 : j) * K;
+        __m512i a[2][3][4];
+        for (int c = 0; c < 2; c++)
+            for (int p = 0; p < 3; p++)
+                for (int r = 0; r < 4; r++) a[c][p][r] = _mm512_setzero_si512();
         int64_t k = 0;
         for (; k < K64; k += 64) {
-            const __m512i wv = _mm512_loadu_si512((const void *)(w + k));
-            a00 = _mm512_dpbusd_epi32(a00, _mm512_loadu_si512((const void *)(pl[0][0] + k)), wv);
-            a01 = _mm512_dpbusd_epi32(a01, _mm512_loadu_si512((const void *)(pl[0][1] + k)), wv);
-            a02 = _mm512_dpbusd_epi32(a02, _mm512_loadu_si512((const void *)(pl[0][2] + k)), wv);
-            a03 = _mm512_dpbusd_epi32(a03, _mm512_loadu_si512((const void *)(pl[0][3] + k)), wv);
-            a10 = _mm512_dpbusd_epi32(a10, _mm512_loadu_si512((const void *)(pl[1][0] + k)), wv);
-            a11 = _mm512_dpbusd_epi32(a11, _mm512_loadu_si512((const void *)(pl[1][1] + k)), wv);
-            a12 = _mm512_dpbusd_epi32(a12, _mm512_loadu_si512((const void *)(pl[1][2] + k)), wv);
-            a13 = _mm512_dpbusd_epi32(a13, _mm512_loadu_si512((const void *)(pl[1][3] + k)), wv);
-            a20 = _mm512_dpbusd_epi32(a20, _mm512_loadu_si512((const void *)(pl[2][0] + k)), wv);
-            a21 = _mm512_dpbusd_epi32(a21, _mm512_loadu_si512((const void *)(pl[2][1] + k)), wv);
-            a22 = _mm512_dpbusd_epi32(a22, _mm512_loadu_si512((const void *)(pl[2][2] + k)), wv);
-            a23 = _mm512_dpbusd_epi32(a23, _mm512_loadu_si512((const void *)(pl[2][3] + k)), wv);
+            const __m512i x0 = _mm512_loadu_si512((const void *)(w0 + k));
+            const __m512i x1 = _mm512_loadu_si512((const void *)(w1 + k));
+            for (int p = 0; p < 3; p++)
+                for (int r = 0; r < 4; r++) {
+                    const __m512i v = _mm512_loadu_si512((const void *)(pl[p][r] + k));
+                    a[0][p][r] = _mm512_dpbusd_epi32(a[0][p][r], v, x0);
+                    a[1][p][r] = _mm512_dpbusd_epi32(a[1][p][r], v, x1);
+                }
         }
         if (tail) {
-            const __m512i wv = _mm512_maskz_loadu_epi8(tail, w + k);
-            a00 = _mm512_dpbusd_epi32(a00, _mm512_maskz_loadu_epi8(tail, pl[0][0] + k), wv);
-            a01 = _mm512_dpbusd_epi32(a01, _mm512_maskz_loadu_epi8(tail, pl[0][1] + k), wv);
-            a02 = _mm512_dpbusd_epi32(a02, _mm512_maskz_loadu_epi8(tail, pl[0][2] + k), wv);
-            a03 = _mm512_dpbusd_epi32(a03, _mm512_maskz_loadu_epi8(tail, pl[0][3] + k), wv);
-            a10 = _mm512_dpbusd_epi32(a10, _mm512_maskz_loadu_epi8(tail, pl[1][0] + k), wv);
-            a11 = _mm512_dpbusd_epi32(a11, _mm512_maskz_loadu_epi8(tail, pl[1][1] + k), wv);
-            a12 = _mm512_dpbusd_epi32(a12, _mm512_maskz_loadu_epi8(tail, pl[1][2] + k), wv);
-            a13 = _mm512_dpbusd_epi32(a13, _mm512_maskz_loadu_epi8(tail, pl[1][3] + k), wv);
-            a20 = _mm512_dpbusd_epi32(a20, _mm512_maskz_loadu_epi8(tail, pl[2][0] + k), wv);
-            a21 = _mm512_dpbusd_epi32(a21, _mm512_maskz_loadu_epi8(tail, pl[2][1] + k), wv);
-            a22 = _mm512_dpbusd_epi32(a22, _mm512_maskz_loadu_epi8(tail, pl[2][2] + k), wv);
-            a23 = _mm512_dpbusd_epi32(a23, _mm512_maskz_loadu_epi8(tail, pl[2][3] + k), wv);
+            const __m512i x0 = _mm512_maskz_loadu_epi8(tail, w0 + k);
+            const __m512i x1 = _mm512_maskz_loadu_epi8(tail, w1 + k);
+            for (int p = 0; p < 3; p++)
+                for (int r = 0; r < 4; r++) {
+                    const __m512i v = _mm512_maskz_loadu_epi8(tail, pl[p][r] + k);
+                    a[0][p][r] = _mm512_dpbusd_epi32(a[0][p][r], v, x0);
+                    a[1][p][r] = _mm512_dpbusd_epi32(a[1][p][r], v, x1);
+                }
         }
-        acc[(0 * 4 + 0) * N + j] = _mm512_reduce_add_epi32(a00);
-        acc[(0 * 4 + 1) * N + j] = _mm512_reduce_add_epi32(a01);
-        acc[(0 * 4 + 2) * N + j] = _mm512_reduce_add_epi32(a02);
-        acc[(0 * 4 + 3) * N + j] = _mm512_reduce_add_epi32(a03);
-        acc[(1 * 4 + 0) * N + j] = _mm512_reduce_add_epi32(a10);
-        acc[(1 * 4 + 1) * N + j] = _mm512_reduce_add_epi32(a11);
-        acc[(1 * 4 + 2) * N + j] = _mm512_reduce_add_epi32(a12);
-        acc[(1 * 4 + 3) * N + j] = _mm512_reduce_add_epi32(a13);
-        acc[(2 * 4 + 0) * N + j] = _mm512_reduce_add_epi32(a20);
-        acc[(2 * 4 + 1) * N + j] = _mm512_reduce_add_epi32(a21);
-        acc[(2 * 4 + 2) * N + j] = _mm512_reduce_add_epi32(a22);
-        acc[(2 * 4 + 3) * N + j] = _mm512_reduce_add_epi32(a23);
+        for (int p = 0; p < 3; p++)
+            for (int r = 0; r < 4; r++) {
+                acc[(p * 4 + r) * N + j] = _mm512_reduce_add_epi32(a[0][p][r]);
+                if (j + 1 < N) acc[(p * 4 + r) * N + j + 1] = _mm512_reduce_add_epi32(a[1][p][r]);
+            }
     }
 }
 #elif defined(SH_SIMD_NEON)

@@ -642,9 +642,9 @@ static void *refill_main(void *arg) {
         sh_group *g = NULL; int deficit = 0;
         for (;;) {
             if (l->stop) { pthread_mutex_unlock(&l->pool_mu); goto done; }
-            /* Which group, and whether to bother. A batch costs one stream of
-             * the group's weights whatever b is (refill_rows4 always computes
-             * four rows), so a batch of one is four times the work per pad. In
+            /* Which group, and whether to bother. Every partial batch still
+             * streams the group's weights, while a full four-row batch
+             * amortises that stream across four pads. In
              * steady state every group loses exactly one pad per token, and
              * refilling each deficit-1 group as it appeared kept two cores
              * busy at a quarter efficiency for the whole decode. So: a group
