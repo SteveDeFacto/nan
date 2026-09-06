@@ -801,8 +801,9 @@ static void *refill_main(void *arg) {
             pthread_cond_broadcast(&l->pool_filled);
         } else {
             /* Bank exhausted: the reservation is abandoned and nothing more
-             * happens until the process restarts. */
+             * happens until the process restarts. Say why, once. */
             g->generating -= b;
+            if (!l->stop) fprintf(stderr, "[shielded] refill stopped: %s (group %s, rc %d)\n", l->err[0] ? l->err : "pad bank exhausted", l->nodes[g->nodes[0]].name, rc);
             l->stop = true;
             pthread_cond_broadcast(&l->pool_filled);
         }
@@ -856,6 +857,12 @@ static int dealt_open(sh_link *l) {
         int err = SH_OK;
         l->pads = sh_pads_reader_open(l->pad_dir, l->pad_seed_id, l->pad_sk, &err);
         if (!l->pads) { snprintf(l->err, sizeof l->err, "dealt pads: cannot read %s", l->pad_dir); return err ? err : SH_ERR_IO; }
+        const char *dh = getenv("SHIELDED_PAD_MODEL_DIGEST");
+        uint8_t digest[32];
+        if (dh && *dh) {
+            if (!sh_pads_hex2bin(dh, digest, 32)) { snprintf(l->err, sizeof l->err, "dealt pads: SHIELDED_PAD_MODEL_DIGEST is not 64 hex"); return SH_ERR_RANGE; }
+            sh_pads_reader_require_digest(l->pads, digest);
+        }
     }
     sh_pads_group *table = (sh_pads_group *)calloc(l->n_groups ? l->n_groups : 1, sizeof *table);
     if (!table) return SH_ERR_NOMEM;
@@ -915,6 +922,24 @@ static int start_pools(sh_link *l) {
         pthread_mutex_unlock(&l->pool_mu);
     }
     return SH_OK;
+}
+
+/* Dealt mode: a short ring means the importers have not caught up yet, not
+ * that pads can be made here. Wait for m ready pads (the deficit logic keeps
+ * the threads importing) up to the bank wait; past that the request fails
+ * with EXHAUST and the bank is genuinely behind. */
+static void dealt_wait(sh_link *l, sh_group *g, int m) {
+    pthread_mutex_lock(&l->pool_mu);
+    if (g->count < m && !l->stop) {
+        struct timespec dl; clock_gettime(CLOCK_MONOTONIC, &dl);
+        dl.tv_sec += l->pad_bank_wait_ms / 1000; dl.tv_nsec += (long)(l->pad_bank_wait_ms % 1000) * 1000000L;
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        pthread_cond_broadcast(&l->need_refill);
+        while (g->count < m && !l->stop) {
+            if (pthread_cond_timedwait(&l->pool_filled, &l->pool_mu, &dl) == ETIMEDOUT) break;
+        }
+    }
+    pthread_mutex_unlock(&l->pool_mu);
 }
 
 /* Take up to m ready pads from the front of group g's ring, by slot index.
@@ -1250,6 +1275,7 @@ int sh_link_gemm(sh_link *l, const int *nodes, size_t n_nodes,
      * PLACE and held until the unmask below; the rows made here live in the
      * link's private scratch. Either way each row's pad is one pointer. */
     double t0 = now_ms();
+    if (l->dealt && l->threads_running) dealt_wait(l, g, m);
     const int took = l->threads_running ? take_pads(l, g, m, l->slots) : 0;
     for (int i = 0; i < took; i++) {
         l->rp[i] = g->r_store + (size_t)l->slots[i] * K;

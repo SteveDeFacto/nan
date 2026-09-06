@@ -83,6 +83,9 @@ int  sh_pads_reader_bind(sh_pads_reader *r, const sh_pads_group *groups, uint32_
  * SH_ERR_EXHAUST when no shipment on disk covers the index (after a rescan),
  * SH_ERR_VERIFY when the box does not open (tampered or wrong key). */
 int  sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int32_t *u_out);
+/* Pin the model: shipments whose header digest differs are ignored (the
+ * dealer prints the digest it recorded; SHIELDED_PAD_MODEL_DIGEST carries it). */
+void sh_pads_reader_require_digest(sh_pads_reader *r, const uint8_t model_digest[32]);
 /* The highest index any shipment on disk covers, plus one (0 = none). */
 uint64_t sh_pads_reader_extent(const sh_pads_reader *r);
 void sh_pads_reader_close(sh_pads_reader *r);

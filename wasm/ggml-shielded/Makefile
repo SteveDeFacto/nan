@@ -106,6 +106,12 @@ shielded-calib: shielded-calib.cpp shielded-field.o shielded-field.h
 #                own verbs (draft2 / decode_seq_full / rewind / harvest).
 bench: bench-batch bench-spec
 
+# The dealer: mint .pads shipments from a model; libllama for the load, the
+# backend module for the registration and the mint (shielded/dealer/PLAN.md).
+shielded-dealer: shielded-dealer.cpp shielded-pads.o tweetnacl.o shielded-tee.o shielded-field.o shielded-wire.o shielded-simd-avx512.o shielded-simd-generic.o
+	$(CXX) $(CXXFLAGS) $(LLAMA_INC) $(GGML_INC) -I../llama-shim -o $@ $^ \
+	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
+
 bench-batch: bench-batch.cpp
 	$(CXX) $(CXXFLAGS) -I$(GGML_SRC)/include $(GGML_INC) -o $@ $< \
 	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl -Wl,-rpath,$(GGML_LIB)

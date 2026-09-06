@@ -54,6 +54,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"))
 
 import numpy as np
+
+# "cuda" (the GPU half by definition) or "cpu" (a reference/test mode: the
+# pre-encoded float64 path is exact on either; no throughput claim is posted).
+DEVICE = "cuda"
 import torch
 
 from protocol import (CMD_ALLOC_BUFFER, CMD_FIELD_GEMM, CMD_FIELD_GEMM24, CMD_FREE_BUFFER,
@@ -224,20 +228,22 @@ class Connection:
             # what the card actually has -- including whatever the host operator
             # is doing with it behind our back, which on a desktop is a running
             # X server. Our ledger cannot see that; mem_get_info can.
-            free_b, total_b = torch.cuda.mem_get_info(0)
-            props = torch.cuda.get_device_properties(0)
+            if DEVICE == "cuda":
+                free_b, total_b = torch.cuda.mem_get_info(0)
+                props = torch.cuda.get_device_properties(0)
+                dev = dict(device=props.name, vram_total=props.total_memory, vram_free=int(free_b),
+                           sm_count=props.multi_processor_count, capability=f"{props.major}.{props.minor}")
+            else:
+                dev = dict(device="cpu (reference)", vram_total=self.state.vram_bytes, vram_free=self.state.vram_bytes,
+                           sm_count=0, capability="0.0")
             info = {
                 "version": list(PROTO_VERSION),
-                "device": props.name,
-                "vram_total": props.total_memory,
-                "vram_free": int(free_b),
                 "vram_budget": self.state.vram_bytes,
                 "vram_reserved": self.state.ledger.reserved,
                 "vram_reserve": self.state.reserve,
-                "sm_count": props.multi_processor_count,
-                "capability": f"{props.major}.{props.minor}",
                 "field_gmac_per_s": round(FIELD_GMACS, 1),
                 "worker": "shielded/worker.py",
+                **dev,
             }
             return json.dumps(info).encode()
 
@@ -245,7 +251,7 @@ class Connection:
             bid = res["bid"]
             size = struct.unpack_from("<Q", payload, 0)[0]
             try:
-                self.storage[bid] = torch.empty(size, dtype=torch.uint8, device="cuda")
+                self.storage[bid] = torch.empty(size, dtype=torch.uint8, device=DEVICE)
             except torch.cuda.OutOfMemoryError as e:
                 # The accounting said it fits and the driver disagreed. Fail the
                 # connection rather than leaving the state machine's view of VRAM
@@ -285,7 +291,7 @@ class Connection:
 
         if cmd in (CMD_FIELD_GEMM, CMD_FIELD_GEMM24):
             ids, m, K, at = res["nodes"], res["m"], res["K"], res["planes_at"]
-            planes = torch.frombuffer(bytearray(payload[at:]), dtype=torch.int8).view(3, m, K).cuda()
+            planes = torch.frombuffer(bytearray(payload[at:]), dtype=torch.int8).view(3, m, K).to(DEVICE)
             xr = [planes[p] for p in range(3)]
             outs = []
             t0 = time.perf_counter()
@@ -431,18 +437,20 @@ def serve(host, port, vram_gb, quiet=False):
         if not quiet:
             print(f"[shielded-worker] {msg}", flush=True)
 
-    if not torch.cuda.is_available():
-        raise SystemExit("no CUDA device; the shielded worker is the GPU half by definition")
-
-    props = torch.cuda.get_device_properties(0)
-    budget = int(vram_gb * (1 << 30)) if vram_gb else int(props.total_memory * 0.85)
-    log(f"{props.name}, sm_{props.major}{props.minor}, "
-        f"{props.total_memory / 2**30:.1f} GiB total, budget {budget / 2**30:.1f} GiB")
-
-    global FIELD_GMACS
-    FIELD_GMACS = measure_field_throughput()
-    if FIELD_GMACS:
-        log(f"field GEMM throughput {FIELD_GMACS:.0f} G-MAC/s (measured, masked path)")
+    if DEVICE == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("no CUDA device; the shielded worker is the GPU half by definition")
+        props = torch.cuda.get_device_properties(0)
+        budget = int(vram_gb * (1 << 30)) if vram_gb else int(props.total_memory * 0.85)
+        log(f"{props.name}, sm_{props.major}{props.minor}, "
+            f"{props.total_memory / 2**30:.1f} GiB total, budget {budget / 2**30:.1f} GiB")
+        global FIELD_GMACS
+        FIELD_GMACS = measure_field_throughput()
+        if FIELD_GMACS:
+            log(f"field GEMM throughput {FIELD_GMACS:.0f} G-MAC/s (measured, masked path)")
+    else:
+        budget = int((vram_gb or 4) * (1 << 30))
+        log(f"CPU reference mode (float64 field GEMM, exact, slow), budget {budget / 2**30:.1f} GiB")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -465,9 +473,12 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address; 127.0.0.1 is reachable from a slirp guest at 10.0.2.2")
     ap.add_argument("--port", type=int, default=int(os.environ.get("SHIELDED_PORT", "9500")))
+    ap.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="cpu = exact float64 reference mode for tests; no GPU touched")
     ap.add_argument("--vram-gb", type=float, default=0.0, help="0 = 85%% of the card")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    global DEVICE
+    DEVICE = a.device
     serve(a.host, a.port, a.vram_gb, a.quiet)
 
 

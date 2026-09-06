@@ -1296,3 +1296,19 @@ ggml_backend_t ggml_backend_shielded_init(void) {
 #ifdef GGML_BACKEND_DL
 GGML_BACKEND_DL_IMPL(ggml_backend_shielded_reg)
 #endif
+
+/* The dealer's entry (shielded/dealer/PLAN.md): with the model registered on
+ * the legacy single link (SHIELDED_HOST/PORT; a pool splits groups over cards
+ * and a shipment must cover them all), mint one shipment. No worker is
+ * needed - registration happens at context creation, before any connect. */
+extern "C" int ggml_backend_shielded_mint(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
+                                                           uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path) {
+    sh_state &s = sh_get();
+    if (!s.link) { SH_LOG("mint: no link (set SHIELDED_HOST/PORT so the weights register)\n"); return SH_ERR_RANGE; }
+    uint8_t seed[32], seed_id[16], digest[32], pk[32];
+    if (!sh_pads_hex2bin(seed_hex, seed, 32) || !sh_pads_hex2bin(seed_id_hex, seed_id, 16) ||
+        !sh_pads_hex2bin(digest_hex, digest, 32) || !sh_pads_hex2bin(consumer_pk_hex, pk, 32)) return SH_ERR_RANGE;
+    const int rc = sh_link_mint_shipment(s.link, seed, seed_id, digest, index0, count, pk, path);
+    memset(seed, 0, sizeof seed);
+    return rc;
+}

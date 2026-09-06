@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -204,13 +205,17 @@ typedef struct {
     int *ordinal_of;                    /* consumer group -> this shipment's group, or -1 */
 } sh_pads_file;
 
+/* Several importer threads read cells concurrently: the file list is guarded
+ * by `mu` (scans mutate it), cell scratch is per call, and pread on a shared
+ * descriptor is safe. */
 struct sh_pads_reader {
     char dir[512];
     uint8_t seed_id[16];
     uint8_t sk[32];
+    pthread_mutex_t mu;
+    bool have_digest; uint8_t model_digest[32];   /* when set, shipments for another model are not ours */
     sh_pads_file *files; size_t n_files, cap_files;
     sh_pads_group *bound; uint32_t n_bound;
-    uint8_t *cell, *plain; size_t cell_cap;
 };
 
 static void file_close(sh_pads_file *f) {
@@ -234,7 +239,7 @@ static int file_open(sh_pads_reader *r, const char *path, sh_pads_file *f) {
     if (pread(f->fd, &f->hdr, sizeof f->hdr, 0) != (ssize_t)sizeof f->hdr) { file_close(f); return SH_ERR_IO; }
     sh_pads_hdr *h = &f->hdr;
     if (memcmp(h->magic, SH_PADS_MAGIC, 8) || h->version != SH_PADS_VERSION || !h->group_count || h->group_count > 65535 ||
-        memcmp(h->seed_id, r->seed_id, 16)) { file_close(f); return SH_ERR_VERIFY; }
+        memcmp(h->seed_id, r->seed_id, 16) || (r->have_digest && memcmp(h->model_digest, r->model_digest, 32))) { file_close(f); return SH_ERR_VERIFY; }
     f->groups = (sh_pads_group *)calloc(h->group_count, sizeof *f->groups);
     f->group_off = (uint64_t *)calloc(h->group_count, sizeof *f->group_off);
     if (!f->groups || !f->group_off) { file_close(f); return SH_ERR_NOMEM; }
@@ -310,6 +315,7 @@ sh_pads_reader *sh_pads_reader_open(const char *dir, const uint8_t seed_id[16], 
     snprintf(r->dir, sizeof r->dir, "%s", dir);
     memcpy(r->seed_id, seed_id, 16);
     memcpy(r->sk, consumer_sk, 32);
+    pthread_mutex_init(&r->mu, NULL);
     const int rc = reader_scan(r);
     if (rc < 0) { *err = rc; sh_pads_reader_close(r); return NULL; }
     return r;
@@ -322,13 +328,6 @@ int sh_pads_reader_bind(sh_pads_reader *r, const sh_pads_group *groups, uint32_t
     if (!r->bound) return SH_ERR_NOMEM;
     memcpy(r->bound, groups, (size_t)n_groups * sizeof *groups);
     r->n_bound = n_groups;
-    uint64_t biggest = 0;
-    for (uint32_t g = 0; g < n_groups; g++) if (cell_bytes(groups[g].u_len) > biggest) biggest = cell_bytes(groups[g].u_len);
-    free(r->cell); free(r->plain);
-    r->cell_cap = (size_t)biggest;
-    r->cell = (uint8_t *)malloc(r->cell_cap);
-    r->plain = (uint8_t *)malloc(r->cell_cap);
-    if (!r->cell || !r->plain) return SH_ERR_NOMEM;
     /* Re-bind what is already open; drop shipments that do not fit. */
     size_t kept = 0;
     for (size_t i = 0; i < r->n_files; i++) {
@@ -349,41 +348,74 @@ static sh_pads_file *reader_find(sh_pads_reader *r, uint64_t index) {
 
 int sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int32_t *u_out) {
     if (!r || !r->n_bound || group >= r->n_bound) return SH_ERR_RANGE;
+    /* Resolve the cell under the lock (scans mutate the list), then read and
+     * open it outside: the file entry only ever grows the list, never moves. */
+    pthread_mutex_lock(&r->mu);
     sh_pads_file *f = reader_find(r, index);
     if (!f) { reader_scan(r); f = reader_find(r, index); }
-    if (!f) return SH_ERR_EXHAUST;
-    const int g = f->ordinal_of[group];
-    const uint64_t u_len = f->groups[g].u_len;
-    const size_t n = (size_t)cell_bytes(u_len);
-    const uint64_t off = f->hdr.data_off + (index - f->hdr.index0) * f->hdr.row_bytes + f->group_off[g];
-    if (pread(f->fd, r->cell, n, (off_t)off) != (ssize_t)n) return SH_ERR_IO;
-    uint8_t nonce[24];
-    cell_nonce(nonce, f->hdr.seed_id, index, (uint32_t)g);
-    int rc = secretbox_open(r->plain, r->cell, (size_t)(3 * u_len), nonce, f->key);
-    if (rc != SH_OK) return rc;
-    for (uint64_t j = 0; j < u_len; j++) {
-        const int64_t v = (int64_t)r->plain[3 * j] | ((int64_t)r->plain[3 * j + 1] << 8) | ((int64_t)r->plain[3 * j + 2] << 16);
-        if (v >= SH_M_MOD) return SH_ERR_VERIFY;
-        u_out[j] = (int32_t)(v - SH_HALF_M);
+    int fd = -1, g = -1; uint64_t u_len = 0, off = 0; uint8_t key[32], seed_id[16];
+    if (f) {
+        g = f->ordinal_of[group];
+        u_len = f->groups[g].u_len;
+        off = f->hdr.data_off + (index - f->hdr.index0) * f->hdr.row_bytes + f->group_off[g];
+        fd = f->fd;
+        memcpy(key, f->key, 32); memcpy(seed_id, f->hdr.seed_id, 16);
     }
-    return SH_OK;
+    pthread_mutex_unlock(&r->mu);
+    if (!f) return SH_ERR_EXHAUST;
+    const size_t n = (size_t)cell_bytes(u_len);
+    uint8_t *cell = (uint8_t *)malloc(n), *plain = (uint8_t *)malloc((size_t)(3 * u_len));
+    int rc = SH_OK;
+    if (!cell || !plain) rc = SH_ERR_NOMEM;
+    else if (pread(fd, cell, n, (off_t)off) != (ssize_t)n) rc = SH_ERR_IO;
+    else {
+        uint8_t nonce[24];
+        cell_nonce(nonce, seed_id, index, (uint32_t)g);
+        rc = secretbox_open(plain, cell, (size_t)(3 * u_len), nonce, key);
+        for (uint64_t j = 0; rc == SH_OK && j < u_len; j++) {
+            const int64_t v = (int64_t)plain[3 * j] | ((int64_t)plain[3 * j + 1] << 8) | ((int64_t)plain[3 * j + 2] << 16);
+            if (v >= SH_M_MOD) { rc = SH_ERR_VERIFY; break; }
+            u_out[j] = (int32_t)(v - SH_HALF_M);
+        }
+    }
+    memset(key, 0, sizeof key);
+    free(cell); free(plain);
+    return rc;
 }
 
 uint64_t sh_pads_reader_extent(const sh_pads_reader *r) {
     uint64_t hi = 0;
-    for (size_t i = 0; r && i < r->n_files; i++) {
+    if (!r) return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&r->mu);
+    for (size_t i = 0; i < r->n_files; i++) {
         const uint64_t e = r->files[i].hdr.index0 + r->files[i].hdr.index_count;
         if (e > hi) hi = e;
     }
+    pthread_mutex_unlock((pthread_mutex_t *)&r->mu);
     return hi;
 }
 
 void sh_pads_reader_close(sh_pads_reader *r) {
     if (!r) return;
     for (size_t i = 0; i < r->n_files; i++) file_close(&r->files[i]);
-    free(r->files); free(r->bound); free(r->cell); free(r->plain);
+    free(r->files); free(r->bound);
+    pthread_mutex_destroy(&r->mu);
     memset(r->sk, 0, sizeof r->sk);
     free(r);
+}
+
+void sh_pads_reader_require_digest(sh_pads_reader *r, const uint8_t model_digest[32]) {
+    if (!r) return;
+    pthread_mutex_lock(&r->mu);
+    memcpy(r->model_digest, model_digest, 32); r->have_digest = true;
+    /* Drop anything already opened for another model. */
+    size_t kept = 0;
+    for (size_t i = 0; i < r->n_files; i++) {
+        if (!memcmp(r->files[i].hdr.model_digest, model_digest, 32)) { if (kept != i) r->files[kept] = r->files[i]; kept++; }
+        else file_close(&r->files[i]);
+    }
+    r->n_files = kept;
+    pthread_mutex_unlock(&r->mu);
 }
 
 /* ---- ledger window (P1: a local file) ----------------------------------- */

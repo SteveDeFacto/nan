@@ -87,6 +87,17 @@ window, `sh_link_mint_shipment`, `sh_link_group_table`), and
 `dealt-selftest.c` (mint -> oracle -> tamper -> wrong key -> exhaustion ->
 ledger -> link import), run by `test/shielded-cbackend.test.mjs`.
 
+**P1 end to end, 2026-09-06 (CPU only, no GPU touched):** `shielded-dealer`
+minted 64 rows for Qwen3.5-0.8B (123 MB, 1.9 MB per row) to a consumer key
+from `pads-keygen`; `shielded-run` in dealt mode against `worker.py
+--device cpu` (the reference worker's exact float64 path) offloaded all
+2363 nodes, used 2033 pads, minted none, verified every product (0
+failures), advanced the ledger to 64 before use, and produced the exact
+text of the self-minting run. Two things the run taught: importers are
+threads, so the reader keeps per-call scratch and a lock around its file
+list; and a ring that is short at an exchange must WAIT for the importers
+(`dealt_wait`), not fail, since a dealt engine has nothing to mint with.
+
 ## Ledger and single use across reboots
 
 pVM state is ephemeral, so the ledger is the only durable record. The unsafe
@@ -127,7 +138,7 @@ bank must be sized for the largest prompt burst, not the decode rate.
 
 ## Phases
 
-### P1. Format, dealer tool, engine pad source (CPU-testable end to end)
+### P1. Format, dealer tool, engine pad source (CPU-testable end to end) - DONE 2026-09-06
 - `wasm/ggml-shielded/shielded-dealer.cpp`: loads a GGUF + calib the way
   `shielded-calib`/`shielded-run` do, registers the groups through the same
   `sh_link_add_weight` path (identical ordering, `K`, `u_len`), derives `r`

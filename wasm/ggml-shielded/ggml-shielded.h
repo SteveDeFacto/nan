@@ -48,6 +48,11 @@ GGML_BACKEND_API void ggml_backend_shielded_configure(const char *host, int port
 
 /* Capability probe used by the manager before admitting a pooled tenant. */
 GGML_BACKEND_API int ggml_backend_shielded_pool_version(void);
+/* Dealt pads: mint one .pads shipment from the registered weights (single
+ * link). Hex arguments: seed 64, seed_id 32, model digest 64, consumer X25519
+ * public key 64. Returns SH_OK or an sh error. */
+GGML_BACKEND_API int ggml_backend_shielded_mint(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
+                                                uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path);
 
 /* Counters for the boot probe and the supervisor's verdict. */
 GGML_BACKEND_API void ggml_backend_shielded_stats(uint64_t *offloaded_nodes,

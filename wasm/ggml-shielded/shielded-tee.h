@@ -74,6 +74,8 @@ typedef struct sh_link sh_link;
  *   SHIELDED_PAD_SEED_ID     32 hex: names the seed; shipments carry it
  *   SHIELDED_PAD_SK          64 hex: this consumer's X25519 pad secret key
  *   SHIELDED_PAD_LEDGER      path of the ledger file (P1: local; P2: platform)
+ *   SHIELDED_PAD_MODEL_DIGEST optional 64 hex: only shipments minted for this
+ *                            model (the digest the dealer printed) are used
  *   SHIELDED_PAD_WINDOW      indices reserved per ledger call (default 64)
  *   SHIELDED_PAD_WAIT_MS     how long a refill waits for a missing index
  *                            before the link stops (default 10000) */
