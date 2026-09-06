@@ -219,10 +219,10 @@ index b2db808..af89d10 100644
  
 diff --git a/crates/wasi-nn/src/backend/ggml.rs b/crates/wasi-nn/src/backend/ggml.rs
 new file mode 100644
-index 0000000..f121d0f
+index 0000000..fdde186
 --- /dev/null
 +++ b/crates/wasi-nn/src/backend/ggml.rs
-@@ -0,0 +1,3609 @@
+@@ -0,0 +1,3738 @@
 +//! A ggml/llama.cpp backend for wasi-nn — GGUF language models behind the
 +//! standard `wasi:nn` interface.
 +//!
@@ -261,6 +261,14 @@ index 0000000..f121d0f
 +//!   "prompt" names positions where a shared prefix ends (system text, tool
 +//!   block); the state there is parked as prefill crosses it, on its own
 +//!   slot budget, so every prompt that starts the same way branches off it.
++//! mm36 shared warming: {"prefix_wait": I32 [1] = 1} beside that first chunk
++//!   opts the caller into WAITING when another context is already preparing
++//!   the exact prefix of one of its marks: the chunk is refused with the
++//!   "[prefix_warming] ... (N of M tokens)" marker and nothing changes; the
++//!   guest retries the same chunk shortly and branches off the park the
++//!   moment it stands (see prefix_claims.rs). Without the opt-in, callers
++//!   warm concurrently as before. "caps" indices 14..16 = [protocol (1),
++//!   live claims, standing parks].
 +//! Speculative-decoding verbs (see each handler in `compute`):
 +//!   "tokens"+"all"=1 -> "logits" [n, n_vocab] (per-position verify rows);
 +//!   "caps" -> [seq_id, recurrent, mtp, vision, n_batch, host_tok,
@@ -362,7 +370,8 @@ index 0000000..f121d0f
 +use std::collections::{HashMap, VecDeque};
 +use std::ffi::{c_char, c_void, CString};
 +use std::path::{Path, PathBuf};
-+use std::sync::atomic::{AtomicUsize, Ordering};
++use super::prefix_claims::{ClaimVerdict, PrefixClaims, DEFAULT_STALE_SECS, PREFIX_WARMING_ERR};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 +use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 +use std::time::{Duration, Instant};
 +
@@ -717,6 +726,28 @@ index 0000000..f121d0f
 +fn prefix_ttl() -> Duration {
 +    static V: OnceLock<u64> = OnceLock::new();
 +    Duration::from_secs(*V.get_or_init(|| env_u32("ENCLAVE_GGML_PREFIX_TTL_S", 21600) as u64))
++}
++
++/// mm36: a prefix claim (see prefix_claims.rs) whose leader reported no
++/// progress for this long no longer makes anyone wait.
++fn prefix_claim_stale() -> Duration {
++    static V: OnceLock<u64> = OnceLock::new();
++    Duration::from_secs(*V.get_or_init(|| {
++        env_u32("ENCLAVE_GGML_PREFIX_CLAIM_STALE_S", DEFAULT_STALE_SECS as u32) as u64
++    }))
++}
++
++/// mm36: claim owners. A context's seq_id changes at every park fork, so
++/// the claims it holds are keyed by this id, minted once at init.
++static CLAIM_IDS: AtomicU64 = AtomicU64::new(0);
++
++/// mm36: the follower's refusal (see prefix_claims.rs). Substring-matched by
++/// guests on PREFIX_WARMING_ERR; the "N of M" pair is the leader's progress.
++fn prefix_warming(done: usize, total: usize) -> BackendError {
++    err(format!(
++        "{PREFIX_WARMING_ERR} another request is preparing this prompt's shared prefix \
++         ({done} of {total} tokens); retry the same chunk shortly"
++    ))
 +}
 +
 +/// mm33 VIDEO. What one "video" verb may cost this node: frames are encoder
@@ -1205,6 +1236,11 @@ index 0000000..f121d0f
 +    /// donor is gone, the id returns to `slots` clean.
 +    parked: Mutex<Vec<ParkedPrefix>>,
 +    alias: Mutex<HashMap<i32, i32>>,
++    /// mm36: who is preparing which exact prefix right now (see
++    /// prefix_claims.rs). A LEAF lock: taken alone, or last after
++    /// q -> parked when a plan is settled against the parks; never held
++    /// across a shim call or while taking any other lock.
++    claims: Mutex<PrefixClaims>,
 +    n_vocab: usize,
 +    /// mm26: device top-k armed at K (0 = off) - small decodes return
 +    /// TopK rows, wide ones (prefill) fall back to Dense inside the shim
@@ -1447,6 +1483,7 @@ index 0000000..f121d0f
 +            total_seqs,
 +            parked: Mutex::new(Vec::new()),
 +            alias: Mutex::new(HashMap::new()),
++            claims: Mutex::new(PrefixClaims::new(prefix_claim_stale())),
 +            n_vocab: model.n_vocab as usize,
 +            dev_topk,
 +            slots: Mutex::new((0..total_seqs as i32).collect()),
@@ -2375,6 +2412,7 @@ index 0000000..f121d0f
 +            park_pin: None,
 +            last_row: None,
 +            plan: None,
++            claim_id: CLAIM_IDS.fetch_add(1, Ordering::Relaxed) + 1,
 +        });
 +        Ok(ctx.into())
 +    }
@@ -2416,6 +2454,9 @@ index 0000000..f121d0f
 +    last_row: Option<RowOut>,
 +    /// mm34: the branch a declared prompt settled on at its first chunk.
 +    plan: Option<PromptPlan>,
++    /// mm36: this context's identity in the server's prefix claims (stable
++    /// across the seq_id swaps a park fork makes)
++    claim_id: u64,
 +}
 +unsafe impl Send for GgmlExecutionContext {}
 +unsafe impl Sync for GgmlExecutionContext {}
@@ -2424,6 +2465,10 @@ index 0000000..f121d0f
 +        // the decode-turn wait below is unbounded when the turn holder is
 +        // wedged, and a hung teardown pins an executor thread and its slot
 +        let _wd = WatchdogGuard::compute("a session teardown");
++        // mm36: whatever prefix this context promised to park is off the
++        // table - followers re-plan against the parks and lead from there.
++        // Taken alone, before any other lock (claims is a leaf).
++        self.server.claims.lock().unwrap().release_all(self.claim_id);
 +        // seq removal mutates the llama context: wait out any in-flight
 +        // batch (bounded — one llama_decode), remove under the queue lock so
 +        // no leader starts meanwhile, then free the slot. The slot lock is
@@ -2650,11 +2695,42 @@ index 0000000..f121d0f
 +    /// context's first feed may declare, and only while the cache is armed and
 +    /// not opted out; anything else is ignored, exactly as an engine predating
 +    /// the input would ignore it.
-+    fn plan_prompt(&mut self, prompt: Vec<i32>, marks: Vec<usize>) {
++    ///
++    /// mm36: with `wait_ok`, a caller whose still-pending mark another live
++    /// context is already preparing is refused with PREFIX_WARMING_ERR and
++    /// left untouched (no copy, no pin, no plan), so its retry of the same
++    /// chunk is a clean re-plan that branches off the park once it stands.
++    /// Otherwise it leads, claiming its pending marks (see prefix_claims.rs).
++    fn plan_prompt(&mut self, prompt: Vec<i32>, marks: Vec<usize>, wait_ok: bool)
++        -> Result<(), BackendError>
++    {
 +        if park_slots() == 0 || self.no_cache || self.prompt_done || self.n_past > 0
 +            || self.defer.is_some() || self.plan.is_some() || prompt.len() < 2
 +        {
-+            return;
++            return Ok(());
++        }
++        // the boundaries a caller could park or wait on: inside the prompt
++        // and long enough to earn a slot (those a park already covers are
++        // dropped below, once the parks have been read)
++        let mut marks: Vec<usize> = if prefix_slots() == 0 { Vec::new() } else {
++            marks.into_iter()
++                .filter(|&m| m <= prompt.len() && m >= park_min_tokens())
++                .collect()
++        };
++        marks.sort_unstable();
++        marks.dedup();
++        // mm36 fast path for a follower's retry: a leader mid-chunk holds the
++        // decode turn for up to ~45 s on the slowest node, and the turn wait
++        // below would sit inside this host call for all of it. The claims
++        // table alone answers "is somebody preparing my prefix" at once; a
++        // claim that resolves between here and the re-check under the turn
++        // costs one more retry, never a wrong answer.
++        if wait_ok && !marks.is_empty() {
++            let blocking = self.server.claims.lock().unwrap()
++                .blocking(self.claim_id, &prompt, &marks, Instant::now());
++            if let Some((done, total)) = blocking {
++                return Err(prefix_warming(done, total));
++            }
 +        }
 +        // lock order q -> parked, matching Drop, so the copy cannot race an
 +        // eviction
@@ -2668,7 +2744,22 @@ index 0000000..f121d0f
 +            .filter(|p| p.tokens.len() >= park_min_tokens() && p.tokens.len() <= prompt.len()
 +                        && prompt[..p.tokens.len()] == p.tokens[..])
 +            .max_by_key(|p| p.tokens.len());
-+        let (covered, exact_row) = match best {
++        let covered = best.as_ref().map_or(0, |p| p.tokens.len());
++        // the boundaries still worth parking: past what the branch covers
++        marks.retain(|&m| m > covered);
++        // mm36: settle the claims against the parks just read and BEFORE
++        // this context is touched. claims is a leaf lock: q -> parked ->
++        // claims here, released before the copy below.
++        if !marks.is_empty() {
++            let verdict = self.server.claims.lock().unwrap()
++                .plan(self.claim_id, &prompt, &marks, wait_ok, Instant::now());
++            if let ClaimVerdict::Wait { done, total } = verdict {
++                drop(parked);
++                drop(q);
++                return Err(prefix_warming(done, total));
++            }
++        }
++        let exact_row = match best {
 +            Some(p) => {
 +                unsafe { ell_seq_copy(self.server.raw, p.seq_id, self.seq_id) };
 +                p.at = Instant::now(); // reuse refreshes LRU age
@@ -2678,28 +2769,33 @@ index 0000000..f121d0f
 +                    p.pin.fetch_add(1, Ordering::AcqRel);
 +                    self.park_pin = Some(p.pin.clone());
 +                }
-+                let plen = p.tokens.len();
-+                (plen, if plen == prompt.len() { Some(p.row.clone()) } else { None })
++                if p.tokens.len() == prompt.len() { Some(p.row.clone()) } else { None }
 +            }
-+            None => (0, None),
++            None => None,
 +        };
 +        drop(parked);
 +        drop(q);
-+        // the boundaries still worth parking: past what the branch already
-+        // covers, inside the prompt, and long enough to earn a slot
-+        let mut marks: Vec<usize> = if prefix_slots() == 0 { Vec::new() } else {
-+            marks.into_iter()
-+                .filter(|&m| m > covered && m <= prompt.len() && m >= park_min_tokens())
-+                .collect()
-+        };
-+        marks.sort_unstable();
-+        marks.dedup();
 +        if covered == 0 && marks.is_empty() {
-+            return; // no park relates and nothing to park: plain feeds
++            return Ok(()); // no park relates and nothing to park: plain feeds
 +        }
 +        self.n_past = covered as i32;
 +        self.fed = prompt[..covered].to_vec();
 +        self.plan = Some(PromptPlan { prompt, covered, exact_row, seen: 0, marks });
++        Ok(())
++    }
++
++    /// mm36: the prefill just advanced to n_past - followers waiting on a
++    /// later mark of this plan see it as progress. Taken alone.
++    fn claim_progress(&self) {
++        self.server.claims.lock().unwrap()
++            .progress(self.claim_id, self.n_past.max(0) as usize, Instant::now());
++    }
++
++    /// mm36: this plan crossed `mark` (parked it, or found it unparkable):
++    /// its claim there is settled either way - followers re-plan against
++    /// the parks, which are the truth. Taken alone.
++    fn claim_resolve(&self, mark: usize) {
++        self.server.claims.lock().unwrap().resolve(self.claim_id, mark);
 +    }
 +
 +    /// mm34: one chunk of a declared prompt (see PromptPlan). None = no plan
@@ -2708,6 +2804,17 @@ index 0000000..f121d0f
 +    /// excepted - an exact repeat answers the park's stored row instead).
 +    /// Some(Some(row)) = the part past the park was fed; this is its row.
 +    fn plan_step(&mut self, ids: &[i32], mtp: bool) -> Result<Option<Option<RowOut>>, BackendError> {
++        let had_plan = self.plan.is_some();
++        let r = self.plan_step_inner(ids, mtp);
++        // mm36: a plan that ended (served, outgrown, or failed) promises
++        // nothing more - followers re-plan against whatever got parked
++        if had_plan && (r.is_err() || self.plan.is_none()) {
++            self.server.claims.lock().unwrap().release_all(self.claim_id);
++        }
++        r
++    }
++
++    fn plan_step_inner(&mut self, ids: &[i32], mtp: bool) -> Result<Option<Option<RowOut>>, BackendError> {
 +        let (tail, last, pos0, marks) = {
 +            let Some(plan) = self.plan.as_mut() else { return Ok(None) };
 +            if self.prompt_done || plan.seen >= plan.prompt.len() {
@@ -2765,12 +2872,15 @@ index 0000000..f121d0f
 +                pos = m;
 +            }
 +            self.fork_park(true);
++            // mm36: parked or not, the claim on this mark is settled
++            self.claim_resolve(m);
 +        }
 +        if off < tail.len() {
 +            let piece = &tail[off..];
 +            self.shadow(piece);
 +            row = Some(if mtp { self.feed_mtp(piece)? } else { self.feed_plain(piece)? });
 +        }
++        self.claim_progress();
 +        let row = row.ok_or_else(|| err("empty token feed"))?;
 +        if !self.prompt_done {
 +            self.last_row = Some(row.clone());
@@ -3299,6 +3409,10 @@ index 0000000..f121d0f
 +                    if unsafe { ell_cuda_sync_stats(sync.as_mut_ptr()) } != 0 {
 +                        sync = [-1, -1];
 +                    }
++                    // mm36: read one at a time (claims and parked are never
++                    // nested), before the row is assembled
++                    let warming = self.server.claims.lock().unwrap().active(Instant::now()) as i32;
++                    let parks = self.server.parked.lock().unwrap().len() as i32;
 +                    let vals = [
 +                        self.seq_id,
 +                        self.server.model.recurrent as i32,
@@ -3353,6 +3467,15 @@ index 0000000..f121d0f
 +                        // mm35: boundary-park slots armed (0 = off): a guest
 +                        // may send "marks" beside its "prompt" declaration
 +                        prefix_slots() as i32,
++                        // mm36: shared prefix warming protocol (1 = the
++                        // "prefix_wait" opt-in and the [prefix_warming]
++                        // refusal exist), live claims (someone is preparing
++                        // a prefix right now), standing parks. A guest reads
++                        // the last two as proof the model serves under this
++                        // share and skips its own probe feed.
++                        1,
++                        warming,
++                        parks,
 +                    ];
 +                    let mut data = Vec::with_capacity(vals.len() * 4);
 +                    for v in vals {
@@ -3667,7 +3790,13 @@ index 0000000..f121d0f
 +                            .into_iter().filter(|&m| m > 0).map(|m| m as usize).collect(),
 +                        None => Vec::new(),
 +                    };
-+                    self.plan_prompt(tokens_from_tensor(&pt.tensor)?, marks);
++                    // mm36: {"prefix_wait": I32 [1] = 1} opts this call into
++                    // waiting for another context that is preparing the same
++                    // prefix (refused with PREFIX_WARMING_ERR, retried by the
++                    // guest); absent = warm concurrently, as before mm36
++                    let wait_ok = inputs.iter().any(|nt| nt.name == "prefix_wait"
++                        && tokens_from_tensor(&nt.tensor).map(|v| v.first() == Some(&1)).unwrap_or(false));
++                    self.plan_prompt(tokens_from_tensor(&pt.tensor)?, marks, wait_ok)?;
 +                }
 +                let flag = |name: &str| {
 +                    inputs.iter().any(|nt| nt.name == name
@@ -3833,7 +3962,7 @@ index 0000000..f121d0f
 +
 +}
 diff --git a/crates/wasi-nn/src/backend/mod.rs b/crates/wasi-nn/src/backend/mod.rs
-index f6f81e8..b8d8710 100644
+index f6f81e8..abeaa42 100644
 --- a/crates/wasi-nn/src/backend/mod.rs
 +++ b/crates/wasi-nn/src/backend/mod.rs
 @@ -2,6 +2,8 @@
@@ -3865,6 +3994,355 @@ index f6f81e8..b8d8710 100644
      #[cfg(feature = "pytorch")]
      {
          backends.push(Backend::from(PytorchBackend::default()));
+@@ -141,3 +149,6 @@ pub struct NamedTensor {
+     pub name: String,
+     pub tensor: Tensor,
+ }
++
++/// mm36 shared prefix warming (pure; unit-tested without the ggml FFI)
++pub mod prefix_claims;
+diff --git a/crates/wasi-nn/src/backend/prefix_claims.rs b/crates/wasi-nn/src/backend/prefix_claims.rs
+new file mode 100644
+index 0000000..5174d65
+--- /dev/null
++++ b/crates/wasi-nn/src/backend/prefix_claims.rs
+@@ -0,0 +1,336 @@
++//! mm36 SHARED prefix warming: exact-prefix CLAIMS on one serving context.
++//!
++//! The mm35 boundary parks make every prompt that starts the same way branch
++//! off a parked prefix - once somebody has READ that prefix. Until then every
++//! caller that arrives reads it for itself: the manager's boot warm-up, the
++//! page-load warm-up of every open tab, the first chat, an API benchmark -
++//! each a full ~3,000-token prefill on the same tokens, all serialised on the
++//! decode turn, so the prefix is prepared N times and the N-th caller waits
++//! for all of them. Wasmtime builds a fresh store per HTTP request, so the
++//! guest cannot coordinate this on its side: nothing of one request survives
++//! into the next. The serving context is the one thing every request of a
++//! deployment shares, so the coordination lives there.
++//!
++//! A claim is a promise, by one live execution context (the LEADER), to park
++//! the exact token prefix `prompt[..mark]` for one of the marks it declared.
++//! Any later context whose declared prompt carries the SAME exact prefix as
++//! a pending mark of its own is a FOLLOWER: instead of feeding, its first
++//! chunk is refused with the `[prefix_warming]` marker and the leader's
++//! progress, and the guest retries that same chunk after a short sleep.
++//! Every retry re-plans against the parks, so the moment the leader has
++//! parked the mark the follower branches off it and pays only what follows.
++//! The follower waits OUTSIDE any host call, so its stream stays alive and a
++//! reader that leaves ends the wait at once.
++//!
++//! Claims are released as each mark is parked (or found unparkable), when
++//! the leader's plan ends or fails, and when the leader's context drops -
++//! an abandoned warm-up (a closed tab) lets the next follower's retry find
++//! no claim and lead from wherever the parks stand. A claim that has seen
++//! no progress for `stale_after` is ignored (and replaced), so a wedged
++//! leader can strand nobody past that; the engine watchdog bounds the
++//! leader itself. The identity of a claim is its owner's `claim_id`, minted
++//! once per context: a park fork SWAPS a session's `seq_id`, so that is not
++//! a safe owner name.
++//!
++//! Waiting is OPT-IN per call (`{"prefix_wait": [1]}` beside the first
++//! chunk): a guest built before mm36 treats any compute error as fatal, so
++//! it must never be refused - it warms concurrently exactly as before.
++//! This module holds no engine state and no locks of its own; the server
++//! keeps it behind one leaf mutex (see GgmlServer::claims).
++
++#![allow(dead_code)]
++
++use std::time::{Duration, Instant};
++
++/// The refusal marker a follower sees. Guests match it with a substring test
++/// (the forgiving-parser shape every marker in this backend uses), so the
++/// literal is pinned by test/prefix-warming.test.mjs in the enclave repo and
++/// must never change.
++pub const PREFIX_WARMING_ERR: &str = "[prefix_warming]";
++
++/// Default `stale_after`: a leader that reported no progress for this long
++/// is treated as gone. One prefill chunk on the slowest fleet node is ~45 s
++/// (512 tokens at ~11 tok/s), so five minutes is comfortably past a chunk
++/// and far short of the engine watchdog (600 s), which is what actually
++/// ends a wedged leader. ENCLAVE_GGML_PREFIX_CLAIM_STALE_S overrides.
++pub const DEFAULT_STALE_SECS: u64 = 300;
++
++/// Bound on live claims (contexts x marks; the session cap is 8 and a prompt
++/// declares two or three marks). Past it new callers lead unclaimed - the
++/// pre-mm36 behaviour - rather than growing the table.
++pub const MAX_CLAIMS: usize = 64;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ClaimVerdict {
++    /// no live claim by another owner covers any of the caller's pending
++    /// marks: the caller leads, and now holds a claim on each of them
++    Lead,
++    /// another context is preparing exactly the prefix of the caller's
++    /// first still-pending mark: wait for it. `done`/`total` is that
++    /// leader's progress in positions toward the mark.
++    Wait { done: usize, total: usize },
++}
++
++#[derive(Debug)]
++struct Claim {
++    /// the exact prefix promised: `prompt[..total]`
++    key: Vec<i32>,
++    owner: u64,
++    total: usize,
++    done: usize,
++    touched: Instant,
++}
++
++#[derive(Debug)]
++pub struct PrefixClaims {
++    claims: Vec<Claim>,
++    stale_after: Duration,
++    cap: usize,
++}
++
++impl PrefixClaims {
++    pub fn new(stale_after: Duration) -> Self {
++        PrefixClaims { claims: Vec::new(), stale_after, cap: MAX_CLAIMS }
++    }
++
++    #[cfg(test)]
++    fn with_cap(stale_after: Duration, cap: usize) -> Self {
++        PrefixClaims { claims: Vec::new(), stale_after, cap }
++    }
++
++    fn fresh(&self, c: &Claim, now: Instant) -> bool {
++        now.saturating_duration_since(c.touched) <= self.stale_after
++    }
++
++    /// The first (lowest) mark in `marks` whose exact prefix a fresh claim
++    /// by ANOTHER owner covers, as that leader's (done, total). None = no
++    /// conflict. Read-only: the cheap pre-check a follower's retry runs
++    /// without waiting for the decode turn.
++    pub fn blocking(&self, owner: u64, prompt: &[i32], marks: &[usize], now: Instant) -> Option<(usize, usize)> {
++        let mut marks: Vec<usize> = marks.iter().copied().filter(|&m| m > 0 && m <= prompt.len()).collect();
++        marks.sort_unstable();
++        marks.dedup();
++        for m in marks {
++            if let Some(c) = self.claims.iter().find(|c| {
++                c.owner != owner && c.total == m && self.fresh(c, now) && c.key[..] == prompt[..m]
++            }) {
++                return Some((c.done.min(c.total), c.total));
++            }
++        }
++        None
++    }
++
++    /// Check-and-register, atomically with respect to this table: with
++    /// `wait_ok`, a conflict on any pending mark returns Wait and registers
++    /// nothing; otherwise the caller leads and gains a claim on every mark
++    /// no other live owner already holds (a re-plan by the same owner
++    /// refreshes its own). Stale claims are dropped on the way.
++    pub fn plan(&mut self, owner: u64, prompt: &[i32], marks: &[usize], wait_ok: bool, now: Instant) -> ClaimVerdict {
++        let stale = self.stale_after;
++        self.claims.retain(|c| now.saturating_duration_since(c.touched) <= stale);
++        if wait_ok {
++            if let Some((done, total)) = self.blocking(owner, prompt, marks, now) {
++                return ClaimVerdict::Wait { done, total };
++            }
++        }
++        let mut marks: Vec<usize> = marks.iter().copied().filter(|&m| m > 0 && m <= prompt.len()).collect();
++        marks.sort_unstable();
++        marks.dedup();
++        for m in marks {
++            if let Some(c) = self.claims.iter_mut().find(|c| c.total == m && c.key[..] == prompt[..m]) {
++                if c.owner == owner {
++                    c.touched = now;
++                }
++                // another owner's live claim stands (only reachable when the
++                // caller declined to wait): two leaders, as before mm36
++                continue;
++            }
++            if self.claims.len() >= self.cap {
++                break;
++            }
++            self.claims.push(Claim { key: prompt[..m].to_vec(), owner, total: m, done: 0, touched: now });
++        }
++        ClaimVerdict::Lead
++    }
++
++    /// The leader fed up to absolute position `pos`: every claim it holds
++    /// advances (they are all served by the same prefill) and stays fresh.
++    pub fn progress(&mut self, owner: u64, pos: usize, now: Instant) {
++        for c in self.claims.iter_mut().filter(|c| c.owner == owner) {
++            c.done = pos.min(c.total);
++            c.touched = now;
++        }
++    }
++
++    /// The leader crossed `mark` (parked it, or found it unparkable - either
++    /// way followers must re-plan against the parks, not wait on): drop its
++    /// claim on that mark.
++    pub fn resolve(&mut self, owner: u64, mark: usize) {
++        self.claims.retain(|c| !(c.owner == owner && c.total == mark));
++    }
++
++    /// Everything `owner` holds: its plan ended, failed, or its context is
++    /// going away.
++    pub fn release_all(&mut self, owner: u64) {
++        self.claims.retain(|c| c.owner != owner);
++    }
++
++    /// Live (fresh) claims right now - "somebody is warming a prefix here".
++    pub fn active(&self, now: Instant) -> usize {
++        self.claims.iter().filter(|c| self.fresh(c, now)).count()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn prompt(n: usize) -> Vec<i32> {
++        (0..n as i32).collect()
++    }
++
++    #[test]
++    fn first_caller_leads_and_matching_follower_waits_with_progress() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.active(now), 2);
++        // a chat whose prompt continues past the warm-up's end shares both marks
++        let mut chat = p.clone();
++        chat.extend([500, 501, 502]);
++        assert_eq!(t.plan(2, &chat, &[40, 90], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++        t.progress(1, 32, now);
++        assert_eq!(t.plan(2, &chat, &[40, 90], true, now), ClaimVerdict::Wait { done: 32, total: 40 });
++        // progress is clamped to the mark it reports on
++        t.progress(1, 70, now);
++        assert_eq!(t.plan(2, &chat, &[40, 90], true, now), ClaimVerdict::Wait { done: 40, total: 40 });
++        // the first mark parked: the follower's re-plan (which now covers
++        // 40 and has only 90 pending) waits on the second
++        t.resolve(1, 40);
++        assert_eq!(t.plan(2, &chat, &[90], true, now), ClaimVerdict::Wait { done: 70, total: 90 });
++        t.resolve(1, 90);
++        assert_eq!(t.active(now), 0);
++        // nothing pending any more: the follower leads what is left (nothing)
++        assert_eq!(t.plan(2, &chat, &[], true, now), ClaimVerdict::Lead);
++    }
++
++    #[test]
++    fn a_different_prefix_never_waits_and_a_shared_head_waits_only_for_the_head() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        // same length, one token differs inside the first mark: unrelated
++        let mut other = p.clone();
++        other[10] = -1;
++        assert_eq!(t.plan(2, &other, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.active(now), 4);
++        // shares the system text (mark 40) but carries another tool block
++        let mut sibling = p[..40].to_vec();
++        sibling.extend((1000..1060).collect::<Vec<i32>>());
++        assert_eq!(t.plan(3, &sibling, &[40, 100], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++        t.resolve(1, 40);
++        // its second mark is its own: it leads that one
++        assert_eq!(t.plan(3, &sibling, &[100], true, now), ClaimVerdict::Lead);
++        assert!(t.claims.iter().any(|c| c.owner == 3 && c.total == 100));
++    }
++
++    #[test]
++    fn a_dropped_or_failed_leader_frees_its_followers() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.plan(2, &p, &[40, 90], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++        t.release_all(1); // the leader's context dropped mid-prefill
++        assert_eq!(t.plan(2, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert!(t.claims.iter().all(|c| c.owner == 2));
++        // the take-over leader is itself authoritative for a third caller
++        assert_eq!(t.plan(3, &p, &[40, 90], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++    }
++
++    #[test]
++    fn a_stale_leader_is_ignored_and_replaced() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let t0 = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40], true, t0), ClaimVerdict::Lead);
++        let later = t0 + Duration::from_secs(299);
++        assert_eq!(t.plan(2, &p, &[40], true, later), ClaimVerdict::Wait { done: 0, total: 40 });
++        // progress keeps a slow leader fresh
++        t.progress(1, 8, later);
++        let later2 = later + Duration::from_secs(299);
++        assert_eq!(t.plan(2, &p, &[40], true, later2), ClaimVerdict::Wait { done: 8, total: 40 });
++        let stale = later2 + Duration::from_secs(2);
++        assert_eq!(t.active(stale), 0);
++        assert_eq!(t.plan(2, &p, &[40], true, stale), ClaimVerdict::Lead);
++        assert!(t.claims.iter().all(|c| c.owner == 2), "the stale claim is replaced, not kept beside");
++    }
++
++    #[test]
++    fn declining_to_wait_leads_beside_the_leader_without_stealing_its_claim() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.plan(2, &p, &[40, 90], false, now), ClaimVerdict::Lead);
++        assert_eq!(t.active(now), 2, "the impatient caller registers nothing already claimed");
++        // the original leader still answers for followers
++        assert_eq!(t.plan(3, &p, &[40, 90], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++        t.progress(2, 30, now); // the second leader's progress is not the claim's
++        assert_eq!(t.plan(3, &p, &[40, 90], true, now), ClaimVerdict::Wait { done: 0, total: 40 });
++    }
++
++    #[test]
++    fn a_leader_re_planning_refreshes_its_own_claims_and_never_waits_on_itself() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let t0 = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, t0), ClaimVerdict::Lead);
++        let later = t0 + Duration::from_secs(200);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, later), ClaimVerdict::Lead);
++        assert_eq!(t.active(later + Duration::from_secs(200)), 2, "refreshed, not aged from t0");
++    }
++
++    #[test]
++    fn marks_outside_the_prompt_or_at_zero_are_not_claims() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(50);
++        assert_eq!(t.plan(1, &p, &[0, 40, 51, 40], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.active(now), 1);
++        assert_eq!(t.blocking(2, &p, &[0, 51], now), None);
++        assert_eq!(t.blocking(2, &p, &[40], now), Some((0, 40)));
++    }
++
++    #[test]
++    fn the_table_is_bounded_and_overflow_degrades_to_leading_unclaimed() {
++        let mut t = PrefixClaims::with_cap(Duration::from_secs(300), 2);
++        let now = Instant::now();
++        let p = prompt(100);
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        let mut other = p.clone();
++        other[0] = -1;
++        assert_eq!(t.plan(2, &other, &[40], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.active(now), 2, "no room: the second caller leads without a claim");
++        assert_eq!(t.blocking(3, &other, &[40], now), None);
++    }
++
++    #[test]
++    fn resolve_touches_only_that_owner_and_mark() {
++        let mut t = PrefixClaims::new(Duration::from_secs(300));
++        let now = Instant::now();
++        let p = prompt(100);
++        let mut other = p.clone();
++        other[0] = -1;
++        assert_eq!(t.plan(1, &p, &[40, 90], true, now), ClaimVerdict::Lead);
++        assert_eq!(t.plan(2, &other, &[40], true, now), ClaimVerdict::Lead);
++        t.resolve(2, 40);
++        assert_eq!(t.blocking(9, &p, &[40], now), Some((0, 40)));
++        assert_eq!(t.blocking(9, &other, &[40], now), None);
++        t.resolve(1, 40);
++        assert_eq!(t.blocking(9, &p, &[40], now), None);
++        assert_eq!(t.blocking(9, &p, &[90], now), Some((0, 90)));
++    }
++}
 diff --git a/crates/wasi-nn/src/lib.rs b/crates/wasi-nn/src/lib.rs
 index b826f6a..3dd6190 100644
 --- a/crates/wasi-nn/src/lib.rs
