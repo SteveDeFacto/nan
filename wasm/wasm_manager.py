@@ -5498,6 +5498,11 @@ def _spawn_and_wait(rec, ctx):
         nt = _nn_threads_for(enclave_config, cpu_share)
         if nt is not None:
             env["ENCLAVE_GGML_N_THREADS"] = str(nt)
+        # Optional bounded wait for a privacy-pad batch already in flight.
+        # No extra threads, CPU allocation, or pad reuse. Zero disables it.
+        pw = _nn_cfg_int(enclave_config, "nnShieldedPadWaitUs", 0, 50000)
+        if pw is not None:
+            env["SHIELDED_PAD_WAIT_US"] = str(pw)
         # Recurrent-snapshot depth for speculative rewind (the shim's
         # ENCLAVE_GGML_N_RS_SEQ, read at ggml server-context creation):
         # deployment-config `nnRsSeq`, wasmtime PROCESS env like the MPS

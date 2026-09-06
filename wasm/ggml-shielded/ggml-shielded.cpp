@@ -298,13 +298,16 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
                 card, s.host.c_str(), s.port, (long long)s.device_bytes, (long long)s.reserve_cap);
         uint64_t used = 0, missed = 0;
         if (s.link) sh_link_pool_stats(s.link, &used, &missed);
+        uint64_t waited = 0; double wait_ms = 0;
+        sh_link_pad_wait_stats(s.link, &waited, &wait_ms);
         fprintf(stderr, "[shielded] profile: exchanges=%llu nodes=%llu (completions=%llu served=%llu) | link: mask=%.1fms wire=%.1fms "
                         "refill-on-path=%.1fms unmask+lhs=%.1fms rhs=%.1fms total=%.1fms | backend: encode=%.1fms "
-                        "post=%.1fms graph_compute=%.1fms | pads used=%llu missed=%llu | contended=%d events=%llu | simd=%s refill_threads=%d\n",
+                        "post=%.1fms graph_compute=%.1fms | pads used=%llu missed=%llu waited=%llu wait=%.1fms | contended=%d events=%llu | simd=%s refill_threads=%d\n",
                 (unsigned long long)s.exchanges, (unsigned long long)s.offloaded_nodes,
                 (unsigned long long)s.completed, (unsigned long long)s.served,
                 sh_prof[0], sh_prof[1], sh_prof[2], sh_prof[3], sh_prof[4], s.t_link,
                 s.t_encode, s.t_post, s.t_graph, (unsigned long long)used, (unsigned long long)missed,
+                (unsigned long long)waited, wait_ms,
                 (int)s.contention.contended, (unsigned long long)s.contention.events,
                 sh_link_simd()->name, s.link ? sh_link_refill_threads(s.link) : 0);
         // Identify the groups delaying GPU submission. Aggregate misses alone

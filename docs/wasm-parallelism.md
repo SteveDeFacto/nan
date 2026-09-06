@@ -1073,3 +1073,10 @@ backend's background masking workers have a separate bounded pool, so reducing
 the compute pool can reduce contention while the GPUs perform the matrix
 operations. Benchmark the setting with the same model, context and prompt. It
 does not allocate additional CPUs, alter the model, or reduce the context.
+
+`nnShieldedPadWaitUs` optionally waits up to 0–50000 microseconds for an
+already-reserved privacy-mask batch before generating missing masks on the
+request thread. It defaults to zero. Waiting does not add workers or reuse
+masks; a timeout consumes only ready masks and generates the remainder as
+before. Compare TTFT, generation throughput, and the shielded profile's
+`waited`/`wait` counters before enabling it for a workload.

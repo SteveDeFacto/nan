@@ -327,7 +327,7 @@ struct sh_link {
     pthread_cond_t  pool_filled;   /* a pad was published (start waits on it) */
     pthread_t *threads; int n_threads; bool threads_running, stop;
     int threads_env;               /* SHIELDED_REFILL_THREADS, or -1 = derive from the weights */
-    int pool_depth, refill_batch, target_ms, warm_ms;
+    int pool_depth, refill_batch, target_ms, warm_ms, pad_wait_us;
     int64_t Kmax, Nmax, ulen_max;
 
     /* request-path scratch (caller thread) */
@@ -340,6 +340,8 @@ struct sh_link {
     uint8_t *hdr;     size_t hdr_cap;
 
     uint64_t   exchanges, macs, verify_fail, pads_used, pads_missed;
+    uint64_t   pads_waited;
+    double     pad_wait_ms;
     double     last_wire_us;
     char       transport[192];
     char       err[256];
@@ -360,6 +362,10 @@ void sh_link_pool_stats(const sh_link *l, uint64_t *consumed, uint64_t *missed) 
     if (!l) return;
     if (consumed) *consumed = l->pads_used;
     if (missed) *missed = l->pads_missed;
+}
+void sh_link_pad_wait_stats(const sh_link *l, uint64_t *waited, double *wait_ms) {
+    if (waited) *waited = l ? l->pads_waited : 0;
+    if (wait_ms) *wait_ms = l ? l->pad_wait_ms : 0;
 }
 void sh_link_node_pool_stats(const sh_link *l, int node, uint64_t *consumed,
                              uint64_t *missed, double *on_path_ms) {
@@ -391,12 +397,17 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     if (!maskbank_init(&l->bank)) { free(l); if (err) *err = SH_ERR_IO; return NULL; }
     pthread_mutex_init(&l->pool_mu, NULL);
     pthread_cond_init(&l->need_refill, NULL);
-    pthread_cond_init(&l->pool_filled, NULL);
+    pthread_condattr_t filled_attr;
+    pthread_condattr_init(&filled_attr);
+    pthread_condattr_setclock(&filled_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&l->pool_filled, &filled_attr);
+    pthread_condattr_destroy(&filled_attr);
     l->threads_env  = env_int("SHIELDED_REFILL_THREADS", -1, 0, 64);
     l->pool_depth   = env_int("SHIELDED_POOL_DEPTH", -1, -1, 4096);   /* -1: 4 x the widest max_m, at least 16 */
     l->refill_batch = env_int("SHIELDED_REFILL_BATCH", 4, 1, 64);
     l->target_ms    = env_int("SHIELDED_REFILL_TARGET_MS", 6, 1, 10000);
     l->warm_ms      = env_int("SHIELDED_WARM_MS", 5000, 0, 600000);
+    l->pad_wait_us  = env_int("SHIELDED_PAD_WAIT_US", 0, 0, 50000);
     if (err) *err = SH_OK;
     return l;
 }
@@ -413,6 +424,7 @@ static void stop_threads(sh_link *l) {
     pthread_mutex_lock(&l->pool_mu);
     l->stop = true;
     pthread_cond_broadcast(&l->need_refill);
+    pthread_cond_broadcast(&l->pool_filled);
     pthread_mutex_unlock(&l->pool_mu);
     for (int i = 0; i < l->n_threads; i++) pthread_join(l->threads[i], NULL);
     free(l->threads); l->threads = NULL;
@@ -672,6 +684,7 @@ static void *refill_main(void *arg) {
              * happens until the process restarts. */
             g->generating -= b;
             l->stop = true;
+            pthread_cond_broadcast(&l->pool_filled);
         }
         pthread_mutex_unlock(&l->pool_mu);
     }
@@ -744,7 +757,7 @@ static int start_pools(sh_link *l) {
          * empty made the first token generate 49 pads on the request path
          * (19.6 ms of refill-on-path in a 64-token decode, all in token one).
          * Bounded: a pathological box still starts, it just pays on the path. */
-        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+        struct timespec dl; clock_gettime(CLOCK_MONOTONIC, &dl);
         dl.tv_sec += l->warm_ms / 1000; dl.tv_nsec += (long)(l->warm_ms % 1000) * 1000000L;
         if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
         pthread_mutex_lock(&l->pool_mu);
@@ -764,7 +777,25 @@ static int start_pools(sh_link *l) {
  * They are consumed here and held until release_pads. */
 static int take_pads(sh_link *l, sh_group *g, int m, int *slots) {
     pthread_mutex_lock(&l->pool_mu);
+    const int before = g->count < m ? g->count : m;
+    /* An in-flight full refill can finish sooner than a separate, partial
+     * request-thread refill. Only wait when the missing pads are ALREADY
+     * reserved, and release the mutex while their producers write/publish.
+     * A timeout consumes only the ready prefix; unpublished and held slots
+     * remain owned exactly as before. Default zero preserves the old path. */
+    if (l->pad_wait_us > 0 && !l->stop && g->count < m &&
+        g->count + g->generating >= m) {
+        const double started = now_ms();
+        struct timespec dl; clock_gettime(CLOCK_MONOTONIC, &dl);
+        dl.tv_nsec += (long)l->pad_wait_us * 1000L;
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        while (!l->stop && g->count < m && g->generating > 0) {
+            if (pthread_cond_timedwait(&l->pool_filled, &l->pool_mu, &dl) != 0) break;
+        }
+        l->pad_wait_ms += now_ms() - started;
+    }
     int take = g->count < m ? g->count : m;
+    l->pads_waited += (uint64_t)(take - before);
     for (int i = 0; i < take; i++) slots[i] = (g->head + i) % g->depth;
     g->head = (g->head + take) % g->depth;
     g->count -= take;
