@@ -21,12 +21,15 @@
 #include <immintrin.h>
 #define SH_CPU_RELAX() _mm_pause()
 #define SH_SFENCE()    _mm_sfence()
+#define SH_MFENCE()    _mm_mfence()
 #elif defined(__aarch64__)
 #define SH_CPU_RELAX() __asm__ __volatile__("yield")
 #define SH_SFENCE()    __asm__ __volatile__("dmb ishst" ::: "memory")
+#define SH_MFENCE()    __asm__ __volatile__("dmb ish" ::: "memory")
 #else
 #define SH_CPU_RELAX() ((void)0)
 #define SH_SFENCE()    __sync_synchronize()
+#define SH_MFENCE()    __sync_synchronize()
 #endif
 
 /* A single frame is capped well below the point where a bad length header could
@@ -53,6 +56,7 @@ struct sh_pipe {
     uint8_t *ring;
     uint64_t seq;
     int      misses;
+    int      stream_load;
 };
 
 /* Frames per exchange that fit the stack-resident iovec/header arrays. Every
@@ -333,6 +337,39 @@ static inline void st_rel(uint8_t *at, uint64_t v) {
 }
 
 int sh_pipe_ring_live(const sh_pipe *p) { return p && p->ring != NULL; }
+int sh_pipe_ring_stream_load(const sh_pipe *p) { return sh_pipe_ring_live(p) && p->stream_load; }
+
+#if defined(__x86_64__) || defined(__i386__)
+/* MOVNTDQA can gather a WC cache line through a streaming-load buffer.
+ * This remains a bounded copy into private RAM, with exactly the same
+ * subsequent verification. Fence it against the peer's WB writes; see
+ * Intel SDM MOVNTDQA / Optimization Reference Manual 9.4.4. Off by default
+ * until measured on the actual guest mapping and CPU. */
+__attribute__((target("sse4.1")))
+static void ring_stream_copy(uint8_t *dst, const uint8_t *src, size_t n) {
+    _mm_mfence();
+    size_t lead = (16 - ((uintptr_t)src & 15)) & 15;
+    if (lead > n) lead = n;
+    if (lead) { memcpy(dst, src, lead); dst += lead; src += lead; n -= lead; }
+    while (n >= 64) {
+        const __m128i a = _mm_stream_load_si128((__m128i *)(src));
+        const __m128i b = _mm_stream_load_si128((__m128i *)(src + 16));
+        const __m128i c = _mm_stream_load_si128((__m128i *)(src + 32));
+        const __m128i d = _mm_stream_load_si128((__m128i *)(src + 48));
+        _mm_storeu_si128((__m128i *)(dst), a);
+        _mm_storeu_si128((__m128i *)(dst + 16), b);
+        _mm_storeu_si128((__m128i *)(dst + 32), c);
+        _mm_storeu_si128((__m128i *)(dst + 48), d);
+        src += 64; dst += 64; n -= 64;
+    }
+    while (n >= 16) {
+        _mm_storeu_si128((__m128i *)dst, _mm_stream_load_si128((__m128i *)src));
+        src += 16; dst += 16; n -= 16;
+    }
+    if (n) memcpy(dst, src, n);
+    _mm_mfence();
+}
+#endif
 
 static void ring_drop(sh_pipe *p) {
     if (p->map) munmap(p->map, p->map_len);
@@ -390,6 +427,11 @@ int sh_pipe_shm_attach(sh_pipe *p, const char *path, int index, size_t bytes) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     p->seq = (((uint64_t)ts.tv_sec << 24) | ((uint64_t)ts.tv_nsec >> 6)) & 0x3fffffffffffffffULL;
     p->misses = 0;
+    p->stream_load = 0;
+#if defined(__x86_64__) || defined(__i386__)
+    const char *stream = getenv("SHIELDED_SHM_STREAM_LOAD");
+    p->stream_load = stream && strcmp(stream, "1") == 0 && __builtin_cpu_supports("sse4.1");
+#endif
     return SH_OK;
 }
 
@@ -449,6 +491,7 @@ int sh_pipe_ring_exchange(sh_pipe *p, const sh_frame *f, size_t want, sh_reply *
     }
     /* The header is validated against what WE expect before the payload is
      * read. A wrong length is a refusal, never "use the peer's length". */
+    SH_MFENCE();  /* WC loads must follow observation of the peer's sequence. */
     const uint8_t status = r[SH_RING_OFF_RPH];
     const uint64_t len = get_u64(r + SH_RING_OFF_RPH + 1);
     if (status != 0) {
@@ -465,6 +508,10 @@ int sh_pipe_ring_exchange(sh_pipe *p, const sh_frame *f, size_t want, sh_reply *
     }
     /* Out of the shared page and into OUR buffer: unmask and Freivalds run on
      * this copy, so nothing the host does to the ring afterwards matters. */
+#if defined(__x86_64__) || defined(__i386__)
+    if (p->stream_load) ring_stream_copy(p->rbuf, r + SH_RING_OFF_RPP, want);
+    else
+#endif
     memcpy(p->rbuf, r + SH_RING_OFF_RPP, want);
     p->misses = 0;
     out->status = 0; out->data = p->rbuf; out->len = want;

@@ -2412,6 +2412,18 @@ def _shielded_profile_tail(rec: dict) -> None:
     threading.Thread(target=run, daemon=True, name=f"shielded-profile-{rec.get('id')}").start()
 
 
+def _nn_shielded_transport_for(config: str) -> dict:
+    """Optional transport comparison, without changing any card reservation."""
+    try:
+        mode = json.loads(config).get("nnShieldedTransport")
+    except (ValueError, AttributeError, TypeError):
+        return {}
+    if not isinstance(mode, str) or mode not in ("auto", "socket", "shm-stream"):
+        return {}
+    return {"SHIELDED_SHM_DISABLE": "1" if mode == "socket" else "0",
+            "SHIELDED_SHM_STREAM_LOAD": "1" if mode == "shm-stream" else "0"}
+
+
 def _shielded_shm_fields(worker: dict):
     """Only guest-derived, card-bound BAR mappings can enter a native process."""
     if "shmPath" not in worker and "shmBytes" not in worker:
@@ -5524,6 +5536,7 @@ def _spawn_and_wait(rec, ctx):
         pw = _nn_cfg_int(enclave_config, "nnShieldedPadWaitUs", 0, 50000)
         if pw is not None:
             env["SHIELDED_PAD_WAIT_US"] = str(pw)
+        env.update(_nn_shielded_transport_for(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's
         # ENCLAVE_GGML_N_RS_SEQ, read at ggml server-context creation):
         # deployment-config `nnRsSeq`, wasmtime PROCESS env like the MPS

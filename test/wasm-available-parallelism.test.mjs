@@ -87,3 +87,16 @@ test("omitted or invalid ggml thread tuning preserves the engine default", () =>
     assert.equal(mgr(`m._nn_threads_for(${JSON.stringify(config)}, 0.53)`, { NODE_VCPUS: "16" }), null);
   }
 });
+
+test("per-app shielded transport selection cannot change routes or reservations", () => {
+  const got = mgr(`{mode: m._nn_shielded_transport_for(json.dumps({"nnShieldedTransport": mode}))
+                   for mode in ["auto", "socket", "shm-stream", "arbitrary"]}`);
+  assert.deepEqual(got, {
+    auto: { SHIELDED_SHM_DISABLE: "0", SHIELDED_SHM_STREAM_LOAD: "0" },
+    socket: { SHIELDED_SHM_DISABLE: "1", SHIELDED_SHM_STREAM_LOAD: "0" },
+    "shm-stream": { SHIELDED_SHM_DISABLE: "0", SHIELDED_SHM_STREAM_LOAD: "1" },
+    arbitrary: {},
+  });
+  for (const c of ['{}', '[]', 'invalid', '{"nnShieldedTransport":true}'])
+    assert.deepEqual(mgr(`m._nn_shielded_transport_for(${JSON.stringify(c)})`), {});
+});

@@ -1002,7 +1002,7 @@ int sh_link_start(sh_link *l) {
      * transport string says which, so the profile line can be read. */
     {
         const char *shm = l->shm_configured ? l->shm_path : getenv("SHIELDED_SHM");
-        if (shm && *shm) {
+        if (shm && *shm && !env_int("SHIELDED_SHM_DISABLE", 0, 0, 1)) {
             if (hello_minor < 2) {
                 snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport),
                          " (shm ring: worker speaks 1.%d, needs 1.2)", hello_minor);
@@ -1013,7 +1013,9 @@ int sh_link_start(sh_link *l) {
                 int arc = index < 0 ? sh_pipe_shm_attach_available(l->pipe, shm, bytes, &index)
                                     : sh_pipe_shm_attach(l->pipe, shm, index, bytes);
                 if (arc == SH_OK)
-                    snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport), " + shm ring %d (%s)", index, shm);
+                    snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport),
+                             " + shm ring %d (%s)%s", index, shm,
+                             sh_pipe_ring_stream_load(l->pipe) ? " stream-load" : "");
                 else if (arc == SH_ERR_IO)
                     snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport), " (shm ring unavailable: %s)", sh_pipe_last_error(l->pipe));
                 else {

@@ -297,6 +297,12 @@ path; malformed peer replies still fail verification. The message contents,
 one-time pads and Freivalds checks are unchanged. This is off by default and
 requires a launcher restart; benchmark the actual workload before enabling it.
 Mapping paths and sizes come from the guest's device discovery, not `tenantEnv`.
+For comparisons, a deployment can set `nnShieldedTransport` to `"socket"` to
+disable its ring, `"auto"` for the normal copy, or `"shm-stream"` to opt into
+SSE4.1 streaming loads from the WC mapping when the CPU supports them. These
+knobs change only that app's transport and take effect on its next launch;
+they never add a device or change its reservation. Streaming loads are off by
+default; their effect depends on the CPU and mapping, so measure before use.
 
 **A dead worker never takes the box down.** It is restarted with backoff, and the enclave
 keeps serving CPU work meanwhile. What tells you the path is healthy is the boot probe:
