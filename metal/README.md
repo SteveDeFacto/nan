@@ -285,6 +285,19 @@ None of this changes what crosses the boundary: masked residue planes, public we
 their field products, as before. It changes only whether a vCPU that is waiting for those
 bytes halts or spins, and the host could always see when the guest went idle.
 
+**Optional shared-memory transport.** A CUDA worker can also set
+`"shm": { "path": "/dev/shm/enclave-shielded-card0", "mib": 32 }`.
+Each worker needs a distinct absolute backing-file path; sizes are powers of
+two from 8 through 64 MiB. The launcher attaches each file as an ivshmem BAR.
+The guest validates the PCI device and BAR size, then exposes only that BAR at
+a fixed path inside the native engine's chroot. WASI preopens are unchanged.
+Pooled engines receive a separate mapping for each card and claim a free ring
+per link. An absent mapping, occupied ring, or ring timeout retains the socket
+path; malformed peer replies still fail verification. The message contents,
+one-time pads and Freivalds checks are unchanged. This is off by default and
+requires a launcher restart; benchmark the actual workload before enabling it.
+Mapping paths and sizes come from the guest's device discovery, not `tenantEnv`.
+
 **A dead worker never takes the box down.** It is restarted with backoff, and the enclave
 keeps serving CPU work meanwhile. What tells you the path is healthy is the boot probe:
 

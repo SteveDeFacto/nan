@@ -70,6 +70,8 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err);
 /* Explicit per-link transport/reservation for a pooled tenant. Call before start;
  * avoids mutating process-wide environment while other links refill/reconnect. */
 void sh_link_configure(sh_link *l, int vsock_port, uint64_t reserve_bytes, int refill_threads);
+/* Per-card optional BAR, before start. Empty path explicitly keeps sockets. */
+void sh_link_configure_shm(sh_link *l, const char *path, uint64_t bytes);
 void     sh_link_close(sh_link *l);
 const char *sh_link_last_error(const sh_link *l);
 

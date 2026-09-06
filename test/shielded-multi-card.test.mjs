@@ -136,6 +136,44 @@ test('pooled admission is atomic if any sibling lacks VRAM or compute', () => {
   assert.deepEqual(r[0].cards.map(c => c.free), [6.5,31,31]);
   assert.equal(r[1].handle.pooled, true);
 });
+
+test('pooled shared-memory mappings stay bound to their original cards', () => {
+  const verdict = { ...pooled, cards: pooled.cards.map((c, i) => ({ ...c,
+    shmPath: `/dev/enclave-shielded-shm/card-${i}`, shmBytes: 8388608 })) };
+  const actions = [{ alloc: { name: 'a', gpu: .1, cpu: .1 } }, { launch: 'a' }];
+  const route = run(actions, verdict)[1].route;
+  assert.deepEqual(route.workers.map(w => [w.cardId, w.shmPath, w.shmBytes]),
+    [0,1,2].map(i => [i, `/dev/enclave-shielded-shm/card-${i}`, 8388608]));
+  verdict.cards[1].shmPath = '/dev/enclave-shielded-shm/card-0';
+  const fallback = run(actions, verdict)[1].route;
+  assert.equal(fallback.workers[1].shmPath, undefined);
+  assert.equal(fallback.workers[1].vsockPort, 9501);
+});
+
+test('launcher bounds ring files and prevents two workers from sharing a backing file', () => {
+  const a = { port: 9500, device: 'GPU-75f32211-2a00-2fb0-703f-99a11bbe5977', shm: { path: '/dev/shm/a', mib: 8 } };
+  const b = { port: 9501, device: 'GPU-1397d8cd-27ae-e1a6-a7ed-e485e7ca002c', shm: { path: '/dev/shm/b', mib: 32 } };
+  validate({ shieldedWorkers: [a,b] });
+  assert.throws(() => validate({ shieldedWorkers: [a, { ...b, shm: { path: '/dev//shm/a', mib: 8 } }] }), /distinct shared-memory/);
+  for (const shm of [{ path: 'relative', mib: 8 }, { path: '/dev/shm/a,other', mib: 8 },
+    { path: '/dev/shm/../a', mib: 8 }, { path: '/dev/shm/a', mib: 128 }, { path: '/dev/shm/a', mib: 12 }])
+    assert.throws(() => validate({ shieldedWorker: { ...a, shm } }), /absolute path/);
+});
+
+test('QEMU receives every configured ring, including when the first worker has none', () => {
+  const begin = source.indexOf('  for (const sw of runtimeCfg.shieldedWorkers) {', source.indexOf('// The shielded worker\'s shared-memory ring:'));
+  assert.ok(begin >= 0);
+  const block = source.slice(begin, source.indexOf('  // model volumes:', begin));
+  const a = [];
+  vm.runInNewContext(block, { a,
+    runtimeCfg: { shieldedWorkers: [{ id: 0 }, { id: 1, shmIndex: 0, shmMib: 8 }, { id: 2, shmIndex: 1, shmMib: 32 }] },
+    shieldedWorkers: [{}, { shm: { path: '/dev/shm/a' } }, { shm: { path: '/dev/shm/b' } }],
+  });
+  assert.deepEqual(a, ['-object', 'memory-backend-file,id=shring0,share=on,mem-path=/dev/shm/a,size=8M',
+    '-device', 'ivshmem-plain,memdev=shring0',
+    '-object', 'memory-backend-file,id=shring1,share=on,mem-path=/dev/shm/b,size=32M',
+    '-device', 'ivshmem-plain,memdev=shring1']);
+});
 test('missing pool member withdraws new shares without shrinking totals or rerouting a lease', () => {
   const r = run([
     { alloc: { name: 'a', gpu: .4, cpu: .3 } },

@@ -311,6 +311,9 @@ struct sh_link {
     char       host[128];
     int        port, vsock_port;
     uint64_t   reserve_bytes;
+    bool       shm_configured;
+    char       shm_path[256];
+    size_t     shm_bytes;
     bool       verify;
     /* Bytes per reply value: 4 (FIELD_GEMM, protocol 1.1) or 3 (FIELD_GEMM24,
      * 1.2). Decided at start from the worker's HELLO; SHIELDED_REPLY32=1
@@ -417,6 +420,16 @@ void sh_link_configure(sh_link *l, int vsock_port, uint64_t reserve_bytes, int r
     l->vsock_port = vsock_port;
     l->reserve_bytes = reserve_bytes;
     if (refill_threads >= 0 && refill_threads <= 64) l->threads_env = refill_threads;
+}
+
+void sh_link_configure_shm(sh_link *l, const char *path, uint64_t bytes) {
+    if (!l || l->pipe || l->threads_running) return;
+    l->shm_configured = true;
+    l->shm_path[0] = 0; l->shm_bytes = 0;
+    if (!path || !*path || strlen(path) >= sizeof l->shm_path ||
+        bytes < SH_RING_BYTES || bytes > SH_RING_MAX_FILE) return;
+    snprintf(l->shm_path, sizeof l->shm_path, "%s", path);
+    l->shm_bytes = (size_t)bytes;
 }
 
 static void stop_threads(sh_link *l) {
@@ -982,21 +995,23 @@ int sh_link_start(sh_link *l) {
     if (rc != SH_OK) { snprintf(l->err, sizeof l->err, "GRAPH_INSTALL: %s", sh_pipe_last_error(l->pipe)); return rc; }
     sh_reply_free(&rep);
 
-    /* The shared-memory ring (shielded-wire.h): opened only when the tenant's
-     * environment names one AND the worker speaks 1.2. Anything short of a
+    /* The shared-memory ring (shielded-wire.h): opened only when per-link
+     * config or the legacy environment names one AND the worker speaks 1.2.
+     * Anything short of a
      * granted ring leaves the link on the socket exactly as before; the
      * transport string says which, so the profile line can be read. */
     {
-        const char *shm = getenv("SHIELDED_SHM");
+        const char *shm = l->shm_configured ? l->shm_path : getenv("SHIELDED_SHM");
         if (shm && *shm) {
             if (hello_minor < 2) {
                 snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport),
                          " (shm ring: worker speaks 1.%d, needs 1.2)", hello_minor);
             } else {
-                const int index = env_int("SHIELDED_SHM_RING", 0, 0, 7);
+                int index = l->shm_configured ? -1 : env_int("SHIELDED_SHM_RING", 0, -1, 7);
                 const char *nb = getenv("SHIELDED_SHM_BYTES");
-                size_t bytes = nb && *nb ? (size_t)strtoull(nb, NULL, 10) : 0;
-                int arc = sh_pipe_shm_attach(l->pipe, shm, index, bytes);
+                size_t bytes = l->shm_configured ? l->shm_bytes : (nb && *nb ? (size_t)strtoull(nb, NULL, 10) : 0);
+                int arc = index < 0 ? sh_pipe_shm_attach_available(l->pipe, shm, bytes, &index)
+                                    : sh_pipe_shm_attach(l->pipe, shm, index, bytes);
                 if (arc == SH_OK)
                     snprintf(l->transport + strlen(l->transport), sizeof l->transport - strlen(l->transport), " + shm ring %d (%s)", index, shm);
                 else if (arc == SH_ERR_IO)

@@ -393,6 +393,20 @@ int sh_pipe_shm_attach(sh_pipe *p, const char *path, int index, size_t bytes) {
     return SH_OK;
 }
 
+int sh_pipe_shm_attach_available(sh_pipe *p, const char *path, size_t bytes, int *index) {
+    const size_t bound = bytes && bytes < SH_RING_MAX_FILE ? bytes : SH_RING_MAX_FILE;
+    int rc = SH_ERR_IO;
+    if (index) *index = -1;
+    for (size_t i = 0; i < bound / SH_RING_BYTES; i++) {
+        rc = sh_pipe_shm_attach(p, path, (int)i, bytes);
+        if (rc == SH_OK) { if (index) *index = (int)i; return SH_OK; }
+        // Occupied/unavailable rings can fall back. An invalid peer reply
+        // cannot be retried into a seemingly trustworthy connection.
+        if (rc != SH_ERR_IO) return rc;
+    }
+    return rc;
+}
+
 /* Longest the TEE spins for a ring reply before it sends the same frame on
  * the socket. The 4B lm_head at m=8 is ~1 ms on the card; 3 ms leaves room
  * for a card shared with another tenant without stalling the token forever. */

@@ -179,6 +179,39 @@ print(json.dumps({'ready':wm._shielded_pool_available()}))
   assert.equal(r.ready, false);
 });
 
+test('shared-memory routes remain per card and cannot be overridden by tenantEnv', () => {
+  const r = py(`
+workers = [{'cardId':i,'endpoint':f'10.0.2.2:{9500+i}','vramGb':1,
+ 'shmPath':f'/dev/enclave-shielded-shm/card-{i}','shmBytes':8388608} for i in range(2)]
+e = wm._shielded_tenant_env({'pooled':True,'workers':workers,'vramGb':2,
+ 'tenantEnv':{'SHIELDED_SHM':'/tmp/private','SHIELDED_SHM_BYTES':'999999999','SHIELDED_SHM_RING':'7'}})
+single = wm._shielded_tenant_env({**workers[1], 'tenantEnv':{'SHIELDED_SHM':'/tmp/private','SHIELDED_SHM_RING':'7'}})
+print(json.dumps({'records':e['SHIELDED_WORKERS'].split('\\n'),'global':e.get('SHIELDED_SHM'),
+ 'path':single.get('SHIELDED_SHM'),'bytes':single.get('SHIELDED_SHM_BYTES'),'ring':single.get('SHIELDED_SHM_RING')}))
+`);
+  assert.deepEqual(r.records, [0,1].map(i => `10.0.2.2|${9500+i}|0|1073741824|/dev/enclave-shielded-shm/card-${i}|8388608`));
+  assert.equal(r.global, null);
+  assert.equal(r.path, '/dev/enclave-shielded-shm/card-1');
+  assert.equal(r.bytes, '8388608');
+  assert.equal(r.ring, '-1');
+});
+
+test('invalid BAR paths, card IDs and mapping sizes cannot reach the native backend', () => {
+  const r = py(`
+base={'cardId':0,'endpoint':'10.0.2.2:9500','vramGb':1,'shmPath':'/dev/enclave-shielded-shm/card-0','shmBytes':8388608}
+variants=[{'shmPath':'/tmp/private'},{'shmPath':'/dev/enclave-shielded-shm/card-1'},
+ {'cardId':True},{'cardId':16},{'shmBytes':True},{'shmBytes':'8388608'},
+ {'shmBytes':4194304},{'shmBytes':12582912},{'shmBytes':134217728}]
+errors=[]
+for bad in variants:
+ try: wm._shielded_tenant_env({**base,**bad})
+ except ValueError: errors.append(True)
+ else: errors.append(False)
+print(json.dumps(errors))
+`);
+  assert.equal(r.length, 9); assert.ok(r.every(Boolean));
+});
+
 
 test("pool capability probe handles a backend whose registry symbols resolve in the engine", () => {
   const r = py(`

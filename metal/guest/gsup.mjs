@@ -15,6 +15,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
+import { prepareShieldedShm } from './shielded-shm.mjs';
 
 const log = (...a) => { try { fs.writeSync(1, `[gsup] ${a.join(' ')}\n`); } catch {} };
 const readJson = (p, d) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return d; } };
@@ -531,6 +532,11 @@ for (const [id, sw] of shieldedWorkers.entries()) {
             ? Number(sw.vsockPort) : 0;
           if (Number(sw.vsockPort) > 0 && !vsockPort)
             log('shielded worker offers vsock but this guest has no /dev/vsock; tenants stay on TCP');
+          let shm = null;
+          if (sw.shmMib !== undefined) {
+            try { shm = prepareShieldedShm({ ...sw, id }); }
+            catch (e) { log(`shielded card ${id}: shared memory unavailable (${e.message}); retaining socket transport`); }
+          }
           // Tenant knobs from host config (SHIELDED_SPIN_US and friends). Only
           // SHIELDED_* names, only printable strings: the host tunes the
           // backend it already serves, it does not get an env injector into a
@@ -556,6 +562,7 @@ for (const [id, sw] of shieldedWorkers.entries()) {
           writeVerdict({
             ...v.card, endpoint: `${host}:${port}`,
             ...(vsockPort ? { vsockPort } : {}),
+            ...(shm || {}),
             ...(Object.keys(tenantEnv).length ? { tenantEnv } : {}),
             ...(priceSec6 ? { pricePerSec6: priceSec6 } : {}),
             ...(computeShare ? { compute_share: computeShare } : {}),

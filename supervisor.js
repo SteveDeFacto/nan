@@ -4733,6 +4733,7 @@ function shieldedCapacity(cardId = null) {
         verifiedAt: String(v.at || ""),
         endpoint: String(v.endpoint || ""),
         vsockPort: Number(v.vsockPort) || 0,
+        ...shieldedShmSpec(v, id),
         pricePerSec6: Number(v.pricePerSec6) || 0,
         // host-configured tenant knobs (SHIELDED_* only; the guest wrote the
         // file and the manager filters again, this is the middle of three)
@@ -4760,6 +4761,13 @@ function shieldedCapacity(cardId = null) {
     : (_shieldedCache.cards.find(c => c.id === Number(cardId)) || null);
 }
 
+function shieldedShmSpec(v, cardId) {
+  const bytes = v?.shmBytes;
+  return v?.shmPath === `/dev/enclave-shielded-shm/card-${cardId}` &&
+    Number.isInteger(bytes) && bytes >= 8 * 1048576 && bytes <= 64 * 1048576 && !(bytes & (bytes - 1))
+    ? { shmPath: v.shmPath, shmBytes: bytes } : {};
+}
+
 function shieldedPoolCapacity() {
   const cards = _shieldedPool.cardIds.map(id => gpuCards[id]?.proof).filter(Boolean);
   if (cards.length !== _shieldedPool.cardIds.length) return null;
@@ -4783,7 +4791,7 @@ function shieldedLaunchSpec(cardId, gpuShare, vramGb, heldCards) {
       const card = shieldedCapacity(h.cardId);
       if (!card) throw new Error(`Shielded GPU ${h.cardId} is unavailable; refusing a partial pool launch`);
       return { cardId: card.id, deviceUuid: card.deviceUuid, endpoint: card.endpoint,
-        vsockPort: card.vsockPort || 0, vramGb: h.vramGb };
+        vsockPort: card.vsockPort || 0, vramGb: h.vramGb, ...shieldedShmSpec(card, card.id) };
     });
     return { pooled: true, mode: "layers", endpoint: workers[0].endpoint, workers,
       vramGb: workers.reduce((a, w) => a + w.vramGb, 0),
@@ -4795,6 +4803,7 @@ function shieldedLaunchSpec(cardId, gpuShare, vramGb, heldCards) {
     endpoint: card.endpoint, cardId: card.id,
     vramGb: vramGb ?? round1(gpuShare * (card.vramBudgetGb || card.vramGb)),
     ...(card.vsockPort ? { vsockPort: card.vsockPort } : {}),
+    ...shieldedShmSpec(card, card.id),
     ...(Object.keys(card.tenantEnv || {}).length ? { tenantEnv: card.tenantEnv } : {}),
   };
 }

@@ -143,6 +143,8 @@ struct sh_state {
     std::string host = "127.0.0.1";
     int port = 9500, vsock_port = -1, refill_threads = -1;
     uint64_t reserve_bytes = 0;
+    std::string shm_path;
+    uint64_t shm_bytes = 0;
     bool explicit_link = false;
     std::string calib_path;
     bool configured = false;
@@ -365,6 +367,7 @@ static void sh_env_defaults(sh_state &s) {
 }
 
 /* Manager-generated records: host|tcp-port|vsock-port|reservation-bytes,
+ * optionally followed by |card-bound-shm-path|shm-bytes.
  * one per line. Strict parsing is fail-closed: a malformed pool must never
  * turn a paid slice into the legacy uncapped single-worker connection. */
 static void sh_pool_init(sh_pool &p) {
@@ -383,13 +386,14 @@ static void sh_pool_init(sh_pool &p) {
     std::istringstream lines(env);
     std::string line;
     std::set<std::string> endpoints;
+    std::set<std::string> shm_paths;
     std::vector<std::unique_ptr<sh_state>> parsed;
     while (std::getline(lines, line)) {
         std::vector<std::string> parts;
         std::istringstream fields(line);
         std::string part;
         while (std::getline(fields, part, '|')) parts.push_back(part);
-        if (parts.size() != 4 || parts[0].empty() || parts[0].size() > 127 || parsed.size() >= 16 ||
+        if ((parts.size() != 4 && parts.size() != 6) || parts[0].empty() || parts[0].size() > 127 || parsed.size() >= 16 ||
             parts[0].find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-") != std::string::npos) { reject(); return; }
         uint64_t nums[3];
         for (int i = 0; i < 3; i++) {
@@ -400,6 +404,18 @@ static void sh_pool_init(sh_pool &p) {
             !endpoints.insert(parts[0] + ":" + std::to_string(nums[0])).second) { reject(); return; }
         auto s = std::make_unique<sh_state>();
         sh_env_defaults(*s);
+        if (parts.size() == 6) {
+            const std::string prefix = "/dev/enclave-shielded-shm/card-";
+            if (parts[4].compare(0, prefix.size(), prefix) != 0) { reject(); return; }
+            const std::string id = parts[4].substr(prefix.size());
+            if (id.empty() || id.size() > 2 || id.find_first_not_of("0123456789") != std::string::npos ||
+                (id.size() > 1 && id[0] == '0') || atoi(id.c_str()) >= 16 ||
+                !shm_paths.insert(parts[4]).second || parts[5].empty() || parts[5].size() > 8 ||
+                parts[5].find_first_not_of("0123456789") != std::string::npos) { reject(); return; }
+            const uint64_t bytes = strtoull(parts[5].c_str(), nullptr, 10);
+            if (bytes < 8 * 1048576ULL || bytes > 64 * 1048576ULL || (bytes & (bytes - 1))) { reject(); return; }
+            s->shm_path = parts[4]; s->shm_bytes = bytes;
+        }
         s->host = parts[0]; s->port = (int)nums[0]; s->vsock_port = (int)nums[1];
         s->reserve_bytes = nums[2]; s->explicit_link = true;
         double frac = getenv("SHIELDED_WEIGHT_BUDGET_FRAC") ? atof(getenv("SHIELDED_WEIGHT_BUDGET_FRAC")) : .90;
@@ -566,7 +582,12 @@ static bool sh_register(sh_state &s, const ggml_tensor *w) {
         int err = SH_OK;
         s.link = sh_link_open(s.host.c_str(), s.port, true, &err);
         if (!s.link) { s.link_failed = true; return false; }
-        if (s.explicit_link) sh_link_configure(s.link, s.vsock_port, s.reserve_bytes, s.refill_threads);
+        if (s.explicit_link) {
+            sh_link_configure(s.link, s.vsock_port, s.reserve_bytes, s.refill_threads);
+            // Even an empty path is explicit: a global legacy SHM setting
+            // must never bind several pooled cards to the same BAR.
+            sh_link_configure_shm(s.link, s.shm_path.c_str(), s.shm_bytes);
+        }
     }
     int lo = e.f_w[0], hi = e.f_w[0];
     for (int64_t j = 1; j < N; j++) { if (e.f_w[j] < lo) lo = e.f_w[j]; if (e.f_w[j] > hi) hi = e.f_w[j]; }

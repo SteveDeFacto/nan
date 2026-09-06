@@ -137,6 +137,8 @@ void sh_reply_free(sh_reply *r);
  * live, SH_ERR_IO when the ring cannot be used (the pipe stays valid on the
  * socket), SH_ERR_VIOLATION/PROTO when the worker answered nonsense. */
 int  sh_pipe_shm_attach(sh_pipe *p, const char *path, int index, size_t bytes);
+/* First available ring, bounded by the mapping and compiled geometry. */
+int  sh_pipe_shm_attach_available(sh_pipe *p, const char *path, size_t bytes, int *index);
 int  sh_pipe_ring_live(const sh_pipe *p);
 /* One FIELD_GEMM frame over the ring. `want` is the reply length the CALLER
  * expects; a reply of any other length is refused before a byte of it is read.

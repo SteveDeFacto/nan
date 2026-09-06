@@ -231,6 +231,7 @@ const shieldedWorkers = cfg.shieldedWorkers ?? (cfg.shieldedWorker ? [cfg.shield
 if (!Array.isArray(shieldedWorkers) || shieldedWorkers.length > 16)
   throw new Error('shieldedWorkers must be an array of at most 16 workers');
 const workerPorts = new Set(), workerVsockPorts = new Set(), workerDevices = new Set();
+const workerShmPaths = new Set();
 for (const [id, sw] of shieldedWorkers.entries()) {
   if (!sw || typeof sw !== 'object' || Array.isArray(sw))
     throw new Error('Each shielded worker must be an object');
@@ -249,8 +250,17 @@ for (const [id, sw] of shieldedWorkers.entries()) {
   if (sw.device && workerDevices.has(sw.device.toLowerCase()))
     throw new Error('A GPU UUID must not be advertised by multiple workers');
   if (sw.device) workerDevices.add(sw.device.toLowerCase());
-  if (shieldedWorkers.length > 1 && sw.shm)
-    throw new Error('Multi-GPU workers currently use TCP/vsock, not a shared-memory ring');
+  if (sw.shm) {
+    const p = sw.shm.path;
+    const mib = sw.shm.mib ?? 32;
+    if (typeof p !== 'string' || !p.startsWith('/') || /[,\x00-\x1f]/.test(p) ||
+        p.split('/').some(c => c === '.' || c === '..') ||
+        !Number.isInteger(mib) || mib < 8 || mib > 64 || (mib & (mib - 1)))
+      throw new Error('shielded shm needs an absolute path and a power-of-two size of 8..64 MiB');
+    const canonical = p.replace(/\/+/g, '/');
+    if (workerShmPaths.has(canonical)) throw new Error('shielded workers need distinct shared-memory paths');
+    workerShmPaths.add(canonical);
+  }
 }
 // Pool pricing is computed from each probed dedicated slice, never physical
 // VRAM or momentary benchmark speed. The existing registry price buys one pool.
@@ -268,6 +278,7 @@ if (cfg.shieldedPool !== undefined) {
     cardIds: shieldedWorkers.map((_, id) => id) };
 }
 runtimeCfg.shieldedWorkers = [];
+let nextShmIndex = 0;
 for (const [id, sw] of shieldedWorkers.entries()) {
   const port = sw.port || 9500;
   // The C++/CUDA worker when it has been built (make -C shielded/worker-cuda),
@@ -374,7 +385,7 @@ for (const [id, sw] of shieldedWorkers.entries()) {
     ...(Object.keys(tenantEnv).length ? { tenantEnv } : {}),
     // the ring's size in MiB, so the guest can bound its mapping of the BAR
     // (it maps the ivshmem device 1af4:1110 it finds, never a host address)
-    ...(shm ? { shmMib: shm.mib } : {}),
+    ...(shm ? { shmMib: shm.mib, shmIndex: nextShmIndex++ } : {}),
     // the box's ask for a WHOLE shielded card, USD/hour. Config, not a probe
     // result, but it rides with the endpoint so the guest sees one object.
     ...(Number(sw.priceUsdHr) > 0 ? { priceUsdHr: Number(sw.priceUsdHr) } : {}),
@@ -492,9 +503,11 @@ function baseArgs() {
   // The shielded worker's shared-memory ring: the worker's --shm file becomes
   // BAR2 of an ivshmem-plain device. Verified to boot and poll exit-free
   // under SEV-SNP with this OVMF and kernel (2026-08-26, throwaway VM).
-  if (runtimeCfg.shieldedWorker?.shmMib && shieldedWorkers[0]?.shm?.path) {
-    a.push('-object', `memory-backend-file,id=shring,share=on,mem-path=${shieldedWorkers[0].shm.path},size=${runtimeCfg.shieldedWorker.shmMib}M`);
-    a.push('-device', 'ivshmem-plain,memdev=shring');
+  for (const sw of runtimeCfg.shieldedWorkers) {
+    if (!sw.shmMib) continue;
+    const id = `shring${sw.shmIndex}`;
+    a.push('-object', `memory-backend-file,id=${id},share=on,mem-path=${shieldedWorkers[sw.id].shm.path},size=${sw.shmMib}M`);
+    a.push('-device', `ivshmem-plain,memdev=${id}`);
   }
   // model volumes: one read-only virtio-blk disk each. cache=none keeps the
   // host page cache out of it — the guest caches what it reads (verified), and

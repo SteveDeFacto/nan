@@ -227,7 +227,7 @@ const md = path.join(ROOT, 'opt/metal'); fs.mkdirSync(md, { recursive: true });
 // the guest half of the shielded tier is trusted code and must be attested. The
 // worker it talks to is not, and is not shipped here: it runs on the host, is
 // assumed hostile, and its address arrives unmeasured over fw_cfg.
-for (const f of ['gsup.mjs', 'agent.mjs', 'shielded.mjs', 'shielded-probe.mjs'])
+for (const f of ['gsup.mjs', 'agent.mjs', 'shielded.mjs', 'shielded-probe.mjs', 'shielded-shm.mjs'])
   fs.copyFileSync(path.join(HERE, 'guest', f), path.join(md, f));
 // init (PID1), with the kernel version substituted in
 let init = fs.readFileSync(path.join(HERE, 'guest', 'init'), 'utf8').replaceAll('__KVER__', KVER);

@@ -2412,6 +2412,18 @@ def _shielded_profile_tail(rec: dict) -> None:
     threading.Thread(target=run, daemon=True, name=f"shielded-profile-{rec.get('id')}").start()
 
 
+def _shielded_shm_fields(worker: dict):
+    """Only guest-derived, card-bound BAR mappings can enter a native process."""
+    if "shmPath" not in worker and "shmBytes" not in worker:
+        return None
+    card_id, path, size = worker.get("cardId"), worker.get("shmPath"), worker.get("shmBytes")
+    if (type(card_id) is not int or not 0 <= card_id < 16 or
+            path != f"/dev/enclave-shielded-shm/card-{card_id}" or
+            type(size) is not int or not 8 * 1048576 <= size <= 64 * 1048576 or size & (size - 1)):
+        raise ValueError("invalid shielded shared-memory mapping")
+    return path, size
+
+
 def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
     """The env a tenant runs with when its GPU share is a SHIELDED card.
 
@@ -2438,6 +2450,8 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
 
     env.pop("SHIELDED_WORKERS", None)
     env.pop("SHIELDED_VSOCK_PORT", None)
+    for name in ("SHIELDED_SHM", "SHIELDED_SHM_BYTES", "SHIELDED_SHM_RING"):
+        env.pop(name, None)
     workers = (spec or {}).get("workers")
     if (spec or {}).get("pooled"):
         if not isinstance(workers, list) or not 1 <= len(workers) <= 16:
@@ -2459,7 +2473,8 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
             if type(card_id) is not int or not 0 <= card_id < 16 or endpoint in endpoints or (device and device in devices) or card_id in card_ids or (vport > 0 and vport in vsock_ports) or not 0 <= vport <= (1 << 30) or not 0 < reserve <= (1 << 50):
                 raise ValueError("invalid or duplicate shielded pool reservation")
             endpoints.add(endpoint); devices.add(device); card_ids.add(card_id); vsock_ports.add(vport)
-            records.append(f"{host}|{int(port)}|{vport}|{reserve}")
+            shm = _shielded_shm_fields(worker)
+            records.append(f"{host}|{int(port)}|{vport}|{reserve}" + (f"|{shm[0]}|{shm[1]}" if shm else ""))
             total += reserve
         advertised = int(float(spec.get("vramGb") or 0) * (1 << 30))
         if abs(total - advertised) > len(workers):
@@ -2469,6 +2484,12 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
         spec = {**spec, "endpoint": workers[0]["endpoint"], "vsockPort": workers[0].get("vsockPort", 0)}
     elif workers is not None:
         raise ValueError("worker reservations require a shielded pool")
+    else:
+        shm = _shielded_shm_fields(spec or {})
+        if shm:
+            env["SHIELDED_SHM"], size = shm
+            env["SHIELDED_SHM_BYTES"] = str(size)
+            env["SHIELDED_SHM_RING"] = "-1"  # first free ring, bounded by this BAR
     endpoint = str((spec or {}).get("endpoint") or "")
     host, _, port = endpoint.rpartition(":")
     env["SHIELDED_HOST"] = host or "10.0.2.2"
@@ -2538,7 +2559,7 @@ def _shielded_tenant_env(spec: dict, model_volume: str = "") -> dict:
     if isinstance(te, dict):
         for k, v in te.items():
             k = str(k)
-            if k in {"SHIELDED_WORKERS", "SHIELDED_HOST", "SHIELDED_PORT", "SHIELDED_VSOCK_PORT", "SHIELDED_RESERVE_BYTES", "SHIELDED_CALIB"}:
+            if k in {"SHIELDED_WORKERS", "SHIELDED_HOST", "SHIELDED_PORT", "SHIELDED_VSOCK_PORT", "SHIELDED_RESERVE_BYTES", "SHIELDED_CALIB", "SHIELDED_SHM", "SHIELDED_SHM_BYTES", "SHIELDED_SHM_RING"}:
                 continue  # routing, budget and model calibration come from the launch spec
             if not re.fullmatch(r"SHIELDED_[A-Z0-9_]{0,63}", k):
                 print(f"[shielded] tenantEnv: dropping {k[:40]!r} (only SHIELDED_* names may be set from host config)", flush=True)
