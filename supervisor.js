@@ -6034,8 +6034,23 @@ async function launchSpec(rec) {
   return launchSpecFrom(rec, sec, hostsFor(rec));
 }
 
+// A claimed record is visible to the audit while its first launch is still
+// awaiting the manager. Join that launch instead of creating a second VM
+// that reaps the first one and makes its caller release the serving lease.
+// Keep promises outside persisted records; a real supervisor restart must
+// still recover a claimed record whose launch never finished.
+const tenantProvisions = new WeakMap();
+function provisionTenant(rec) {
+  const active = tenantProvisions.get(rec);
+  if (active) return active;
+  const pending = Promise.resolve().then(() => performTenantProvision(rec))
+    .finally(() => tenantProvisions.delete(rec));
+  tenantProvisions.set(rec, pending);
+  return pending;
+}
+
 // Spawn the tenant's MPS-capped worker process (called once, on first payment).
-async function provisionTenant(rec) {
+async function performTenantProvision(rec) {
   try {
     const sp = await spawnContainer(await launchSpec(rec));
     rec._port = sp.internalPort;
@@ -8309,7 +8324,7 @@ async function auditClaims(ledgerById) {
     // an owner restart is mid-flight (stop -> claimed -> provision): the
     // claimed-branch below would double-provision it, and the death check
     // would count the deliberate stop as a crash. The restart route owns it.
-    if (rec._restarting) continue;
+    if (rec._restarting || tenantProvisions.has(rec)) continue;
     // the tick already paged the whole ledger once - one read serves the audit
     // AND the sweep (per-record re-reads were what blew the RPC rate budget)
     const d = ledgerById.get(rec.id.toLowerCase());
@@ -8962,6 +8977,9 @@ async function tryClaim(d, g, firewall, slice, { hinted = false, resume = false 
 // an address, so owner-only routes (status, delete) work unchanged.
 async function adopt(d, g, firewall, slice) {
   const left = deployments.get(d.id);
+  // A concurrent hint/sweep may have completed its prefetch after another
+  // adoption already installed the live record. Never replace that launch.
+  if (left && !CLAIM_TERMINAL.has(left.status)) return;
   if (left) {                                               // terminal leftover from an earlier lease/life
     if (left._gpu) {                                        // a leftover still holding its slice is restore/crash
       releaseGpu(left._gpu); left._gpu = null;              // drift (terminal flips release synchronously) - reclaim
