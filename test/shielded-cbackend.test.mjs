@@ -65,6 +65,17 @@ test("the AVX-512 refill kernels match a scalar exact product on every shape", (
   assert.equal(r.status, 0, `refill-selftest failed: ${r.signal || r.status} ${r.stderr || ""}`);
 });
 
+// Dealt pads (shielded/dealer/PLAN.md): a shipment minted from synthetic weights
+// reads back against an exact oracle, a flipped byte is refused, a foreign key
+// sees nothing, the ledger window advances before use, and the link's own
+// import path yields the same pads. No worker, no AVX-512 requirement.
+test("dealt pads: mint, read back, tamper, exhaustion, ledger window, link import", (t) => {
+  if (!build()) return t.skip("no toolchain for the C backend");
+  const r = spawnSync(join(dir, "dealt-selftest"), { encoding: "utf8", timeout: 300_000 });
+  assert.equal(r.status, 0, `dealt-selftest failed: ${r.signal || r.status} ${r.stderr || ""}`);
+  assert.match(r.stdout, /dealt-selftest: ok/);
+});
+
 // The scales are half of THE encoding, so their fp32->fp16 conversion is part of
 // the contract too. Truncating instead of rounding to nearest-even lands one ulp
 // low on about half of all blocks and fails NOWHERE -- the two sides simply derive

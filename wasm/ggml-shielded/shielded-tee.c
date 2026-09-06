@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "shielded-tee.h"
+#include "shielded-pads.h"
 #include "shielded-field.h"
 
 #include <errno.h>
@@ -221,6 +222,8 @@ static void chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out
     }
     for (int i = 0; i < 16; i++) out[i] = x[i] + s[i];
 }
+/* The same block, for the dealt-pad derivation (shielded-pads.c). */
+void sh_chacha20_block(const uint32_t key[8], uint64_t counter, uint32_t out[16]) { chacha20_block(key, counter, out); }
 
 typedef struct {
     pthread_mutex_t mu;
@@ -304,6 +307,7 @@ typedef struct {
     int32_t  *u_store;          /* depth x u_len, balanced */
     uint64_t pads_used, pads_missed;
     double on_path_ms;          /* request-thread counters; refill threads do not write them */
+    uint64_t cursor;            /* dealt pads: the next shipment index this group imports */
 } sh_group;
 
 struct sh_link {
@@ -341,6 +345,17 @@ struct sh_link {
     uint8_t *gplanes; size_t gplanes_cap;
     int32_t *acc;     size_t acc_cap;
     uint8_t *hdr;     size_t hdr_cap;
+
+    /* Dealt pads (shielded-pads.h, shielded/dealer/PLAN.md): the ring is
+     * filled from shipments on disk, r is derived from pad_seed, every index
+     * is consumed inside a ledger window reserved BEFORE use, and nothing is
+     * ever minted on the request path (a dry ring stalls the request). */
+    bool       dealt;
+    char       pad_dir[512], pad_ledger[512];
+    uint8_t    pad_seed[32], pad_seed_id[16], pad_sk[32];
+    uint64_t   pad_window, win_lo, win_hi;
+    int        pad_bank_wait_ms;
+    sh_pads_reader *pads;
 
     uint64_t   exchanges, macs, verify_fail, pads_used, pads_missed;
     uint64_t   pads_waited;
@@ -412,6 +427,26 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     l->target_ms    = env_int("SHIELDED_REFILL_TARGET_MS", 6, 1, 10000);
     l->warm_ms      = env_int("SHIELDED_WARM_MS", 5000, 0, 600000);
     l->pad_wait_us  = env_int("SHIELDED_PAD_WAIT_US", 0, 0, 50000);
+    /* Dealt mode: all four are required together, or the link refuses to open
+     * rather than silently minting its own pads. */
+    const char *pad_dir = getenv("SHIELDED_PAD_SOURCE");
+    if (pad_dir && *pad_dir) {
+        const char *ledger = getenv("SHIELDED_PAD_LEDGER");
+        snprintf(l->pad_dir, sizeof l->pad_dir, "%s", pad_dir);
+        snprintf(l->pad_ledger, sizeof l->pad_ledger, "%s", ledger && *ledger ? ledger : "");
+        const bool ok = sh_pads_hex2bin(getenv("SHIELDED_PAD_SEED"), l->pad_seed, 32)
+                     && sh_pads_hex2bin(getenv("SHIELDED_PAD_SEED_ID"), l->pad_seed_id, 16)
+                     && sh_pads_hex2bin(getenv("SHIELDED_PAD_SK"), l->pad_sk, 32)
+                     && l->pad_ledger[0];
+        if (!ok) {
+            pthread_mutex_destroy(&l->pool_mu); pthread_cond_destroy(&l->need_refill); pthread_cond_destroy(&l->pool_filled);
+            pthread_mutex_destroy(&l->bank.mu);
+            free(l); if (err) *err = SH_ERR_RANGE; return NULL;
+        }
+        l->dealt = true;
+        l->pad_window  = (uint64_t)env_int("SHIELDED_PAD_WINDOW", 64, 1, 1 << 20);
+        l->pad_bank_wait_ms = env_int("SHIELDED_PAD_WAIT_MS", 10000, 0, 600000);
+    }
     l->refill_cost_priority = env_int("SHIELDED_REFILL_COST_PRIORITY", 0, 0, 1);
     if (err) *err = SH_OK;
     return l;
@@ -465,10 +500,13 @@ void sh_link_close(sh_link *l) {
     free(l->rp); free(l->up); free(l->slots);
     free(l->r); free(l->u); free(l->planes); free(l->gplanes); free(l->acc); free(l->hdr);
     sh_pipe_close(l->pipe);
+    sh_pads_reader_close(l->pads);
     pthread_mutex_destroy(&l->pool_mu); pthread_cond_destroy(&l->need_refill); pthread_cond_destroy(&l->pool_filled);
     pthread_mutex_destroy(&l->bank.mu);
+    memset(l->pad_seed, 0, sizeof l->pad_seed); memset(l->pad_sk, 0, sizeof l->pad_sk);
     free(l);
 }
+
 
 /* fv_prepare over row ranges on several threads: the products of the ranges
  * are independent and sum mod P2. Registration is serial in the engine's
@@ -660,6 +698,30 @@ static sh_group *pick_refill_group(sh_link *l, int B, int *deficit) {
     return best;
 }
 
+/* Dealt pads: fill b slots of group gi from the shipments - r derived from
+ * the seed, u read and opened. Waits up to pad_wait_ms for a bank that has
+ * not prefetched the index yet; past that the bank is behind and the link
+ * stops (a dealt engine never mints for itself). */
+static int dealt_import(sh_link *l, const sh_group *g, uint32_t gi, uint64_t index0, int b, int32_t *r_out, int32_t *u_out) {
+    for (int i = 0; i < b; i++) {
+        const uint64_t index = index0 + (uint64_t)i;
+        sh_pad_r(l->pad_seed, gi, index, g->K, r_out + (size_t)i * g->K);
+        const double t0 = now_ms();
+        int rc;
+        for (;;) {
+            rc = sh_pads_reader_cell(l->pads, gi, index, u_out + (size_t)i * g->u_len);
+            if (rc != SH_ERR_EXHAUST || l->stop || now_ms() - t0 >= (double)l->pad_bank_wait_ms) break;
+            usleep(50000);
+        }
+        if (rc != SH_OK) {
+            snprintf(l->err, sizeof l->err, "dealt pads: group %u index %llu %s", gi, (unsigned long long)index,
+                     rc == SH_ERR_EXHAUST ? "not in any shipment (bank behind)" : rc == SH_ERR_VERIFY ? "failed to open (tampered or wrong key)" : "unreadable");
+            return rc;
+        }
+    }
+    return SH_OK;
+}
+
 static void *refill_main(void *arg) {
     sh_link *l = (sh_link *)arg;
     gen_scratch s;
@@ -694,13 +756,32 @@ static void *refill_main(void *arg) {
         }
         const int b = deficit < B ? deficit : B;
         const int first = (g->head + g->count + g->generating) % g->depth;
+        uint64_t index0 = 0;
+        if (l->dealt) {
+            /* Reserve-before-use: no index is imported unless the ledger's
+             * mark is already past it, so a restart can never replay one. */
+            if (g->cursor + (uint64_t)b > l->win_hi) {
+                uint64_t lo, hi;
+                if (sh_pads_window_reserve(l->pad_ledger, l->pad_window, &lo, &hi) != SH_OK || lo != l->win_hi) {
+                    snprintf(l->err, sizeof l->err, "dealt pads: ledger window refused; stopping");
+                    l->stop = true;
+                    pthread_cond_broadcast(&l->pool_filled);
+                    pthread_mutex_unlock(&l->pool_mu);
+                    goto done;
+                }
+                l->win_hi = hi;
+            }
+            index0 = g->cursor;
+            g->cursor += (uint64_t)b;
+        }
         g->generating += b;
         pthread_mutex_unlock(&l->pool_mu);
 
         const bool direct = first + b <= g->depth;
         int32_t *r_out = direct ? g->r_store + (size_t)first * g->K     : r;
         int32_t *u_out = direct ? g->u_store + (size_t)first * g->u_len : u;
-        const int rc = generate(l, g, b, r_out, u_out, &s);
+        const int rc = l->dealt ? dealt_import(l, g, (uint32_t)(g - l->groups), index0, b, r_out, u_out)
+                                : generate(l, g, b, r_out, u_out, &s);
         if (rc == SH_OK && !direct) {
             for (int i = 0; i < b; i++) {
                 const int slot = (first + i) % g->depth;
@@ -746,6 +827,7 @@ done:
 #define SH_REFILL_GMACS_PER_CORE 250.0
 static int derive_threads(const sh_link *l) {
     if (l->threads_env >= 0) return l->threads_env;
+    if (l->dealt) return 2;                    /* reading and opening cells, not MACs */
     double macs = 0;
     for (size_t i = 0; i < l->n_nodes; i++) macs += (double)l->nodes[i].K * (double)l->nodes[i].N;
     const double core_ms = 3.0 * macs / (SH_REFILL_GMACS_PER_CORE * 1e9) * 1e3;
@@ -766,9 +848,32 @@ static int derive_threads(const sh_link *l) {
     return want;
 }
 
+/* Dealt mode: open the shipment reader against this link's group table and
+ * take the first ledger window. Every group starts at the window's low edge. */
+static int dealt_open(sh_link *l) {
+    if (!l->dealt) return SH_OK;
+    if (!l->pads) {
+        int err = SH_OK;
+        l->pads = sh_pads_reader_open(l->pad_dir, l->pad_seed_id, l->pad_sk, &err);
+        if (!l->pads) { snprintf(l->err, sizeof l->err, "dealt pads: cannot read %s", l->pad_dir); return err ? err : SH_ERR_IO; }
+    }
+    sh_pads_group *table = (sh_pads_group *)calloc(l->n_groups ? l->n_groups : 1, sizeof *table);
+    if (!table) return SH_ERR_NOMEM;
+    int rc = sh_link_group_table(l, table, (uint32_t)l->n_groups);
+    if (rc >= 0) rc = sh_pads_reader_bind(l->pads, table, (uint32_t)l->n_groups);
+    free(table);
+    if (rc < 0) { snprintf(l->err, sizeof l->err, "dealt pads: no shipment matches this model's groups"); return rc; }
+    uint64_t lo, hi;
+    if (sh_pads_window_reserve(l->pad_ledger, l->pad_window, &lo, &hi) != SH_OK) { snprintf(l->err, sizeof l->err, "dealt pads: ledger %s unusable", l->pad_ledger); return SH_ERR_IO; }
+    l->win_lo = lo; l->win_hi = hi;
+    for (size_t i = 0; i < l->n_groups; i++) l->groups[i].cursor = lo;
+    return SH_OK;
+}
+
 static int start_pools(sh_link *l) {
     stop_threads(l);
     free_pools(l);
+    { const int rc = dealt_open(l); if (rc != SH_OK) return rc; }
     for (size_t i = 0; i < l->n_groups; i++) {
         sh_group *g = &l->groups[i];
         /* A batched step takes m pads from a group at once, and the pool is
@@ -1150,6 +1255,11 @@ int sh_link_gemm(sh_link *l, const int *nodes, size_t n_nodes,
         l->rp[i] = g->r_store + (size_t)l->slots[i] * K;
         l->up[i] = g->u_store + (size_t)l->slots[i] * g->u_len;
     }
+    if (took < m && l->dealt) {
+        /* A dealt engine has no key to mint with; the bank is behind. */
+        snprintf(l->err, sizeof l->err, "dealt pads: %d of %d ready for group %s; the bank is behind", took, m, l->nodes[g->nodes[0]].name);
+        rc = SH_ERR_EXHAUST; goto fail;
+    }
     if (took < m) {
         const int miss = m - took;
         if ((rc = ensure((void **)&l->r,       &l->r_cap,       (size_t)miss * K * sizeof(int32_t))) != SH_OK) goto fail;
@@ -1271,4 +1381,73 @@ fail:
      * releasing the slots lets a refill overwrite them, never re-issues them. */
     release_pads(l, g, took);
     return rc;
+}
+
+/* ---- dealt pads: the group table and the dealer's mint ------------------- */
+int sh_link_group_table(const sh_link *l, sh_pads_group *out, uint32_t cap) {
+    if (!l || l->n_groups > cap) return SH_ERR_RANGE;
+    for (size_t i = 0; i < l->n_groups; i++) {
+        const sh_group *g = &l->groups[i];
+        memset(&out[i], 0, sizeof out[i]);
+        out[i].group = (uint32_t)i; out[i].K = (uint32_t)g->K; out[i].u_len = (uint64_t)g->u_len;
+        snprintf(out[i].name, SH_PADS_NAME_MAX, "%s", l->nodes[g->nodes[0]].name);
+    }
+    return (int)l->n_groups;
+}
+
+int sh_link_mint_shipment(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
+                          uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path) {
+    if (!l || !l->n_groups || !count) return SH_ERR_RANGE;
+    enum { B = 16 };
+    sh_pads_group *table = (sh_pads_group *)calloc(l->n_groups, sizeof *table);
+    if (!table) return SH_ERR_NOMEM;
+    int rc = sh_link_group_table(l, table, (uint32_t)l->n_groups);
+    if (rc < 0) { free(table); return rc; }
+    int err = SH_OK;
+    sh_pads_writer *w = sh_pads_writer_open(path, model_digest, seed_id, table, (uint32_t)l->n_groups, index0, count, consumer_pk, &err);
+    free(table);
+    if (!w) return err;
+    gen_scratch s;
+    int32_t *r = (int32_t *)malloc((size_t)B * l->Kmax * sizeof(int32_t));
+    int32_t *u = (int32_t *)malloc((size_t)B * l->ulen_max * sizeof(int32_t));
+    if (gen_scratch_init(l, &s, B) != SH_OK || !r || !u) { free(r); free(u); sh_pads_writer_close(w); return SH_ERR_NOMEM; }
+    rc = SH_OK;
+    for (size_t gi = 0; gi < l->n_groups && rc == SH_OK; gi++) {
+        const sh_group *g = &l->groups[gi];
+        const int64_t K = g->K;
+        for (uint64_t i0 = 0; i0 < count && rc == SH_OK; i0 += B) {
+            const int b = (int)((count - i0) < B ? (count - i0) : B);
+            for (int i = 0; i < b; i++) sh_pad_r(seed, (uint32_t)gi, index0 + i0 + (uint64_t)i, K, r + (size_t)i * K);
+            l->simd->pad_planes(r, (size_t)b * K, s.planes, s.planes + (size_t)b * K, s.planes + (size_t)2 * b * K);
+            for (int n = 0; n < g->n_nodes; n++) {
+                const sh_node *nd = &l->nodes[g->nodes[n]];
+                l->simd->refill(s.planes, b, nd->w, K, nd->N, u + nd->u_off, g->u_len, s.acc);
+            }
+            for (int i = 0; i < b && rc == SH_OK; i++) rc = sh_pads_writer_cell(w, index0 + i0 + (uint64_t)i, (uint32_t)gi, u + (size_t)i * g->u_len);
+        }
+    }
+    free(r); free(u); free(s.planes); free(s.acc);
+    const int crc = sh_pads_writer_close(w);
+    return rc != SH_OK ? rc : crc;
+}
+
+/* Test hook: dealt mode without a worker. Opens the shipments, binds the
+ * groups, takes a window, and imports `rows` pads per group through the same
+ * path the refill threads use. Returns the number of rows imported, or an
+ * error; dealt-selftest.c checks them against the shipment's plaintext. */
+int sh_link_dealt_selftest(sh_link *l, int rows, int32_t *r_out, int32_t *u_out) {
+    if (!l || !l->dealt || !l->n_groups) return SH_ERR_RANGE;
+    int rc = dealt_open(l);
+    if (rc != SH_OK) return rc;
+    int done = 0;
+    for (size_t gi = 0; gi < l->n_groups; gi++) {
+        sh_group *g = &l->groups[gi];
+        const uint64_t index0 = g->cursor;
+        if (index0 + (uint64_t)rows > l->win_hi) return SH_ERR_EXHAUST;
+        g->cursor += (uint64_t)rows;
+        rc = dealt_import(l, g, (uint32_t)gi, index0, rows, r_out + (size_t)done * l->Kmax, u_out + (size_t)done * l->ulen_max);
+        if (rc != SH_OK) return rc;
+        done += rows;
+    }
+    return done;
 }

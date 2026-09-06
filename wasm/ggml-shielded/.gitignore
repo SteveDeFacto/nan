@@ -12,3 +12,4 @@ libggml-shielded.so
 bench-batch
 bench-spec
 refill-selftest
+dealt-selftest

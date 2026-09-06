@@ -8,7 +8,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC
 LDLIBS  += -lm
 
-CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c
+CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c tweetnacl.c
 CORE_OBJ := $(CORE_SRC:.c=.o) shielded-simd-avx512.o shielded-simd-generic.o
 LDLIBS   += -lpthread
 
@@ -26,7 +26,7 @@ GGML_INC := -I$(GGML_SRC)/ggml/include -I$(GGML_SRC)/ggml/src
 CXX      ?= c++
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fPIC
 
-all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest
+all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest
 
 # Built only where an engine checkout exists; `make ggml` opts in.
 ggml: ggml-test
@@ -66,6 +66,11 @@ half-selftest: half-selftest.c shielded-field.o
 
 # The refill kernels against a scalar exact product (exit 77 = no AVX-512 VNNI here).
 refill-selftest: refill-selftest.c shielded-simd-avx512.o shielded-field.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Dealt pads end to end on synthetic weights: mint, read back against an
+# exact oracle, tamper, exhaustion, ledger window, the link's own import.
+dealt-selftest: dealt-selftest.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ggml-shielded.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielded-tee.h shielded-field.h shielded-simd.h
@@ -110,6 +115,6 @@ bench-spec: bench-spec.cpp ../llama-shim/enclave_llama.h
 	  -L$(GGML_LIB) -lenclave_llama -lllama -lggml -lggml-base -ldl -Wl,-rpath,$(GGML_LIB)
 
 clean:
-	rm -f $(CORE_OBJ) ggml-shielded-dl.o shielded-probe field-selftest prepare-selftest half-selftest refill-selftest ggml-shielded.o ggml-test shielded-run shielded-calib libggml-shielded.so bench-batch bench-spec
+	rm -f $(CORE_OBJ) ggml-shielded-dl.o shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest ggml-shielded.o ggml-test shielded-run shielded-calib libggml-shielded.so bench-batch bench-spec
 
 .PHONY: all clean ggml run calib bench

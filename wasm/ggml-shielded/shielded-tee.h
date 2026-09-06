@@ -32,6 +32,7 @@
 #define SHIELDED_TEE_H
 
 #include <stdbool.h>
+#include "shielded-pads.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,6 +67,16 @@ typedef struct sh_link sh_link;
  * and at start:
  *   SHIELDED_VSOCK_PORT      try AF_VSOCK to the host on this port before TCP;
  *                            unset = the TCP port number when /dev/vsock exists, 0 = never */
+/* Dealt pads (shielded-pads.h, shielded/dealer/PLAN.md), all read at open and
+ * required TOGETHER - a partial set refuses to open rather than minting:
+ *   SHIELDED_PAD_SOURCE      directory of .pads shipments (the operator's bank)
+ *   SHIELDED_PAD_SEED        64 hex: the 32-byte seed r is derived from
+ *   SHIELDED_PAD_SEED_ID     32 hex: names the seed; shipments carry it
+ *   SHIELDED_PAD_SK          64 hex: this consumer's X25519 pad secret key
+ *   SHIELDED_PAD_LEDGER      path of the ledger file (P1: local; P2: platform)
+ *   SHIELDED_PAD_WINDOW      indices reserved per ledger call (default 64)
+ *   SHIELDED_PAD_WAIT_MS     how long a refill waits for a missing index
+ *                            before the link stops (default 10000) */
 sh_link *sh_link_open(const char *host, int port, bool verify, int *err);
 /* Explicit per-link transport/reservation for a pooled tenant. Call before start;
  * avoids mutating process-wide environment while other links refill/reconnect. */
@@ -114,6 +125,16 @@ bool sh_link_verify(const sh_link *l, int node, const int64_t *x, const int64_t 
 
 /* Counters, for the probe and for tests. */
 void sh_link_stats(const sh_link *l, uint64_t *exchanges, uint64_t *macs, uint64_t *verify_fail);
+
+/* Dealt pads. The group table this link would bind a shipment against
+ * (ordinal, first node's name, K, u_len); returns the group count. */
+int sh_link_group_table(const sh_link *l, sh_pads_group *out, uint32_t cap);
+/* The dealer's mint: with the model's weights registered (no worker needed),
+ * write one shipment of `count` indices from `index0` for every group, r from
+ * `seed`, cells boxed to `consumer_pk`. */
+int sh_link_dealt_selftest(sh_link *l, int rows, int32_t *r_out, int32_t *u_out);
+int sh_link_mint_shipment(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
+                          uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path);
 /* Pool health: pads consumed, and how many had to be generated on the
  * request path because the pool was dry (the number that should be ~0). */
 void sh_link_pool_stats(const sh_link *l, uint64_t *consumed, uint64_t *missed);

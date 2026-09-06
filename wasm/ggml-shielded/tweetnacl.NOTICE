@@ -1,0 +1,8 @@
+tweetnacl.c / tweetnacl.h -- TweetNaCl 20140427, public domain
+(Daniel J. Bernstein, Bernard van Gastel, Wesley Janssen, Tanja Lange,
+Peter Schwabe, Sjaak Smetsers). Fetched 2026-09-02 from
+https://tweetnacl.cr.yp.to/20140427/tweetnacl.c and tweetnacl.h.
+sha256 02e65bc3013ff2168983365e55906bc783c4c7e0a60d8100f17bb303a17175c4  tweetnacl.c
+sha256 43f29ad721d9927b747b0100ab4160c119e7bb180c7c98a66e4bf79d31244287  tweetnacl.h
+Used for the pVM's Ed25519 transport key (crypto_sign_keypair). randombytes()
+is supplied by anchor_payload.c from the guest's getrandom(2).
