@@ -21,9 +21,12 @@ FROM ${WASMTIME_IMAGE} AS wasmtime
 # CPU-only engine changes do not require rebuilding wasmtime or CUDA. Rebuild
 # this dlopened module from the SAME llama revision and ABI flags as the pinned
 # toolchain; all other engine libraries still come from that toolchain image.
-FROM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS ggml-cpu-build
+# Match the Ubuntu 22.04 / GCC 11 toolchain that produced the shipped module.
+# A compiler change would confound both floating-point and performance checks.
+FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS ggml-cpu-build
 ARG GGML_CPU_COMMIT=ddd4ec1428a6201e18975ea52b07c71e0f9aef26
-RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc-11 g++-11 cmake make git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN git init -q /src/llama && cd /src/llama \
     && git remote add origin https://github.com/ggml-org/llama.cpp \
@@ -31,6 +34,7 @@ RUN git init -q /src/llama && cd /src/llama \
 COPY llamacpp-parallel-copy.patch /tmp/parallel-copy.patch
 RUN cd /src/llama && git apply /tmp/parallel-copy.patch \
     && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
        -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
        -DCMAKE_C_FLAGS=-DGGML_MAX_NAME=128 -DCMAKE_CXX_FLAGS=-DGGML_MAX_NAME=128 \
        -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
