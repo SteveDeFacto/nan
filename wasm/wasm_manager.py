@@ -6067,6 +6067,7 @@ class _CpuProfile:
         self.state = "idle"
         self.timer = None
         self.seconds = None
+        self.error = None
 
     @classmethod
     def prepare(cls, config, env):
@@ -6078,6 +6079,8 @@ class _CpuProfile:
             return None
         if not pathlib.Path(cls.LIB).is_file():
             raise ValueError("CPU profiler is unavailable in this runtime")
+        if not pathlib.Path("/proc/self/status").is_file() or not pathlib.Path("/proc/self/maps").is_file():
+            raise ValueError("CPU profiling requires native procfs (status and mappings)")
         profile = cls()
         env["LD_PRELOAD"] = " ".join(filter(None, [cls.LIB, env.get("LD_PRELOAD")]))
         env.update(CPUPROFILE=str(profile.directory / "capture"),
@@ -6127,8 +6130,9 @@ class _CpuProfile:
             self.timer.start()
             try:
                 self._signal(True)
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError) as e:
                 self.state = "uncertain"
+                self.error = str(e)[:300]
                 raise
             return self._metadata()
 
@@ -6143,14 +6147,15 @@ class _CpuProfile:
                         self.state = "complete"
                     else:
                         self.state = "incomplete"
-                except (OSError, RuntimeError):
+                except (OSError, RuntimeError) as e:
                     self.state = "incomplete"
+                    self.error = str(e)[:300]
             if self.timer:
                 self.timer.cancel()
             return self._metadata()
 
     def _metadata(self):
-        return {"state": self.state, "seconds": self.seconds, "frequencyHz": 49,
+        return {"state": self.state, "seconds": self.seconds, "frequencyHz": 49, "error": self.error,
                 "format": "gperftools", "oneCapturePerProcess": True}
 
     def read(self):

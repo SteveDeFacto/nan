@@ -65,6 +65,18 @@ p.cleanup()
 `);
 });
 
+test("a chroot without procfs refuses profiling before touching the process environment", () => {
+  python(`
+env = {}
+with patch.object(pathlib.Path, 'is_file', lambda self: str(self) == m._CpuProfile.LIB):
+ try: m._CpuProfile.prepare('{"nnCpuProfile":true}', env)
+ except ValueError as e: assert 'procfs' in str(e)
+ else: raise AssertionError('missing process mappings accepted')
+assert env == {}
+assert list(m.LOG_DIR.iterdir()) == []
+`);
+});
+
 test("dead generations are never signalled and failed acknowledgements stay bounded", () => {
   python(`
 p = m._CpuProfile()
@@ -75,6 +87,7 @@ else: raise AssertionError('dead process accepted')
 assert p.state == 'uncertain'
 time.sleep(1.1)
 assert p.state == 'incomplete'
+assert p.read()['error'] == 'Profile process has exited'
 assert 'data' not in p.read()
 p.cleanup()
 `);

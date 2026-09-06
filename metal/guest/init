@@ -121,6 +121,13 @@ mkdir -p /opt/roots/wasm/etc && cp /etc/resolv.conf /opt/roots/wasm/etc/resolv.c
 mkdir -p /opt/roots/wasm/dev
 mount --rbind /dev /opt/roots/wasm/dev 2>/dev/null || log "WARNING: /dev rbind into wasm chroot failed"
 
+# Native process inspection (profiler mappings, signal handlers, socket audit).
+# This is the CVM's procfs, read-only and outside every tenant WASI preopen.
+# A chroot without it can launch apps but cannot inspect its own children.
+mkdir -p /opt/roots/wasm/proc
+mount -t proc -o ro,nosuid,nodev,noexec proc /opt/roots/wasm/proc 2>/dev/null \
+  || log "WARNING: read-only procfs mount into wasm chroot failed"
+
 log "handing off to gsup"
 exec /usr/local/bin/node /opt/metal/gsup.mjs
 # if gsup ever returns, don't leave a dead CVM wedged — reboot so the host
