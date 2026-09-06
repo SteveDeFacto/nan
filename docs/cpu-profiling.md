@@ -31,3 +31,21 @@ Sampling measures CPU execution, including background worker threads. It
 does not measure time blocked waiting for GPU work. Interpret CPU samples
 alongside the engine's request/phase timings; do not add background CPU
 time to request wall time.
+
+## Independent CPU scheduling controls
+
+Two optional configuration fields support controlled comparisons after profiling:
+
+* `nnShieldedRefillPriority`: `"deficit"` preserves the existing scheduler;
+  `"cost"` weights nonurgent full-batch deficits by matrix work per pad.
+  Urgent groups retain priority, and both policies preserve batch eligibility,
+  pool sizes, thread counts, and one-use mask reservations. Omission preserves
+  the existing policy.
+* `nnOmpSpinCount`: an integer from 0 to 1000000, passed as the native
+  `GOMP_SPINCOUNT`. This bounds OpenMP busy waiting before passive waiting;
+  it does not change the number of compute threads. Omission preserves the
+  runtime's existing setting.
+
+Measure each change separately with CPU sampling disabled. The periodic
+native profile line reports both settings. These are experimental controls;
+neither changes default scheduling until an application opts in.

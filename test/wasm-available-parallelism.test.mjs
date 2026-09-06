@@ -100,3 +100,14 @@ test("per-app shielded transport selection cannot change routes or reservations"
   for (const c of ['{}', '[]', 'invalid', '{"nnShieldedTransport":true}'])
     assert.deepEqual(mgr(`m._nn_shielded_transport_for(${JSON.stringify(c)})`), {});
 });
+
+test("CPU wait and refill policies are independent bounded opt-ins", () => {
+  assert.deepEqual(mgr(`m._nn_cpu_wait_env('{"nnOmpSpinCount":1000}')`), { GOMP_SPINCOUNT: "1000" });
+  assert.deepEqual(mgr(`m._nn_cpu_wait_env('{"nnShieldedRefillPriority":"cost"}')`), { SHIELDED_REFILL_COST_PRIORITY: "1" });
+  assert.deepEqual(mgr(`m._nn_cpu_wait_env('{"nnOmpSpinCount":0,"nnShieldedRefillPriority":"deficit"}')`),
+    { GOMP_SPINCOUNT: "0", SHIELDED_REFILL_COST_PRIORITY: "0" });
+  for (const config of ['{}', '[]', 'invalid', '{"nnOmpSpinCount":true}', '{"nnOmpSpinCount":"0"}',
+    '{"nnOmpSpinCount":-1}', '{"nnOmpSpinCount":1000001}', '{"nnShieldedRefillPriority":true}',
+    '{"nnShieldedRefillPriority":"arbitrary","GOMP_SPINCOUNT":"INFINITE"}'])
+    assert.deepEqual(mgr(`m._nn_cpu_wait_env(${JSON.stringify(config)})`), {});
+});

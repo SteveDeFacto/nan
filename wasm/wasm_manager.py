@@ -3532,6 +3532,21 @@ def _available_parallelism_for(cpu_share: float) -> int:
     return max(1, min(NODE_VCPUS, math.ceil(cpu_share * NODE_VCPUS)))
 
 
+def _nn_cpu_wait_env(config: str) -> dict:
+    """Independent, opt-in CPU scheduling experiments; no resource changes."""
+    result = {}
+    spins = _nn_cfg_int(config, "nnOmpSpinCount", 0, 1000000)
+    if spins is not None:
+        result["GOMP_SPINCOUNT"] = str(spins)
+    try:
+        priority = json.loads(config).get("nnShieldedRefillPriority")
+    except (ValueError, AttributeError, TypeError):
+        priority = None
+    if priority in ("deficit", "cost"):
+        result["SHIELDED_REFILL_COST_PRIORITY"] = "1" if priority == "cost" else "0"
+    return result
+
+
 def _nn_threads_for(enclave_config, cpu_share: float):
     """Optional ggml compute-thread limit, bounded by this tenant's CPU share.
 
@@ -5538,6 +5553,7 @@ def _spawn_and_wait(rec, ctx):
         if pw is not None:
             env["SHIELDED_PAD_WAIT_US"] = str(pw)
         env.update(_nn_shielded_transport_for(enclave_config))
+        env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's
         # ENCLAVE_GGML_N_RS_SEQ, read at ggml server-context creation):
         # deployment-config `nnRsSeq`, wasmtime PROCESS env like the MPS

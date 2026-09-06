@@ -330,7 +330,7 @@ struct sh_link {
     pthread_cond_t  pool_filled;   /* a pad was published (start waits on it) */
     pthread_t *threads; int n_threads; bool threads_running, stop;
     int threads_env;               /* SHIELDED_REFILL_THREADS, or -1 = derive from the weights */
-    int pool_depth, refill_batch, target_ms, warm_ms, pad_wait_us;
+    int pool_depth, refill_batch, target_ms, warm_ms, pad_wait_us, refill_cost_priority;
     int64_t Kmax, Nmax, ulen_max;
 
     /* request-path scratch (caller thread) */
@@ -379,6 +379,7 @@ void sh_link_node_pool_stats(const sh_link *l, int node, uint64_t *consumed,
     if (on_path_ms) *on_path_ms = g ? g->on_path_ms : 0;
 }
 int sh_link_refill_threads(const sh_link *l) { return l ? l->n_threads : 0; }
+const char *sh_link_refill_priority(const sh_link *l) { return l && l->refill_cost_priority ? "cost" : "deficit"; }
 int sh_link_reply_width(const sh_link *l) { return l && l->pipe ? l->ywidth : 0; }
 
 static int env_int(const char *name, int dflt, int lo, int hi) {
@@ -411,6 +412,7 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     l->target_ms    = env_int("SHIELDED_REFILL_TARGET_MS", 6, 1, 10000);
     l->warm_ms      = env_int("SHIELDED_WARM_MS", 5000, 0, 600000);
     l->pad_wait_us  = env_int("SHIELDED_PAD_WAIT_US", 0, 0, 50000);
+    l->refill_cost_priority = env_int("SHIELDED_REFILL_COST_PRIORITY", 0, 0, 1);
     if (err) *err = SH_OK;
     return l;
 }
@@ -627,6 +629,37 @@ static int generate(sh_link *l, const sh_group *g, int b, int32_t *r_out, int32_
 /* Slots a refill may write: everything that is not ready, held or reserved. */
 static int group_deficit(const sh_group *g) { return g->depth - g->count - g->held - g->generating; }
 
+/* Urgent groups always win, lowest ready+reserved count first. Among groups
+ * with a full batch missing, the optional cost policy prepares expensive
+ * masks earlier: a vocabulary projection otherwise waits behind many small
+ * groups until it is nearly empty, then stalls decode on a single-row refill.
+ * Eligibility, batch size, ring reservations and one-use pads are unchanged.
+ * Cast before multiplying so even large dimensions cannot overflow integers. */
+static sh_group *pick_refill_group(sh_link *l, int B, int *deficit) {
+    sh_group *best = NULL;
+    int best_low = -1;
+    double best_score = -1;
+    *deficit = 0;
+    for (size_t i = 0; i < l->n_groups; i++) {
+        sh_group *c = &l->groups[i];
+        const int d = group_deficit(c);
+        if (d <= 0) continue;
+        const int coming = c->count + c->generating;
+        if (coming < B) {
+            if (best_low < 0 || coming < best_low) {
+                best = c; *deficit = d; best_low = coming;
+            }
+        } else if (best_low < 0 && d >= B) {
+            double score = (double)d;
+            if (l->refill_cost_priority) score *= (double)c->K * (double)c->u_len;
+            if (score > best_score) {
+                best = c; *deficit = d; best_score = score;
+            }
+        }
+    }
+    return best;
+}
+
 static void *refill_main(void *arg) {
     sh_link *l = (sh_link *)arg;
     gen_scratch s;
@@ -651,18 +684,11 @@ static void *refill_main(void *arg) {
              * that is LOW (fewer than a batch ready or coming) is refilled at
              * once with whatever fits -- at start-up that is every group in
              * turn, so the first token finds a pad in each -- and otherwise a
-             * group is refilled only once a whole batch fits, largest deficit
-             * first. Lowest-first among the low ones. */
-            int best_low = -1;      /* ready+coming of the lowest low group seen, or -1 */
-            for (size_t i = 0; i < l->n_groups; i++) {
-                sh_group *c = &l->groups[i];
-                const int d = group_deficit(c);
-                if (d <= 0) continue;
-                const int coming = c->count + c->generating;
-                if (coming < B) {
-                    if (best_low < 0 || coming < best_low) { g = c; deficit = d; best_low = coming; }
-                } else if (best_low < 0 && d >= B && d > deficit) { g = c; deficit = d; }
-            }
+             * group is refilled only once a whole batch fits. The default
+             * chooses the largest deficit; the opt-in cost policy also
+             * weights the full-batch choice by the matrix work per pad.
+             * Lowest-first among the low ones in either policy. */
+            g = pick_refill_group(l, B, &deficit);
             if (g) break;
             pthread_cond_wait(&l->need_refill, &l->pool_mu);
         }
