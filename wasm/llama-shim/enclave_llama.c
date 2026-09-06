@@ -49,6 +49,22 @@ static int32_t ell_n_threads(void) {
     return n > 0 ? (int32_t)n : 4;
 }
 
+/* Threads for BATCH compute (prefill: any ubatch of 32+ tokens), llama's
+ * n_threads_batch. Decode wants few threads on the shielded tier - the
+ * masking refill threads are the binding resource there and every compute
+ * thread past four measured as pure contention - but prefill runs in the
+ * enclave on cores by policy and scales with them (metal0, 27B: ~15 tok/s
+ * on 4 threads). ENCLAVE_GGML_N_THREADS_BATCH overrides; unset = the decode
+ * count, so nothing changes for a deployment that sets only nnThreads. */
+static int32_t ell_n_threads_batch(void) {
+    const char *e = getenv("ENCLAVE_GGML_N_THREADS_BATCH");
+    if (e && *e) {
+        long v = strtol(e, NULL, 10);
+        if (v > 0 && v <= 512) { return (int32_t)v; }
+    }
+    return ell_n_threads();
+}
+
 void ell_init(void) {
     /* GGML_BACKEND_DL builds ship the compute backends (cpu, cuda) as
      * dlopened modules so the wasmtime binary carries no DT_NEEDED on
@@ -242,7 +258,8 @@ static enum ggml_type ell_ggml_kv_type(int32_t t) {
 void *ell_new_context(void *model, uint32_t n_ctx, uint32_t n_batch,
                       int32_t type_k, int32_t type_v, int32_t flash_attn) {
     struct llama_context_params p = llama_context_default_params();
-    p.n_threads = p.n_threads_batch = ell_n_threads();
+    p.n_threads = ell_n_threads();
+    p.n_threads_batch = ell_n_threads_batch();
     p.n_ctx = n_ctx;
     if (n_batch) { p.n_batch = n_batch; }
     p.type_k = ell_ggml_kv_type(type_k);
@@ -334,7 +351,8 @@ int32_t ell_server_topk_k(void *ctx) {
 void *ell_new_server(void *model, uint32_t n_ctx, uint32_t n_batch, uint32_t n_seq_max,
                      int32_t type_k, int32_t type_v, int32_t flash_attn) {
     struct llama_context_params p = llama_context_default_params();
-    p.n_threads = p.n_threads_batch = ell_n_threads();
+    p.n_threads = ell_n_threads();
+    p.n_threads_batch = ell_n_threads_batch();
     p.n_ctx = n_ctx;
     if (n_batch) { p.n_batch = n_batch; }
     if (n_seq_max) { p.n_seq_max = n_seq_max; }
@@ -824,7 +842,8 @@ void *ell_mtp_new(void *model, void *target_ctx, uint32_t n_ctx, uint32_t n_batc
         return NULL;
     }
     struct llama_context_params p = llama_context_default_params();
-    p.n_threads = p.n_threads_batch = ell_n_threads();
+    p.n_threads = ell_n_threads();
+    p.n_threads_batch = ell_n_threads_batch();
     p.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     p.n_ctx = n_ctx;
     if (n_batch) { p.n_batch = n_batch; }

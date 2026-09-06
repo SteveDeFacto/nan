@@ -1074,6 +1074,14 @@ the compute pool can reduce contention while the GPUs perform the matrix
 operations. Benchmark the setting with the same model, context and prompt. It
 does not allocate additional CPUs, alter the model, or reduce the context.
 
+`nnThreadsBatch` sets the thread count for batch compute (prefill: any
+ubatch of 32 or more tokens) separately, under the same cap. The shielded
+tier pulls the two apart: decode wants few compute threads, because its
+masking refill threads are the binding resource and every compute thread past
+four measured as contention, while prefill runs in the enclave on cores by
+policy and scales with them. Omitting it keeps prefill on the `nnThreads`
+count, so existing configurations do not change.
+
 `nnShieldedPadWaitUs` optionally waits up to 0–50000 microseconds for an
 already-reserved privacy-mask batch before generating missing masks on the
 request thread. It defaults to zero. Waiting does not add workers or reuse

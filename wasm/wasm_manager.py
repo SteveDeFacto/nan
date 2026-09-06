@@ -5547,6 +5547,13 @@ def _spawn_and_wait(rec, ctx):
         nt = _nn_threads_for(enclave_config, cpu_share)
         if nt is not None:
             env["ENCLAVE_GGML_N_THREADS"] = str(nt)
+        # Batch (prefill) threads, capped like nnThreads. Decode on the shielded
+        # tier wants few compute threads (the refill threads bind), prefill
+        # runs on cores and scales with them; absent = the engine uses the
+        # decode count, so existing configs keep their behaviour.
+        ntb = _nn_cfg_int(enclave_config, "nnThreadsBatch", 1, 512)
+        if ntb is not None:
+            env["ENCLAVE_GGML_N_THREADS_BATCH"] = str(min(ntb, _available_parallelism_for(cpu_share)))
         # Optional bounded wait for a privacy-pad batch already in flight.
         # No extra threads, CPU allocation, or pad reuse. Zero disables it.
         pw = _nn_cfg_int(enclave_config, "nnShieldedPadWaitUs", 0, 50000)
