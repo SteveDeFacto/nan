@@ -96,6 +96,17 @@ void sh_pads_reader_close(sh_pads_reader *r);
  * ledger is a local file holding the mark; P2 moves it to the platform. */
 int  sh_pads_window_reserve(const char *ledger_path, uint64_t want, uint64_t *lo, uint64_t *hi);
 
+/* --- the platform's seed box and signed windows (relay/pads.mjs) ------------
+ * seed box: X25519(epk, pad key) -> HKDF-SHA512(shared, salt = epk || pad_pk,
+ * info "enclave-pads-seed-box") -> ChaCha20-Poly1305 (RFC 8439, no AAD). */
+int  sh_pads_seed_open(const uint8_t epk[32], const uint8_t nonce[12], const uint8_t *box, size_t box_len,
+                       const uint8_t pad_sk[32], const uint8_t pad_pk[32], uint8_t seed_out[32]);
+/* A ledger window: Ed25519 over "enclave-pads-window\n<seed_id hex>\n<lo>\n<hi>\n<iat>". */
+bool sh_pads_window_verify(const uint8_t ledger_pk[32], const char *seed_id_hex, uint64_t lo, uint64_t hi, uint64_t iat, const uint8_t sig[64]);
+/* Ed25519 detached signature by the pVM's transport key over the request
+ * line set "enclave-pads-<kind>\n<field>\n...\n<nonce hex>" (fields already text). */
+void sh_pads_request_sign(const uint8_t transport_sk[64], const char *kind, const char *const *fields, size_t n_fields, const char *nonce_hex, uint8_t sig_out[64]);
+
 /* Hex helpers for the env/CLI surface. */
 bool sh_pads_hex2bin(const char *hex, uint8_t *out, size_t n);
 void sh_pads_bin2hex(const uint8_t *in, size_t n, char *out /* 2n+1 */);

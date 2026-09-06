@@ -356,6 +356,7 @@ struct sh_link {
     uint64_t   pad_window, win_lo, win_hi;
     int        pad_bank_wait_ms;
     sh_pads_reader *pads;
+    sh_window_fn win_fn; void *win_ctx;     /* a provider (the pVM's owner-app path) replaces the ledger file */
 
     uint64_t   exchanges, macs, verify_fail, pads_used, pads_missed;
     uint64_t   pads_waited;
@@ -365,6 +366,7 @@ struct sh_link {
     char       err[256];
 };
 
+static int dealt_reserve(sh_link *l, uint64_t *lo, uint64_t *hi);   /* dealt pads: below, after the refill loop */
 const char *sh_link_transport(const sh_link *l) { return l && l->transport[0] ? l->transport : "not connected"; }
 double sh_link_last_wire_us(const sh_link *l) { return l ? l->last_wire_us : 0.0; }
 
@@ -434,10 +436,12 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
         const char *ledger = getenv("SHIELDED_PAD_LEDGER");
         snprintf(l->pad_dir, sizeof l->pad_dir, "%s", pad_dir);
         snprintf(l->pad_ledger, sizeof l->pad_ledger, "%s", ledger && *ledger ? ledger : "");
+        /* The ledger path may be empty when the host installs a window
+         * provider before start (sh_link_set_window_provider); start_pools
+         * refuses to run with neither. */
         const bool ok = sh_pads_hex2bin(getenv("SHIELDED_PAD_SEED"), l->pad_seed, 32)
                      && sh_pads_hex2bin(getenv("SHIELDED_PAD_SEED_ID"), l->pad_seed_id, 16)
-                     && sh_pads_hex2bin(getenv("SHIELDED_PAD_SK"), l->pad_sk, 32)
-                     && l->pad_ledger[0];
+                     && sh_pads_hex2bin(getenv("SHIELDED_PAD_SK"), l->pad_sk, 32);
         if (!ok) {
             pthread_mutex_destroy(&l->pool_mu); pthread_cond_destroy(&l->need_refill); pthread_cond_destroy(&l->pool_filled);
             pthread_mutex_destroy(&l->bank.mu);
@@ -762,7 +766,7 @@ static void *refill_main(void *arg) {
              * mark is already past it, so a restart can never replay one. */
             if (g->cursor + (uint64_t)b > l->win_hi) {
                 uint64_t lo, hi;
-                if (sh_pads_window_reserve(l->pad_ledger, l->pad_window, &lo, &hi) != SH_OK || lo != l->win_hi) {
+                if (dealt_reserve(l, &lo, &hi) != SH_OK || lo != l->win_hi) {
                     snprintf(l->err, sizeof l->err, "dealt pads: ledger window refused; stopping");
                     l->stop = true;
                     pthread_cond_broadcast(&l->pool_filled);
@@ -849,10 +853,23 @@ static int derive_threads(const sh_link *l) {
     return want;
 }
 
+/* One ledger window, through the provider when the host supplied one (the
+ * pVM asks its owner app, which asks the platform) and the file otherwise. */
+static int dealt_reserve(sh_link *l, uint64_t *lo, uint64_t *hi) {
+    if (l->win_fn) return l->win_fn(l->win_ctx, l->pad_window, lo, hi);
+    return sh_pads_window_reserve(l->pad_ledger, l->pad_window, lo, hi);
+}
+
+void sh_link_set_window_provider(sh_link *l, sh_window_fn fn, void *ctx) {
+    if (!l) return;
+    l->win_fn = fn; l->win_ctx = ctx;
+}
+
 /* Dealt mode: open the shipment reader against this link's group table and
  * take the first ledger window. Every group starts at the window's low edge. */
 static int dealt_open(sh_link *l) {
     if (!l->dealt) return SH_OK;
+    if (!l->win_fn && !l->pad_ledger[0]) { snprintf(l->err, sizeof l->err, "dealt pads: no ledger (SHIELDED_PAD_LEDGER) and no window provider"); return SH_ERR_RANGE; }
     if (!l->pads) {
         int err = SH_OK;
         l->pads = sh_pads_reader_open(l->pad_dir, l->pad_seed_id, l->pad_sk, &err);
@@ -871,7 +888,7 @@ static int dealt_open(sh_link *l) {
     free(table);
     if (rc < 0) { snprintf(l->err, sizeof l->err, "dealt pads: no shipment matches this model's groups"); return rc; }
     uint64_t lo, hi;
-    if (sh_pads_window_reserve(l->pad_ledger, l->pad_window, &lo, &hi) != SH_OK) { snprintf(l->err, sizeof l->err, "dealt pads: ledger %s unusable", l->pad_ledger); return SH_ERR_IO; }
+    if (dealt_reserve(l, &lo, &hi) != SH_OK) { snprintf(l->err, sizeof l->err, "dealt pads: no ledger window (%s)", l->win_fn ? "provider refused" : l->pad_ledger); return SH_ERR_IO; }
     l->win_lo = lo; l->win_hi = hi;
     for (size_t i = 0; i < l->n_groups; i++) l->groups[i].cursor = lo;
     return SH_OK;

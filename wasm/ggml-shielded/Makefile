@@ -26,7 +26,7 @@ GGML_INC := -I$(GGML_SRC)/ggml/include -I$(GGML_SRC)/ggml/src
 CXX      ?= c++
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fPIC
 
-all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest
+all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest pads-unbox pads-keygen
 
 # Built only where an engine checkout exists; `make ggml` opts in.
 ggml: ggml-test
@@ -71,6 +71,12 @@ refill-selftest: refill-selftest.c shielded-simd-avx512.o shielded-field.o
 # Dealt pads end to end on synthetic weights: mint, read back against an
 # exact oracle, tamper, exhaustion, ledger window, the link's own import.
 dealt-selftest: dealt-selftest.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Node<->C interop helpers for dealt pads (test/pads-interop.test.mjs).
+pads-unbox: pads-unbox.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+pads-keygen: pads-keygen.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ggml-shielded.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielded-tee.h shielded-field.h shielded-simd.h
@@ -121,6 +127,6 @@ bench-spec: bench-spec.cpp ../llama-shim/enclave_llama.h
 	  -L$(GGML_LIB) -lenclave_llama -lllama -lggml -lggml-base -ldl -Wl,-rpath,$(GGML_LIB)
 
 clean:
-	rm -f $(CORE_OBJ) ggml-shielded-dl.o shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest ggml-shielded.o ggml-test shielded-run shielded-calib libggml-shielded.so bench-batch bench-spec
+	rm -f $(CORE_OBJ) ggml-shielded-dl.o shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest pads-unbox pads-keygen ggml-shielded.o ggml-test shielded-run shielded-calib libggml-shielded.so bench-batch bench-spec
 
 .PHONY: all clean ggml run calib bench

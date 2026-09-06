@@ -436,6 +436,109 @@ int sh_pads_window_reserve(const char *ledger_path, uint64_t want, uint64_t *lo,
     return SH_OK;
 }
 
+
+/* ---- HMAC/HKDF-SHA512 over TweetNaCl's crypto_hash --------------------- */
+static void hmac_sha512(const uint8_t *key, size_t klen, const uint8_t *m1, size_t n1, const uint8_t *m2, size_t n2, uint8_t out[64]) {
+    uint8_t k[128] = {0}, kh[64];
+    if (klen > 128) { crypto_hash(kh, key, klen); memcpy(k, kh, 64); } else memcpy(k, key, klen);
+    uint8_t *inner = (uint8_t *)malloc(128 + n1 + n2), ih[64], outer[128 + 64];
+    if (!inner) { memset(out, 0, 64); return; }
+    for (int i = 0; i < 128; i++) inner[i] = k[i] ^ 0x36;
+    memcpy(inner + 128, m1, n1); memcpy(inner + 128 + n1, m2, n2);
+    crypto_hash(ih, inner, 128 + n1 + n2);
+    for (int i = 0; i < 128; i++) outer[i] = k[i] ^ 0x5c;
+    memcpy(outer + 128, ih, 64);
+    crypto_hash(out, outer, 128 + 64);
+    free(inner);
+}
+/* HKDF-SHA512 (RFC 5869), one or two blocks: what the relay's hkdfSync does. */
+static void hkdf_sha512(const uint8_t *ikm, size_t ikm_len, const uint8_t *salt, size_t salt_len,
+                        const char *info, uint8_t *okm, size_t okm_len) {
+    uint8_t prk[64], t[64]; size_t tl = 0, done = 0; uint8_t ctr = 1;
+    hmac_sha512(salt, salt_len, ikm, ikm_len, NULL, 0, prk);
+    while (done < okm_len) {
+        uint8_t *buf = (uint8_t *)malloc(tl + strlen(info) + 1);
+        memcpy(buf, t, tl); memcpy(buf + tl, info, strlen(info)); buf[tl + strlen(info)] = ctr;
+        hmac_sha512(prk, 64, buf, tl + strlen(info) + 1, NULL, 0, t);
+        free(buf);
+        const size_t n = okm_len - done < 64 ? okm_len - done : 64;
+        memcpy(okm + done, t, n); done += n; tl = 64; ctr++;
+    }
+    memset(prk, 0, sizeof prk); memset(t, 0, sizeof t);
+}
+
+/* ---- ChaCha20 (RFC 8439: 32-bit counter, 96-bit nonce) + Poly1305 -------- */
+#define P_ROTL(v, c) (((v) << (c)) | ((v) >> (32 - (c))))
+#define P_QR(a, b, c, d) (a += b, d ^= a, d = P_ROTL(d, 16), c += d, b ^= c, b = P_ROTL(b, 12), a += b, d ^= a, d = P_ROTL(d, 8), c += d, b ^= c, b = P_ROTL(b, 7))
+static uint32_t ld32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static void chacha_ietf_block(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t out[64]) {
+    static const uint32_t C[4] = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
+    uint32_t s[16], x[16];
+    for (int i = 0; i < 4; i++) s[i] = C[i];
+    for (int i = 0; i < 8; i++) s[4 + i] = ld32(key + 4 * i);
+    s[12] = counter; s[13] = ld32(nonce); s[14] = ld32(nonce + 4); s[15] = ld32(nonce + 8);
+    memcpy(x, s, sizeof x);
+    for (int i = 0; i < 10; i++) {
+        P_QR(x[0], x[4], x[8], x[12]); P_QR(x[1], x[5], x[9], x[13]); P_QR(x[2], x[6], x[10], x[14]); P_QR(x[3], x[7], x[11], x[15]);
+        P_QR(x[0], x[5], x[10], x[15]); P_QR(x[1], x[6], x[11], x[12]); P_QR(x[2], x[7], x[8], x[13]); P_QR(x[3], x[4], x[9], x[14]);
+    }
+    for (int i = 0; i < 16; i++) { const uint32_t v = x[i] + s[i]; out[4 * i] = (uint8_t)v; out[4 * i + 1] = (uint8_t)(v >> 8); out[4 * i + 2] = (uint8_t)(v >> 16); out[4 * i + 3] = (uint8_t)(v >> 24); }
+}
+/* AEAD open with no AAD: tag over ct || pad16 || le64(0) || le64(ct_len) under
+ * the one-time key from block 0; plaintext from blocks 1.. */
+static int chacha20poly1305_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *ct, size_t ct_len, const uint8_t tag[16], uint8_t *out) {
+    uint8_t blk[64], otk[32];
+    chacha_ietf_block(key, 0, nonce, blk); memcpy(otk, blk, 32);
+    const size_t pad = (16 - ct_len % 16) % 16, mlen = ct_len + pad + 16;
+    uint8_t *m = (uint8_t *)calloc(mlen, 1);
+    if (!m) return SH_ERR_NOMEM;
+    memcpy(m, ct, ct_len);
+    for (int i = 0; i < 8; i++) m[ct_len + pad + 8 + i] = (uint8_t)((uint64_t)ct_len >> (8 * i));
+    const int ok = crypto_onetimeauth_verify(tag, m, mlen, otk) == 0;
+    free(m); memset(otk, 0, sizeof otk);
+    if (!ok) return SH_ERR_VERIFY;
+    for (size_t off = 0, ctr = 1; off < ct_len; off += 64, ctr++) {
+        chacha_ietf_block(key, (uint32_t)ctr, nonce, blk);
+        for (size_t i = 0; i < 64 && off + i < ct_len; i++) out[off + i] = ct[off + i] ^ blk[i];
+    }
+    memset(blk, 0, sizeof blk);
+    return SH_OK;
+}
+
+int sh_pads_seed_open(const uint8_t epk[32], const uint8_t nonce[12], const uint8_t *box, size_t box_len,
+                      const uint8_t pad_sk[32], const uint8_t pad_pk[32], uint8_t seed_out[32]) {
+    if (box_len != 32 + 16) return SH_ERR_RANGE;
+    uint8_t shared[32], salt[64], key[32];
+    if (crypto_scalarmult(shared, pad_sk, epk) != 0) return SH_ERR_VERIFY;
+    memcpy(salt, epk, 32); memcpy(salt + 32, pad_pk, 32);
+    hkdf_sha512(shared, 32, salt, 64, "enclave-pads-seed-box", key, 32);
+    const int rc = chacha20poly1305_open(key, nonce, box, 32, box + 32, seed_out);
+    memset(shared, 0, sizeof shared); memset(key, 0, sizeof key);
+    return rc;
+}
+
+bool sh_pads_window_verify(const uint8_t ledger_pk[32], const char *seed_id_hex, uint64_t lo, uint64_t hi, uint64_t iat, const uint8_t sig[64]) {
+    char msg[256];
+    const int n = snprintf(msg, sizeof msg, "enclave-pads-window\n%s\n%llu\n%llu\n%llu", seed_id_hex,
+                           (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)iat);
+    if (n <= 0 || n >= (int)sizeof msg) return false;
+    uint8_t sm[64 + 256], m[64 + 256]; unsigned long long mlen = 0;
+    memcpy(sm, sig, 64); memcpy(sm + 64, msg, (size_t)n);
+    return crypto_sign_open(m, &mlen, sm, 64 + (unsigned long long)n, ledger_pk) == 0 && mlen == (unsigned long long)n;
+}
+
+void sh_pads_request_sign(const uint8_t transport_sk[64], const char *kind, const char *const *fields, size_t n_fields, const char *nonce_hex, uint8_t sig_out[64]) {
+    char msg[1024]; size_t at = 0;
+    at += (size_t)snprintf(msg + at, sizeof msg - at, "enclave-pads-%s", kind);
+    for (size_t i = 0; i < n_fields && at < sizeof msg; i++) at += (size_t)snprintf(msg + at, sizeof msg - at, "\n%s", fields[i]);
+    if (at < sizeof msg) at += (size_t)snprintf(msg + at, sizeof msg - at, "\n%s", nonce_hex);
+    if (at >= sizeof msg) at = sizeof msg - 1;
+    uint8_t *sm = (uint8_t *)malloc(64 + at); unsigned long long smlen = 0;
+    crypto_sign(sm, &smlen, (const uint8_t *)msg, at, transport_sk);
+    memcpy(sig_out, sm, 64);
+    free(sm);
+}
+
 /* ---- hex --------------------------------------------------------------- */
 bool sh_pads_hex2bin(const char *hex, uint8_t *out, size_t n) {
     if (!hex || strlen(hex) != 2 * n) return false;

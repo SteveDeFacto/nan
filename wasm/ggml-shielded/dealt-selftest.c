@@ -19,6 +19,14 @@
 #include <unistd.h>
 
 static uint32_t st = 99;
+/* A window provider standing in for the pVM's owner-app path: hands out
+ * consecutive windows of `want` and counts the calls. */
+int provider(void *ctx, uint64_t want, uint64_t *lo, uint64_t *hi) {
+    struct { int *calls; uint64_t *next; } *c = ctx;
+    (*c->calls)++;
+    *lo = *c->next; *hi = *c->next + want; *c->next = *hi;
+    return 0;
+}
 static uint32_t nxt(void) { st = st * 1664525U + 1013904223U; return st; }
 
 static sh_link *build(int8_t *wa, int8_t *wb, int8_t *wc, int64_t KA, int64_t NA, int64_t NB, int64_t KC, int64_t NC) {
@@ -156,6 +164,24 @@ int main(void) {
         assert(sh_link_dealt_selftest(c, 30, R2, U2) == SH_ERR_EXHAUST);    /* window of 8 cannot hold 30 */
         free(R); free(U); free(R2); free(U2);
         sh_link_close(c);
+        /* a window provider replaces the ledger file: the pVM's path */
+        unsetenv("SHIELDED_PAD_LEDGER");
+        setenv("SHIELDED_PAD_WINDOW", "8", 1);
+        {
+            static uint64_t next_lo = 0;
+            sh_link *pv = build(wa, wb, wc, KA, NA, NB, KC, NC);
+            int calls = 0;
+            struct { int *calls; uint64_t *next; } pctx = { &calls, &next_lo };
+            sh_link_set_window_provider(pv, provider, &pctx);
+            int32_t *R3 = calloc((size_t)2 * 3 * KA, sizeof *R3), *U3 = calloc((size_t)2 * 3 * (NA + NB), sizeof *U3);
+            assert(sh_link_dealt_selftest(pv, 3, R3, U3) == 6 && calls == 1 && next_lo == 8);
+            free(R3); free(U3); sh_link_close(pv);
+            /* and with neither a ledger nor a provider, the link refuses to start */
+            sh_link *none = build(wa, wb, wc, KA, NA, NB, KC, NC);
+            assert(sh_link_dealt_selftest(none, 3, R, U) == SH_ERR_RANGE);
+            sh_link_close(none);
+        }
+        setenv("SHIELDED_PAD_LEDGER", ledger, 1);
         /* a partial env refuses to open */
         unsetenv("SHIELDED_PAD_SK");
         int e3 = 0; assert(sh_link_open("127.0.0.1", 1, false, &e3) == NULL && e3 == SH_ERR_RANGE);
