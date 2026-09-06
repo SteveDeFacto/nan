@@ -21,7 +21,7 @@ test('OpenMP wall profiling preserves local-library work and excludes inactive/n
 int run(int nested) {
     int sum = 0;
     omp_set_dynamic(0);
-    omp_set_max_active_levels(2);
+    omp_set_max_active_levels(3);
     #pragma omp parallel num_threads(4) reduction(+:sum)
     {
         const int id = omp_get_thread_num();
@@ -29,7 +29,19 @@ int run(int nested) {
         if (nested) {
             inner = 0;
             #pragma omp parallel num_threads(2) reduction(+:inner)
-            { inner += 1; }
+            {
+                int factor = 1;
+                if (nested > 1) {
+                    factor = 0;
+                    #pragma omp parallel num_threads(2) reduction(+:factor)
+                    {
+                        factor += 1;
+                        #pragma omp barrier
+                    }
+                }
+                inner += factor;
+                #pragma omp barrier
+            }
         }
         sum += (id + 1) * inner;
         if (id == 0) usleep(2000);
@@ -52,21 +64,36 @@ int main(int argc, char **argv) {
     assert(lib);
     int (*run)(int) = (int (*)(int))dlsym(lib, "run");
     void (*snapshot)(uint64_t *) = (void (*)(uint64_t *))dlsym(RTLD_DEFAULT, "enclave_omp_profile_snapshot");
-    assert(run && snapshot);
+    void (*snapshot_v2)(uint64_t *) = (void (*)(uint64_t *))dlsym(RTLD_DEFAULT, "enclave_omp_profile_snapshot_v2");
+    assert(run && snapshot && snapshot_v2);
     uint64_t values[3];
+    uint64_t extended[5];
     assert(run(0) == 10);
     snapshot(values); assert(values[0] == 0);
+    snapshot_v2(extended); assert(extended[3] == 0 && extended[4] == 0);
     active = 1;
     for (int i = 0; i < 10; i++) assert(run(0) == 10);
     snapshot(values);
     assert(values[0] == 10 && values[2] >= 20000000 && values[1] >= values[2]);
+    snapshot_v2(extended);
+    for (int i = 0; i < 3; i++) assert(extended[i] == values[i]);
+    assert(extended[3] == 10 && extended[4] > 0 && extended[4] <= extended[2]);
     assert(run(1) == 20);
     snapshot(values); assert(values[0] == 11 && values[1] >= values[2]);
+    snapshot_v2(extended);
+    assert(extended[3] == 12 && extended[4] <= extended[2]);
+    assert(run(2) == 40);
+    snapshot(values); assert(values[0] == 12 && values[1] >= values[2]);
+    snapshot_v2(extended);
+    assert(extended[3] == 15 && extended[4] <= extended[2]);
     uint64_t saved[3] = { values[0], values[1], values[2] };
+    uint64_t saved_barriers[2] = { extended[3], extended[4] };
     active = 0;
-    assert(run(1) == 20);
+    assert(run(2) == 40);
     snapshot(values);
     for (int i = 0; i < 3; i++) assert(saved[i] == values[i]);
+    snapshot_v2(extended);
+    assert(extended[3] == saved_barriers[0] && extended[4] == saved_barriers[1]);
     return 0;
 }
 `);
