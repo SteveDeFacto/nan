@@ -231,6 +231,55 @@ void FN(fv_prepare)(const int8_t *W, int64_t K, int64_t N, const int64_t *s, int
  *
  * Accumulators: K * 250 * 119 < 2^31 for K < 72k. No saturation anywhere. */
 #ifdef SH_SIMD_AVX512
+/* A dry pool commonly needs only one or two pads for speculative decode.
+ * Do not compute duplicate rows for those requests. Independent K lanes
+ * retain enough accumulators to hide VNNI latency even at a single row. The
+ * four-row background refill below keeps its existing weight-reuse path. */
+#define SH_SMALL_REFILL(ROWS, LANES) \
+static inline void refill_rows##ROWS(const uint8_t *planes, int b, int b0, \
+        const int8_t *W, int64_t K, int64_t N, int32_t *acc) { \
+    const uint8_t *pl[3][ROWS]; \
+    for (int p = 0; p < 3; p++) \
+        for (int r = 0; r < ROWS; r++) \
+            pl[p][r] = planes + ((size_t)p * b + b0 + r) * K; \
+    for (int64_t j = 0; j < N; j++) { \
+        __m512i a[3][ROWS][LANES]; \
+        for (int p = 0; p < 3; p++) \
+            for (int r = 0; r < ROWS; r++) \
+                for (int lane = 0; lane < LANES; lane++) a[p][r][lane] = _mm512_setzero_si512(); \
+        int64_t k = 0; \
+        for (; k + 64 * LANES <= K; k += 64 * LANES) { \
+            for (int lane = 0; lane < LANES; lane++) { \
+                const int64_t at = k + 64 * lane; \
+                const __m512i w = _mm512_loadu_si512((const void *)(W + j * K + at)); \
+                for (int p = 0; p < 3; p++) \
+                    for (int r = 0; r < ROWS; r++) \
+                        a[p][r][lane] = _mm512_dpbusd_epi32(a[p][r][lane], \
+                            _mm512_loadu_si512((const void *)(pl[p][r] + at)), w); \
+            } \
+        } \
+        for (; k < K; k += 64) { \
+            const int n = K - k < 64 ? (int)(K - k) : 64; \
+            const __mmask64 mask = n == 64 ? ~(__mmask64)0 : (((__mmask64)1 << n) - 1); \
+            const __m512i w = _mm512_maskz_loadu_epi8(mask, W + j * K + k); \
+            for (int p = 0; p < 3; p++) \
+                for (int r = 0; r < ROWS; r++) \
+                    a[p][r][0] = _mm512_dpbusd_epi32(a[p][r][0], \
+                        _mm512_maskz_loadu_epi8(mask, pl[p][r] + k), w); \
+        } \
+        for (int p = 0; p < 3; p++) \
+            for (int r = 0; r < ROWS; r++) { \
+                __m512i sum = a[p][r][0]; \
+                for (int lane = 1; lane < LANES; lane++) sum = _mm512_add_epi32(sum, a[p][r][lane]); \
+                acc[(p * 4 + r) * N + j] = _mm512_reduce_add_epi32(sum); \
+            } \
+    } \
+}
+SH_SMALL_REFILL(1, 4)
+SH_SMALL_REFILL(2, 1)
+SH_SMALL_REFILL(3, 1)
+#undef SH_SMALL_REFILL
+
 static inline void refill_rows4(const uint8_t *planes, int b, int b0,
                                 const int8_t *W, int64_t K, int64_t N, int32_t *acc /* [3][4][N] */) {
     const int64_t K64 = K & ~(int64_t)63;
@@ -345,8 +394,14 @@ static inline void refill_rows4(const uint8_t *planes, int b, int b0,
 void FN(refill)(const uint8_t *planes, int b, const int8_t *W, int64_t K, int64_t N,
                 int32_t *u, int64_t u_stride, int32_t *acc) {
     for (int b0 = 0; b0 < b; b0 += 4) {
-        refill_rows4(planes, b, b0, W, K, N, acc);
         const int rows = b - b0 < 4 ? b - b0 : 4;
+#ifdef SH_SIMD_AVX512
+        if (rows == 1) refill_rows1(planes, b, b0, W, K, N, acc);
+        else if (rows == 2) refill_rows2(planes, b, b0, W, K, N, acc);
+        else if (rows == 3) refill_rows3(planes, b, b0, W, K, N, acc);
+        else
+#endif
+        refill_rows4(planes, b, b0, W, K, N, acc);
         for (int r = 0; r < rows; r++) {
             const int32_t *a0 = acc + (0 * 4 + r) * N, *a1 = acc + (1 * 4 + r) * N, *a2 = acc + (2 * 4 + r) * N;
             int32_t *o = u + (int64_t)(b0 + r) * u_stride;
