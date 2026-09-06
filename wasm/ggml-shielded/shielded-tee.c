@@ -302,6 +302,8 @@ typedef struct {
     uint8_t  *ready;            /* per slot: written by a refill, not yet counted */
     int32_t  *r_store;          /* depth x K, each in [0,M) */
     int32_t  *u_store;          /* depth x u_len, balanced */
+    uint64_t pads_used, pads_missed;
+    double on_path_ms;          /* request-thread counters; refill threads do not write them */
 } sh_group;
 
 struct sh_link {
@@ -358,6 +360,14 @@ void sh_link_pool_stats(const sh_link *l, uint64_t *consumed, uint64_t *missed) 
     if (!l) return;
     if (consumed) *consumed = l->pads_used;
     if (missed) *missed = l->pads_missed;
+}
+void sh_link_node_pool_stats(const sh_link *l, int node, uint64_t *consumed,
+                             uint64_t *missed, double *on_path_ms) {
+    const sh_group *g = l && node >= 0 && (size_t)node < l->n_nodes
+                      ? &l->groups[l->nodes[node].group] : NULL;
+    if (consumed) *consumed = g ? g->pads_used : 0;
+    if (missed) *missed = g ? g->pads_missed : 0;
+    if (on_path_ms) *on_path_ms = g ? g->on_path_ms : 0;
 }
 int sh_link_refill_threads(const sh_link *l) { return l ? l->n_threads : 0; }
 int sh_link_reply_width(const sh_link *l) { return l && l->pipe ? l->ywidth : 0; }
@@ -1075,16 +1085,20 @@ int sh_link_gemm(sh_link *l, const int *nodes, size_t n_nodes,
         gen_scratch s = { l->gplanes, l->acc };
         double tg = now_ms();
         rc = generate(l, g, miss, l->r, l->u, &s);
-        sh_prof[2] += now_ms() - tg;
+        const double elapsed_ms = now_ms() - tg;
+        sh_prof[2] += elapsed_ms;
+        g->on_path_ms += elapsed_ms;
         if (rc != SH_OK) { snprintf(l->err, sizeof l->err, "pad bank exhausted; stall the request"); goto fail; }
         for (int i = 0; i < miss; i++) {
             l->rp[took + i] = l->r + (size_t)i * K;
             l->up[took + i] = l->u + (size_t)i * g->u_len;
         }
         l->pads_missed += (uint64_t)miss;
+        g->pads_missed += (uint64_t)miss;
         sh_prof[6] += miss;
     }
     l->pads_used += (uint64_t)m; sh_prof[7] += m;
+    g->pads_used += (uint64_t)m;
 
     for (int32_t row = 0; row < m; row++)
         l->simd->mask_planes(x_field + (size_t)row * K, l->rp[row], (size_t)K,

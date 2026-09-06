@@ -115,6 +115,10 @@ void sh_link_stats(const sh_link *l, uint64_t *exchanges, uint64_t *macs, uint64
 /* Pool health: pads consumed, and how many had to be generated on the
  * request path because the pool was dry (the number that should be ~0). */
 void sh_link_pool_stats(const sh_link *l, uint64_t *consumed, uint64_t *missed);
+/* The same counters for this node's shared-activation group, plus time spent
+ * generating missing pads on the request path. Public weight metadata only. */
+void sh_link_node_pool_stats(const sh_link *l, int node, uint64_t *consumed,
+                             uint64_t *missed, double *on_path_ms);
 /* Refill threads actually running (derived or from the environment), for logs. */
 int  sh_link_refill_threads(const sh_link *l);
 /* Bytes per reply value after start: 4 (FIELD_GEMM) or 3 (FIELD_GEMM24); 0 before. */

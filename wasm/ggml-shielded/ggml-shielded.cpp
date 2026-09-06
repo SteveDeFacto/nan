@@ -307,6 +307,27 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
                 s.t_encode, s.t_post, s.t_graph, (unsigned long long)used, (unsigned long long)missed,
                 (int)s.contention.contended, (unsigned long long)s.contention.events,
                 sh_link_simd()->name, s.link ? sh_link_refill_threads(s.link) : 0);
+        // Identify the groups delaying GPU submission. Aggregate misses alone
+        // cannot distinguish a large output head from an undersized whole pool.
+        struct stalled_group { std::string name; uint64_t used, missed; double ms; };
+        std::vector<stalled_group> stalls;
+        for (const auto &group : s.group_members) {
+            if (!s.link || group.second.empty()) continue;
+            auto e = s.weights.find(group.second.front());
+            if (e == s.weights.end()) continue;
+            stalled_group g{group.first, 0, 0, 0};
+            sh_link_node_pool_stats(s.link, e->second.node, &g.used, &g.missed, &g.ms);
+            if (g.missed) stalls.push_back(std::move(g));
+        }
+        std::sort(stalls.begin(), stalls.end(), [](const stalled_group &a, const stalled_group &b) {
+            return a.ms > b.ms;
+        });
+        for (size_t i = 0; i < std::min<size_t>(3, stalls.size()); i++) {
+            const auto &g = stalls[i];
+            fprintf(stderr, "[shielded] profile: card=%zu group=%s pads=%llu missed=%llu on-path=%.1fms local_nodes=%llu\n",
+                    card, g.name.c_str(), (unsigned long long)g.used, (unsigned long long)g.missed,
+                    g.ms, (unsigned long long)s.local_nodes);
+        }
     }
     if (off)  *off  += s.offloaded_nodes;
     if (loc)  *loc  += s.local_nodes;
