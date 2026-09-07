@@ -528,7 +528,13 @@ the transport carries no trust):
   `POST /pads/window` on its loopback RAD port with a reserve signed by the
   P-256 transport key. The wasm manager fills a deployment whose
   `nnShieldedPadSource` is a bank and that names no keys from that file, so a
-  tenant config carries only the bank URL (`test/metal-agent-pads.test.mjs`).
+  tenant config carries only the bank URL; `nnShieldedPadSource: "platform"`
+  means the platform's own store through the agent's loopback proxy
+  (`GET /pads/shipments`, the store's two shapes only, so the engine never
+  speaks TLS). With no bootstrap file yet the manager drops the dealt env
+  entirely rather than open a half-configured link. The model digest pin
+  comes from the calibration file (SHA-512, first 32 bytes, the dealer's own
+  label) when the config names none (`test/metal-agent-pads.test.mjs`).
 
 **Minting at GPU speed.** `shielded-dealer --worker host:port` mints through a
 worker the dealer owns: with `SHIELDED_ZERO_PADS=1` every ring pad is zero, so

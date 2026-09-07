@@ -2413,6 +2413,19 @@ def _shielded_profile_tail(rec: dict) -> None:
     threading.Thread(target=run, daemon=True, name=f"shielded-profile-{rec.get('id')}").start()
 
 
+def _pads_model_digest(calib_path):
+    """The dealer's model digest (shielded-dealer.cpp file_digest): SHA-512 of
+    the calibration file, truncated to 32 bytes, hex. Empty when unreadable."""
+    try:
+        h = hashlib.sha512()
+        with open(calib_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:64]
+    except OSError:
+        return ""
+
+
 def _pads_bootstrap_env(path=None):
     """The dealt-pad identity the guest agent left for this box (see
     metal/guest/agent.mjs padsBootstrap): seed, seed id, pad secret, the
@@ -2430,8 +2443,11 @@ def _pads_bootstrap_env(path=None):
     if not (isinstance(b, dict) and hexs(b.get("seed"), 64) and hexs(b.get("seed_id"), 32) and hexs(b.get("sk"), 64)
             and hexs(b.get("ledger_pk"), 64) and isinstance(b.get("window_url"), str) and b["window_url"].startswith("http://")):
         return {}
-    return {"SHIELDED_PAD_SEED": b["seed"], "SHIELDED_PAD_SEED_ID": b["seed_id"], "SHIELDED_PAD_SK": b["sk"],
-            "SHIELDED_PAD_LEDGER_PK": b["ledger_pk"], "SHIELDED_PAD_WINDOW_URL": b["window_url"]}
+    out = {"SHIELDED_PAD_SEED": b["seed"], "SHIELDED_PAD_SEED_ID": b["seed_id"], "SHIELDED_PAD_SK": b["sk"],
+           "SHIELDED_PAD_LEDGER_PK": b["ledger_pk"], "SHIELDED_PAD_WINDOW_URL": b["window_url"]}
+    if isinstance(b.get("bank_url"), str) and b["bank_url"].startswith("http://"):
+        out["SHIELDED_PAD_BANK_URL"] = b["bank_url"]          # not an engine env: the caller maps it to SHIELDED_PAD_SOURCE
+    return out
 
 
 def _nn_shielded_transport_for(config: str) -> dict:
@@ -5622,6 +5638,12 @@ def _spawn_and_wait(rec, ctx):
             v = pads.get("nnShieldedPadModelDigest")
             if isinstance(v, str) and len(v) == 64:
                 env["SHIELDED_PAD_MODEL_DIGEST"] = v
+            elif env.get("SHIELDED_CALIB"):
+                # pin the shipments to this model the way the dealer labels
+                # them: SHA-512 of the calibration file, first 32 bytes
+                d = _pads_model_digest(env["SHIELDED_CALIB"])
+                if d:
+                    env["SHIELDED_PAD_MODEL_DIGEST"] = d
             pw = _nn_cfg_int(enclave_config, "nnShieldedPadWindow", 1, 4096)
             if pw is not None:
                 env["SHIELDED_PAD_WINDOW"] = str(pw)
@@ -5648,8 +5670,18 @@ def _spawn_and_wait(rec, ctx):
             # agent fetched and opened it after attach (metal/guest/agent.mjs
             # writes METAL_PADS_BOOTSTRAP, root-only), plus the agent's
             # loopback window relay and the platform ledger key it pins.
-            if env["SHIELDED_PAD_SOURCE"].startswith("http://") and "SHIELDED_PAD_SEED" not in env:
-                env.update(_pads_bootstrap_env())
+            if env["SHIELDED_PAD_SOURCE"] == "platform":
+                # the platform's own store through the guest agent's loopback proxy
+                boot = _pads_bootstrap_env()
+                if boot.get("SHIELDED_PAD_BANK_URL"):
+                    env["SHIELDED_PAD_SOURCE"] = boot.pop("SHIELDED_PAD_BANK_URL")
+                    if "SHIELDED_PAD_SEED" not in env:
+                        env.update(boot)
+                else:
+                    env.pop("SHIELDED_PAD_SOURCE")      # no identity yet: the engine mints its own, loudly, rather than open half-configured
+            elif env["SHIELDED_PAD_SOURCE"].startswith("http://") and "SHIELDED_PAD_SEED" not in env:
+                b = _pads_bootstrap_env(); b.pop("SHIELDED_PAD_BANK_URL", None)
+                env.update(b)
         env.update(_nn_shielded_transport_for(enclave_config))
         env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's

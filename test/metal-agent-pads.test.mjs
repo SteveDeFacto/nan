@@ -35,6 +35,8 @@ test("agent: pad key in the RAD, seed bootstrapped after attach, /pads/window re
     if (req.method === "GET" && url.pathname === "/v1/pads/key") return json(200, { key: ledger.key(), epoch: 1 });
     if (req.method === "POST" && url.pathname === "/v1/pads/seed") { const r = ledger.seed(await readJson(req)); return json(r.status, r.body); }
     if (req.method === "POST" && url.pathname === "/v1/pads/reserve") { const r = ledger.reserve(await readJson(req)); return json(r.status, r.body); }
+    if (req.method === "GET" && url.pathname === "/v1/pads/shipments") return json(200, { seed_id: url.searchParams.get("seed_id"), shipments: [{ name: `${url.searchParams.get("seed_id")}-0-16.pads`, bytes: 3 * 1024 * 1024 + 7, index0: 0, count: 16 }] });
+    if (req.method === "GET" && /^\/v1\/pads\/shipments\/[0-9a-f]{32}\/[0-9a-f]{32}-0-16\.pads$/.test(url.pathname)) { const b = Buffer.alloc(3 * 1024 * 1024 + 7, 0x5a); res.writeHead(200, { "content-type": "application/octet-stream", "content-length": b.length }); return res.end(b); }
     json(404, { error: "not_found" });
   });
   const relayPort = await new Promise((r) => relaySrv.listen(0, "127.0.0.1", () => r(relaySrv.address().port)));
@@ -103,4 +105,17 @@ test("agent: pad key in the RAD, seed bootstrapped after attach, /pads/window re
   // another box's seed is refused by the ledger (signed by this key, wrong keyFp)
   const foreign = await postJson(boot.window_url, { want: 8, seed_id: "0".repeat(32) });
   assert.equal(foreign.status, 403);
+
+  // the bank proxy: the platform store's listing and bytes, verbatim, through the loopback (no TLS in the engine)
+  assert.equal(boot.bank_url, `http://127.0.0.1:${radPort}/pads/shipments`);
+  const list = await fetch(`${boot.bank_url}?seed_id=${boot.seed_id}`).then((r) => r.json());
+  assert.equal(list.shipments[0].name, `${boot.seed_id}-0-16.pads`);
+  const ship = await fetch(`${boot.bank_url}/${boot.seed_id}/${boot.seed_id}-0-16.pads`);
+  assert.equal(ship.status, 200);
+  const bytes = Buffer.from(await ship.arrayBuffer());
+  assert.equal(bytes.length, 3 * 1024 * 1024 + 7);
+  assert.ok(bytes.every((b) => b === 0x5a));
+  assert.equal((await fetch(`${boot.bank_url}/${boot.seed_id}/evil.pads`)).status, 400);      // only the store's two shapes pass
+  assert.equal((await fetch(`${boot.bank_url}/../../v1/pads/key`)).status, 404);              // (the client normalises the traversal away; the agent has no such route)
+  assert.equal((await fetch(`${boot.bank_url}?seed_id=nope`)).status, 400);
 });

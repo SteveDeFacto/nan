@@ -64,8 +64,11 @@ test("dealt-pad knobs reach the engine together, seed and sk as substituted secr
   for (const f of ['"SHIELDED_PAD_SEED": b["seed"]', '"SHIELDED_PAD_SEED_ID": b["seed_id"]', '"SHIELDED_PAD_SK": b["sk"]', '"SHIELDED_PAD_LEDGER_PK": b["ledger_pk"]', '"SHIELDED_PAD_WINDOW_URL": b["window_url"]'])
     assert.ok(manager.includes(f), f);
   const agent = fs.readFileSync(path.join(ROOT, "metal/guest/agent.mjs"), "utf8");
-  for (const f of ["seed_id: r.body.seed_id", "seed: seed.toString('hex')", "sk: padSkHex", "ledger_pk: key.body.key", "window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`"])
+  for (const f of ["seed_id: r.body.seed_id", "seed: seed.toString('hex')", "sk: padSkHex", "ledger_pk: key.body.key", "window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`", "bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments`"])
     assert.ok(agent.includes(f), "agent writes " + f);
+  // "platform" as the source = the store through the agent's proxy, and never a half-configured link
+  assert.ok(manager.includes('if env["SHIELDED_PAD_SOURCE"] == "platform":'), "platform keyword");
+  assert.ok(manager.includes('env.pop("SHIELDED_PAD_SOURCE")'), "no identity -> no dealt env at all");
   // secrets are substituted before this block sees the config
   assert.ok(manager.indexOf("enclave_config = _subst_secrets(enclave_config, secrets)") < manager.indexOf('env["SHIELDED_PAD_SOURCE"]'), "secret refs substituted before the pad env is built");
 });

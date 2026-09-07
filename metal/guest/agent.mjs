@@ -112,7 +112,8 @@ async function padsBootstrap() {
   if (seed.length !== 32) throw new Error('seed box opened to the wrong size');
   fs.mkdirSync(PADS_DIR, { recursive: true, mode: 0o700 });
   const out = { name: NAME, seed_id: r.body.seed_id, epoch: r.body.epoch, seed: seed.toString('hex'), sk: padSkHex,
-                ledger_pk: key.body.key, window_url: `http://127.0.0.1:${RAD_PORT}/pads/window` };
+                ledger_pk: key.body.key, window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`,
+                bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments` };
   const file = `${PADS_DIR}/bootstrap.json`, tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(out), { mode: 0o600 });
   fs.renameSync(tmp, file);
@@ -224,6 +225,23 @@ http.createServer((req, res) => {
       try { const r = await padsWindow(want, seed_id); reply(r.status, r.body); }
       catch (e) { reply(502, { error: 'relay_unreachable', message: String(e && e.message || e) }); }
     });
+    return;
+  }
+  if (req.method === 'GET' && req.url.startsWith('/pads/shipments')) {
+    // the platform's shipment store, proxied so the engine's plain-http bank
+    // client never needs TLS: the listing and the .pads bytes (ciphertext to
+    // this box's pad key; integrity is the cells' own, so a cache in between
+    // - the operator's NVMe box - can only delay, never alter)
+    const m = req.url.match(/^\/pads\/shipments(\?seed_id=[0-9a-f]{32}|\/[0-9a-f]{32}\/[0-9a-f]{32}-\d+-\d+\.pads)$/);
+    if (!m) { res.writeHead(400); res.end(); return; }
+    fetch(relayHttpBase() + '/v1/pads/shipments' + m[1], { headers: RELAY_HOST ? { host: RELAY_HOST } : {} }).then(async (up) => {
+      const headers = { 'content-type': up.headers.get('content-type') || 'application/octet-stream' };
+      const len = up.headers.get('content-length'); if (len) headers['content-length'] = len;
+      res.writeHead(up.status, headers);
+      if (!up.body) return res.end();
+      for await (const chunk of up.body) { if (!res.write(chunk)) await new Promise((r) => res.once('drain', r)); }
+      res.end();
+    }).catch((e) => { try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'relay_unreachable', message: String(e && e.message || e) })); } catch {} });
     return;
   }
   if (req.url.startsWith('/.well-known/enclave-attestation') || req.url === '/health') {
