@@ -192,11 +192,16 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     const llama_vocab *vocab = llama_model_get_vocab(model);
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512; cp.n_batch = 512; cp.n_threads = n_threads; cp.n_threads_batch = n_threads;
+    /* Prefill wider than the link's 8 rows runs on the VM's CPU. ANCHOR_PREFILL_THREADS gives the
+     * batch its own pool; the default stays the decode count: measured on the Pixel 8 Pro, a
+     * 387-token prompt prefills in 11.4 s at 4 threads and 21.2 s at 8 (little cores drag the
+     * barrier splits), and an idle 8-thread pool's polling halved decode as well. */
+    int n_threads_batch = n_threads; { const char *e = getenv("ANCHOR_PREFILL_THREADS"); if (e && atoi(e) > 0) n_threads_batch = atoi(e); if (n_threads_batch > 16) n_threads_batch = 16; }
+    cp.n_ctx = 1024; cp.n_batch = 512; cp.n_threads = n_threads; cp.n_threads_batch = n_threads_batch;
     if (mtp_k > 0) cp.n_rs_seq = (uint32_t)mtp_k;
     llama_context *ctx = llama_init_from_model(model, cp);
     if (!ctx) { outf("ENGINE context failed"); return 2; }
-    anchor_mtp *mtp = mtp_k > 0 ? anchor_mtp_new(model, ctx, 512, 8, n_threads) : nullptr;
+    anchor_mtp *mtp = mtp_k > 0 ? anchor_mtp_new(model, ctx, 1024, 8, n_threads) : nullptr;
     /* ANCHOR_BOOST_THREADS=n: n threads that only spin. The decode is ~100 short compute
      * bursts per token between link waits, and the phone's governor answers that duty cycle
      * with 0.4 GHz on the mid cores (measured: 402 MHz during decode, 2.1 GHz with burners,
@@ -211,8 +216,11 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     /* one persistent CPU pool: without it every scheduler split respawns the threads (REPORT.md 12) */
     void *cpu_h = dlopen(cpu_so.c_str(), RTLD_NOW);
     tp_new_fn tp_new = cpu_h ? (tp_new_fn)dlsym(cpu_h, "ggml_threadpool_new") : nullptr;
-    if (tp_new) { ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads); ggml_threadpool *tp = tp_new(&tpp); llama_attach_threadpool(ctx, tp, tp);
-                  if (mtp) llama_attach_threadpool(anchor_mtp_ctx(mtp), tp, tp); }   /* one pool for target and head */
+    if (tp_new) { ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads); ggml_threadpool *tp = tp_new(&tpp);
+                  ggml_threadpool_params tpb = ggml_threadpool_params_default(n_threads_batch); ggml_threadpool *tpb_pool = n_threads_batch != n_threads ? tp_new(&tpb) : tp;
+                  llama_attach_threadpool(ctx, tp, tpb_pool);
+                  if (mtp) llama_attach_threadpool(anchor_mtp_ctx(mtp), tp, tp); }   /* one decode pool for target and head; the batch pool prefills */
+    outf("ENGINE prefill threads %d (decode %d)", n_threads_batch, n_threads);
     outf("ENGINE context ready, %d threads, persistent pool=%s", n_threads, tp_new ? "yes" : "no");
 
     /* The shared-prefix KV (prefix-kv.h): SHIELDED_PREFIX_KV names the file
