@@ -30,6 +30,10 @@
 //     the pVM's signed usage at the end of a run (pads = cells consumed,
 //     tokens = prompt + generated); the platform bills and pays on these
 //   GET  /v1/pads/receipts?seed_id=  { seed_id, pads, tokens, runs, last[] }
+//   GET  /v1/pads/consumers          { consumers: [{ name, keyFp, padKey, seed_id, epoch, mark, issued }] }
+//     every attached tunnel that offered a pad key: what a dealer daemon
+//     serves (public keys and marks only; the seed is derived from keyFp by
+//     whoever holds the master)
 //                          -> { seed_id, lo, hi, iat, sig }
 //   sig (requests) = Ed25519 over the canonical line set in signedMessage();
 //   sig (windows)  = Ed25519 over windowMessage().
@@ -58,6 +62,7 @@ export function padsRouter({ ledger, store, dealerToken, json, readBody }) {
       const m = ledger.mark(url.searchParams.get("seed_id") || "");
       json(res, m ? 200 : 404, m || { error: "unknown_seed" }); return true;
     }
+    if (p === "/v1/pads/consumers" && req.method === "GET") { json(res, 200, { consumers: ledger.consumers() }); return true; }
     if (p === "/v1/pads/receipts" && req.method === "GET") {
       const r = ledger.receipts(url.searchParams.get("seed_id") || "");
       json(res, r ? 200 : 404, r || { error: "unknown_seed" }); return true;
@@ -312,6 +317,21 @@ export function createPadsLedger({ dir, hub, log = console.log, masterSeed = nul
       const { seed_id } = deriveSeed(master, t.keyFp, PADS_EPOCH);
       const rec = seedRecord(seed_id);
       return { name, keyFp: t.keyFp, padKey: t.padKey || "", seed_id, epoch: PADS_EPOCH, mark: rec ? rec.mark : 0, issued: !!rec };
+    },
+
+    /* GET /v1/pads/consumers: every attached tunnel with a pad key, for the
+     * dealer daemon that keeps all of them ahead of their marks. */
+    consumers() {
+      const names = hub && hub.origins ? hub.origins().map((o) => o.name) : [];
+      const out = [];
+      for (const name of names) {
+        const t = hub.info(name);
+        if (!t || !t.keyFp || !t.padKey) continue;
+        const { seed_id } = deriveSeed(master, t.keyFp, PADS_EPOCH);
+        const rec = seedRecord(seed_id);
+        out.push({ name, keyFp: t.keyFp, padKey: t.padKey, seed_id, epoch: PADS_EPOCH, mark: rec ? rec.mark : 0, issued: !!rec });
+      }
+      return out;
     },
 
     /* GET /v1/pads/ledger?seed_id= (operators and the dealer read the mark). */

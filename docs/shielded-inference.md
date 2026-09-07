@@ -536,6 +536,13 @@ the transport carries no trust):
   comes from the calibration file (SHA-512, first 32 bytes, the dealer's own
   label) when the config names none (`test/metal-agent-pads.test.mjs`).
 
+**The dealer daemon.** `GET /v1/pads/consumers` lists every attached tunnel
+that offered a pad key with its seed id, ledger mark and whether it has asked
+for its seed; `shielded/dealer/dealer-loop.py --all --master <hex> --push
+[--worker host:port]` keeps each issued consumer's bank ahead of its mark
+every pass, pruning spent shipments from the store. A consumer that never
+asked for its seed gets nothing minted.
+
 **Usage receipts from the CVM tier.** With a window agent configured the
 engine also reports usage: after every reserved window (outside the pool lock)
 and once more when the link closes, it POSTs the delta of cells consumed and

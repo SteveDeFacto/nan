@@ -260,9 +260,14 @@ verification failures, exit 0, exact text.
   SHIELDED_PAD_MODEL_DIGEST from the calibration file (SHA-512[:32], the
   dealer's label). x86 proof: totals 2,033 pads / 56 rows over 7 receipts,
   exactly the engine's own counters.
+- DONE 2026-09-07, the dealer daemon: `GET /v1/pads/consumers` lists every
+  attached tunnel with a pad key (seed id, mark, issued); `dealer-loop.py
+  --all --master ... --push [--worker]` serves each issued consumer every
+  pass (one model load per consumer for now: a multi-seed mint per load is
+  the next optimisation for the 27B). test/pads-shipments.test.mjs pins it.
   Still to do for metal0: deploy the relay's pads routes (relay/deploy.sh,
-  Steven), run the dealer on a platform GPU box (`shielded-dealer --worker`),
-  and a deployment config with `nnShieldedPadSource: "platform"`.
+  Steven), run `dealer-loop.py --all` on a platform GPU box with
+  `--worker`, and a deployment config with `nnShieldedPadSource: "platform"`.
 - Earlier design note (kept for the volume alternative):
 - The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
   ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine

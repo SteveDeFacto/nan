@@ -144,3 +144,21 @@ test("a metal box's P-256 transport key signs requests too (ECDSA over sha256); 
   const ed = pvm();
   assert.equal(L.reserve({ name: "metal0", seed_id: s.body.seed_id, want: 16, nonce: randomBytes(16).toString("hex"), sig: ed.signReq("reserve", "metal0", [s.body.seed_id, 16], "00") }).status, 403);
 });
+
+test("consumers: every attached tunnel with a pad key, with its seed id and mark, for the dealer daemon", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pads-"));
+  const a = pvm(), b = pvm();
+  const recs = { phone1: { keyFp: a.keyFp, spki: a.spki, padKey: a.padKey }, phone2: { keyFp: b.keyFp, spki: b.spki, padKey: b.padKey }, plain: { keyFp: "ab".repeat(32), spki: a.spki, padKey: "" } };
+  const hub = { info: (name) => recs[name] ? { name, mode: "avf", ...recs[name] } : null, origins: () => Object.keys(recs).map((name) => ({ name })) };
+  const L = createPadsLedger({ dir, hub, log: () => {}, masterSeed: "22".repeat(32) });
+  let c = L.consumers();
+  assert.deepEqual(c.map((x) => x.name), ["phone1", "phone2"]);              // no pad key = not a consumer
+  assert.ok(c.every((x) => !x.issued && x.mark === 0 && /^[0-9a-f]{32}$/.test(x.seed_id)));
+  const n0 = randomBytes(16).toString("hex");
+  const { seed_id } = L.seed({ name: "phone1", nonce: n0, sig: a.signReq("seed", "phone1", [], n0) }).body;
+  const n1 = randomBytes(16).toString("hex");
+  L.reserve({ name: "phone1", seed_id, want: 24, nonce: n1, sig: a.signReq("reserve", "phone1", [seed_id, 24], n1) });
+  c = L.consumers();
+  assert.deepEqual(c.find((x) => x.name === "phone1"), { name: "phone1", keyFp: a.keyFp, padKey: a.padKey, seed_id, epoch: 1, mark: 24, issued: true });
+  assert.equal(c.find((x) => x.name === "phone2").issued, false);
+});
