@@ -555,6 +555,10 @@ int AVmPayload_main(void) {
                 if ((q = strstr(l, "threads="))) eng_threads = atoi(q + 8);
                 if ((q = strstr(l, " mtp="))) { char kb[8]; snprintf(kb, sizeof kb, "%d", atoi(q + 5)); setenv("ANCHOR_MTP_K", kb, 1); }   /* engine.cpp: MTP-head draft depth */
                 if ((q = strstr(l, " boost="))) { char kb[8]; snprintf(kb, sizeof kb, "%d", atoi(q + 7)); setenv("ANCHOR_BOOST_THREADS", kb, 1); }   /* engine.cpp: clock-keeping spinners */
+                if ((q = strstr(l, " env="))) {                /* extra engine environment: hex of "K=V,K=V" */
+                    char ev[1024]; size_t k = unhex(q + 5, (uint8_t *)ev, sizeof ev - 1); ev[k] = 0;
+                    for (char *tok = strtok(ev, ","); tok; tok = strtok(NULL, ",")) { char *eq = strchr(tok, '='); if (eq) { *eq = 0; setenv(tok, eq + 1, 1); } }
+                }
                 if ((q = strstr(l, "prompt="))) { size_t k = unhex(q + 7, (uint8_t *)eng_prompt, sizeof eng_prompt - 1); eng_prompt[k] = 0; }
                 with_pads = strstr(l, " pads=1") != NULL;
                 with_prefix = strstr(l, " prefix=1") != NULL;

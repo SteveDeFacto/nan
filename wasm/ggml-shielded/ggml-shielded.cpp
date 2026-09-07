@@ -529,9 +529,27 @@ static void sh_load_calib(sh_state &s) {
            (long long)sh_min_macs(), sh_max_m(), sh_link_simd()->name);
 }
 
+/* SHIELDED_LOCAL_SITES=name[,name...]: calibrated sites the backend still does NOT
+ * claim, so they compute locally on the CPU backend. Inert unless set. Why: on the
+ * phone anchor the vocab projection (token_embd.weight, tied) is one exchange per
+ * row with a 456 KB reply; at the USB link's rate that costs more than the phone's
+ * own dotprod cores do (~4 ms per row), and every MTP draft step is such a row. */
+static bool sh_site_forced_local(const char *name) {
+    static std::set<std::string> local; static bool parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char *e = getenv("SHIELDED_LOCAL_SITES")) {
+            std::string v = e; size_t at = 0;
+            while (at <= v.size()) { size_t c = v.find(',', at); if (c == std::string::npos) c = v.size();
+                if (c > at) local.insert(v.substr(at, c - at)); at = c + 1; }
+        }
+    }
+    return !local.empty() && (local.count(name) || local.count(sh_group_key(name)));
+}
 static const sh_calib_site *sh_site_for(sh_state &s, const char *name) {
     sh_env_defaults(s);
     sh_load_calib(s);
+    if (sh_site_forced_local(name)) return nullptr;
     auto it = s.calib.find(sh_group_key(name));
     return it == s.calib.end() ? nullptr : &it->second;
 }

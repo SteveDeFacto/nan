@@ -211,7 +211,8 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     /* one persistent CPU pool: without it every scheduler split respawns the threads (REPORT.md 12) */
     void *cpu_h = dlopen(cpu_so.c_str(), RTLD_NOW);
     tp_new_fn tp_new = cpu_h ? (tp_new_fn)dlsym(cpu_h, "ggml_threadpool_new") : nullptr;
-    if (tp_new) { ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads); ggml_threadpool *tp = tp_new(&tpp); llama_attach_threadpool(ctx, tp, tp); }
+    if (tp_new) { ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads); ggml_threadpool *tp = tp_new(&tpp); llama_attach_threadpool(ctx, tp, tp);
+                  if (mtp) llama_attach_threadpool(anchor_mtp_ctx(mtp), tp, tp); }   /* one pool for target and head */
     outf("ENGINE context ready, %d threads, persistent pool=%s", n_threads, tp_new ? "yes" : "no");
 
     /* The shared-prefix KV (prefix-kv.h): SHIELDED_PREFIX_KV names the file
@@ -305,9 +306,10 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
         cur = bonus;
     }
     const long t_tg1 = ggml_time_us();
-    if (mtp_rounds) outf("ENGINE MTP: %d rounds, %d drafted, %d accepted (%.2f tokens per round, %.0f%% of drafts); per round: draft %.0f ms, verify %.0f ms, rollback+observe %.0f ms",
-                         mtp_rounds, mtp_drafted, mtp_accepted, (double)(mtp_accepted + mtp_rounds) / mtp_rounds, mtp_drafted ? 100.0 * mtp_accepted / mtp_drafted : 0.0,
-                         t_draft / 1e3 / mtp_rounds, t_verify / 1e3 / mtp_rounds, t_observe / 1e3 / mtp_rounds);
+    if (mtp_rounds) { double rm = 0, dec = 0, am = 0, ob = 0; if (mtp) anchor_mtp_timers(mtp, &rm, &dec, &am, &ob);
+        outf("ENGINE MTP: %d rounds, %d drafted, %d accepted (%.2f tokens per round, %.0f%% of drafts); per round: draft %.0f ms (seq_rm %.1f, head decode %.1f, argmax+copy %.1f), verify %.0f ms, rollback+observe %.0f ms (head decode %.1f)",
+             mtp_rounds, mtp_drafted, mtp_accepted, (double)(mtp_accepted + mtp_rounds) / mtp_rounds, mtp_drafted ? 100.0 * mtp_accepted / mtp_drafted : 0.0,
+             t_draft / 1e3 / mtp_rounds, rm / 1e3 / mtp_rounds, dec / 1e3 / mtp_rounds, am / 1e3 / mtp_rounds, t_verify / 1e3 / mtp_rounds, t_observe / 1e3 / mtp_rounds, ob / 1e3 / mtp_rounds); }
     if (mtp) anchor_mtp_free(mtp);
     uint64_t off = 0, loc = 0, macs = 0, vf = 0;
     if (stats) stats(&off, &loc, &macs, &vf);

@@ -26,6 +26,11 @@ typedef struct anchor_mtp anchor_mtp;
  * nextn hidden-row output on the target context. */
 anchor_mtp *anchor_mtp_new(struct llama_model *model, struct llama_context *target, uint32_t n_ctx, uint32_t n_batch, int n_threads);
 void        anchor_mtp_free(anchor_mtp *m);
+/* The head context, e.g. to attach the target's thread pool (one pool for both: the target's
+ * workers busy-poll after its graph and would otherwise contend with the head's fresh threads). */
+struct llama_context *anchor_mtp_ctx(anchor_mtp *m);
+/* Accumulated microseconds inside draft: seq_rm, decode, argmax (+ nextn copy), and observe's decode. */
+void        anchor_mtp_timers(anchor_mtp *m, double *rm_us, double *decode_us, double *argmax_us, double *observe_us);
 /* After the target decoded `n_rows` rows: copy their nextn hidden rows. */
 int         anchor_mtp_harvest(anchor_mtp *m, struct llama_context *target, int32_t n_rows);
 /* Mirror `n` committed tokens at pos0.. into the head (needs a harvest of >= n rows
