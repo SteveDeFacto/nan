@@ -225,6 +225,12 @@ struct sh_state {
     bool dirty = false;                       /* new weights since the last start() */
 
     uint64_t offloaded_nodes = 0, local_nodes = 0, macs = 0, verify_fail = 0, exchanges = 0;
+    /* Width diagnostics for the profile line: how many exchanges carried m
+     * rows (m_hist[m], 9+ folded into [9]) and how many graphs reached this
+     * backend whose widest claimed matmul had 1, 2-4, 5-8 or 9+ rows. The
+     * question they answer: does a prompt reach us as wide graphs the sched
+     * left on the CPU, or as narrow graphs (someone upstream sliced it)? */
+    uint64_t m_hist[10] = {0}, graph_w[4] = {0};
     double t_encode = 0, t_link = 0, t_post = 0, t_graph = 0;
 
     /* graph_compute scratch, kept across calls: resize() never shrinks a
@@ -319,6 +325,9 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
         if (s.link) sh_link_pool_stats(s.link, &used, &missed);
         uint64_t waited = 0; double wait_ms = 0;
         sh_link_pad_wait_stats(s.link, &waited, &wait_ms);
+        fprintf(stderr, "[shielded] widths: exchanges by rows m1=%llu m2=%llu m3=%llu m4=%llu m5=%llu m6=%llu m7=%llu m8=%llu m9+=%llu | graphs by widest matmul rows 1=%llu 2-4=%llu 5-8=%llu 9+=%llu\n",
+                (unsigned long long)s.m_hist[1], (unsigned long long)s.m_hist[2], (unsigned long long)s.m_hist[3], (unsigned long long)s.m_hist[4], (unsigned long long)s.m_hist[5], (unsigned long long)s.m_hist[6], (unsigned long long)s.m_hist[7], (unsigned long long)s.m_hist[8], (unsigned long long)s.m_hist[9],
+                (unsigned long long)s.graph_w[0], (unsigned long long)s.graph_w[1], (unsigned long long)s.graph_w[2], (unsigned long long)s.graph_w[3]);
         if (sh_link_has_bank(s.link)) {
             uint64_t bf = 0, bb = 0; int bst = 0; char berr[256];
             sh_link_bank_stats(s.link, &bf, &bb, &bst, berr, sizeof berr);
@@ -915,6 +924,14 @@ static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
 
     std::vector<char> &done = s.done;
     done.assign((size_t)n, 0);
+    {
+        int64_t widest = 0;
+        for (int i = 0; i < n; i++) {
+            const ggml_tensor *nd = ggml_graph_node(cgraph, i);
+            if (nd->op == GGML_OP_MUL_MAT && nd->src[1] && nd->src[1]->ne[1] > widest) widest = nd->src[1]->ne[1];
+        }
+        if (widest > 0) s.graph_w[widest <= 1 ? 0 : widest <= 4 ? 1 : widest <= 8 ? 2 : 3]++;
+    }
     for (int i = 0; i < n; i++) {
         if (done[i]) continue;
         ggml_tensor *node = ggml_graph_node(cgraph, i);
@@ -1085,6 +1102,7 @@ static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
                 s.local_nodes += members.size();
             } else {
                 s.offloaded_nodes += members.size(); s.exchanges++;
+                s.m_hist[m < 1 ? 0 : m > 9 ? 9 : m]++;
                 {
                     double wb = 0; for (auto *xe : xents) wb += (double)xe->K * (double)xe->N;
                     sh_note_latency(s, e0.group, m, sh_link_last_wire_us(s.link), wb);
