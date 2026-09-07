@@ -13,7 +13,7 @@ GGML_CPU_SO, LD_LIBRARY_PATH. The seed is derived exactly as relay/pads.mjs does
 (HKDF-SHA512, salt = keyFp bytes, info "enclave-pads-seed:<epoch>"); the master
 seed is the platform's secret and never leaves the dealer's process.
 """
-import argparse, hashlib, hmac, json, os, re, subprocess, sys, time, urllib.error, urllib.request
+import argparse, hashlib, hmac, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 
 def hkdf_sha512(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
@@ -103,34 +103,54 @@ def main():
     token = os.environ.get("PADS_DEALER_TOKEN", "")
     if a.push and not (a.relay and token): sys.exit("--push needs --relay and PADS_DEALER_TOKEN")
 
-    def serve(seed, seed_id, pk, mark):
-        """One consumer, one pass: prune below the mark, mint what the plan wants, push."""
+    def prune_and_plan(seed_id, mark):
+        """One consumer: prune below the mark (bank and store), return the ranges to mint."""
         existing = shipments(a.out, seed_id)
         want, spent = plan(existing, mark, a.ahead, a.chunk)
         if a.plan_only:
-            print(json.dumps({"seed_id": seed_id, "mark": mark, "mint": want, "prune": spent})); return
+            print(json.dumps({"seed_id": seed_id, "mark": mark, "mint": want, "prune": spent})); return []
         for p in spent:
             os.unlink(p); print(f"pruned {os.path.basename(p)} (below mark {mark})", flush=True)
             if a.push: print(f"  relay delete -> {relay_delete(a.relay, seed_id, os.path.basename(p), token)}", flush=True)
         if not want:
-            print(f"bank for {seed_id} covers [{mark}, {mark + a.ahead}); nothing to mint", flush=True); return
-        if not (seed and pk and a.model and a.calib):
-            sys.exit("minting needs --seed (or --master) and --pk (or a consumer with a pad key), --model, --calib")
+            print(f"bank for {seed_id} covers [{mark}, {mark + a.ahead}); nothing to mint", flush=True)
+        return want
+
+    def mint(jobs):
+        """jobs: [(seed, seed_id, pk, want)] -> ONE dealer run (one model load), then push. Seeds
+        go through a 0600 file that lives only for the run."""
+        jobs = [j for j in jobs if j[3]]
+        if not jobs: return
+        if not (a.model and a.calib): sys.exit("minting needs --model and --calib")
+        for seed, seed_id, pk, _ in jobs:
+            if not (seed and pk): sys.exit(f"minting {seed_id} needs its seed (--seed or --master) and pad key (--pk or the consumer's)")
         dealer = os.environ.get("DEALER", "shielded-dealer")
-        ranges = ",".join(f"{i0}:{c}" for i0, c in want)
-        tmpl = os.path.join(a.out, f"{seed_id}-{{index0}}-{{count}}.pads")
-        cmd = [dealer, a.model, "--out", tmpl, "--seed", seed, "--seed-id", seed_id, "--pk", pk, "--ranges", ranges]
-        if a.worker: cmd += ["--worker", a.worker]
-        env = {**os.environ, "SHIELDED_CALIB": a.calib}
-        t0 = time.time()
-        r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if r.returncode != 0: sys.exit(f"shielded-dealer failed ({r.returncode}) for {ranges}")
-        print(f"minted {len(want)} shipment(s) for {seed_id} covering up to {want[-1][0] + want[-1][1]} in {time.time() - t0:.1f} s", flush=True)
-        if a.push:
-            for i0, c in want:
-                f = os.path.join(a.out, f"{seed_id}-{i0}-{c}.pads")
-                res = relay_put_file(a.relay, seed_id, f, token)
-                print(f"  pushed {os.path.basename(f)}: {res.get('bytes')} bytes, sha256 {str(res.get('sha256'))[:16]}", flush=True)
+        fd, jobfile = tempfile.mkstemp(prefix="dealer-jobs-", suffix=".txt", dir=a.out)
+        try:
+            with os.fdopen(fd, "w") as f:
+                for seed, seed_id, pk, want in jobs:
+                    ranges = ",".join(f"{i0}:{c}" for i0, c in want)
+                    tmpl = os.path.join(a.out, f"{seed_id}-{{index0}}-{{count}}.pads")
+                    f.write(f"{seed} {seed_id} {pk} {tmpl} {ranges}\n")
+            cmd = [dealer, a.model, "--jobs", jobfile]
+            if a.worker: cmd += ["--worker", a.worker]
+            env = {**os.environ, "SHIELDED_CALIB": a.calib}
+            t0 = time.time()
+            r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            if r.returncode != 0: sys.exit(f"shielded-dealer failed ({r.returncode}) for {len(jobs)} job(s)")
+        finally:
+            try: os.unlink(jobfile)
+            except OSError: pass
+        for seed, seed_id, pk, want in jobs:
+            print(f"minted {len(want)} shipment(s) for {seed_id} covering up to {want[-1][0] + want[-1][1]}" + (f" in {time.time() - t0:.1f} s (one load for {len(jobs)} consumer(s))" if seed_id == jobs[-1][1] else ""), flush=True)
+            if a.push:
+                for i0, c in want:
+                    fpath = os.path.join(a.out, f"{seed_id}-{i0}-{c}.pads")
+                    res = relay_put_file(a.relay, seed_id, fpath, token)
+                    print(f"  pushed {os.path.basename(fpath)}: {res.get('bytes')} bytes, sha256 {str(res.get('sha256'))[:16]}", flush=True)
+
+    def serve(seed, seed_id, pk, mark):
+        mint([(seed, seed_id, pk, prune_and_plan(seed_id, mark))])
 
     while True:
         if a.all:
@@ -144,7 +164,7 @@ def main():
                 print(f"relay {a.relay} unreachable ({getattr(e, 'code', None) or getattr(e, 'reason', e)}); waiting", flush=True)
                 if a.once: return 1
                 time.sleep(a.interval); continue
-            served = 0
+            served, jobs = 0, []
             for c in cons:
                 if not c.get("issued"):
                     continue                     # attached, but never asked for its seed: nothing to mint for yet
@@ -152,7 +172,8 @@ def main():
                 if sid != c["seed_id"]:
                     print(f"consumer {c['name']}: seed id mismatch (relay {c['seed_id']}, derived {sid}); skipped", flush=True); continue
                 print(f"consumer {c['name']} ({sid}, mark {c.get('mark', 0)})", flush=True)
-                serve(seed, sid, c.get("padKey") or "", c.get("mark", 0)); served += 1
+                jobs.append((seed, sid, c.get("padKey") or "", prune_and_plan(sid, c.get("mark", 0)))); served += 1
+            mint(jobs)                           # every consumer's missing ranges, one model load
             if not served: print(f"no consumer with a seed among {len(cons)} attached; waiting", flush=True)
             if a.once or a.plan_only: return 0
             time.sleep(a.interval); continue

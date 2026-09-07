@@ -1677,9 +1677,9 @@ int sh_link_mint_shipment_worker(sh_link *l, const uint8_t seed[32], const uint8
                 for (int i = 0; i < b; i++) {
                     __int128 lhs = 0, rhs = 0;
                     for (int64_t j = 0; j < nd->N; j++) {
-                        int64_t v = yout[n][(size_t)i * nd->N + j] % SH_M_MOD;      /* balanced representative of r.W mod M */
+                        int64_t v = yout[n][(size_t)i * nd->N + j] % SH_M_MOD;      /* the writer's balanced range [-M/2, M/2], as the in-process mint */
+                        if (v < 0) v += SH_M_MOD;
                         if (v > SH_M_MOD / 2) v -= SH_M_MOD;
-                        if (v <= -(SH_M_MOD / 2)) v += SH_M_MOD;
                         u[(size_t)i * g->u_len + nd->u_off + j] = (int32_t)v;
                         lhs += (__int128)v * nd->sM[j];
                     }

@@ -263,8 +263,13 @@ verification failures, exit 0, exact text.
 - DONE 2026-09-07, the dealer daemon: `GET /v1/pads/consumers` lists every
   attached tunnel with a pad key (seed id, mark, issued); `dealer-loop.py
   --all --master ... --push [--worker]` serves each issued consumer every
-  pass (one model load per consumer for now: a multi-seed mint per load is
-  the next optimisation for the 27B). test/pads-shipments.test.mjs pins it.
+  pass in ONE model load (`shielded-dealer --jobs FILE`: lines of seed,
+  seed id, pad key, template, ranges; the daemon writes it 0600 for the run
+  and unlinks it). Two seeds through the CPU worker in one load: both banks
+  byte-identical to in-process mints. test/pads-shipments.test.mjs pins it.
+  Found on the way: the worker mint's balanced reduction mapped u = -M/2 to
+  M/2+1, which the writer refuses (1 in 14M values; fixed to the writer's
+  [-M/2, M/2] like sh_balanced).
   Still to do for metal0: deploy the relay's pads routes (relay/deploy.sh,
   Steven), run `dealer-loop.py --all` on a platform GPU box with
   `--worker`, and a deployment config with `nnShieldedPadSource: "platform"`.

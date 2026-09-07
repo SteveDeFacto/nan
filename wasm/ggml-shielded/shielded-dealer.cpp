@@ -40,7 +40,7 @@ static bool file_digest(const char *path, uint8_t out[32]) {
 
 int main(int argc, char **argv) {
     const char *model_path = argc > 1 ? argv[1] : nullptr;
-    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr, *ranges = nullptr, *worker = nullptr;
+    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr, *ranges = nullptr, *worker = nullptr, *jobs = nullptr;
     uint64_t index0 = 0, count = 64;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--out")) out = argv[i + 1];
@@ -51,10 +51,32 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--index0")) index0 = strtoull(argv[i + 1], nullptr, 10);
         else if (!strcmp(argv[i], "--count")) count = strtoull(argv[i + 1], nullptr, 10);
         else if (!strcmp(argv[i], "--worker")) worker = argv[i + 1];   /* host:port of the DEALER'S OWN worker: r goes to it unmasked, u = r.W comes back at GPU speed */
+        else if (!strcmp(argv[i], "--jobs")) jobs = argv[i + 1];       /* many seeds, ONE model load: lines of "seed seed_id pk out-template ranges" */
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     const char *backend = getenv("SHIELDED_SO"), *calib = getenv("SHIELDED_CALIB");
-    if (!model_path || !out || !seed || !seed_id || !pk || !backend || !calib) {
+    /* A jobs file (the dealer daemon's pass): each line names a consumer's
+     * seed, seed id, pad key, output template and ranges; the weights load
+     * and register once for all of them. Seeds are secrets: the file is the
+     * daemon's, 0600, and gone after the pass. */
+    struct job { std::string seed, seed_id, pk, out, ranges; };
+    std::vector<job> joblist;
+    if (jobs) {
+        FILE *jf = fopen(jobs, "r");
+        if (!jf) { fprintf(stderr, "cannot read jobs %s\n", jobs); return 2; }
+        char line[4096];
+        while (fgets(line, sizeof line, jf)) {
+            char a[130], b[40], c[70], o[2048], r[1500];
+            if (line[0] == '#' || line[0] == '\n') continue;
+            if (sscanf(line, "%129s %39s %69s %2047s %1499s", a, b, c, o, r) != 5) { fprintf(stderr, "bad jobs line: %s", line); fclose(jf); return 2; }
+            joblist.push_back({ a, b, c, o, r });
+        }
+        fclose(jf);
+        if (joblist.empty()) { fprintf(stderr, "jobs file %s is empty\n", jobs); return 2; }
+    } else if (model_path && out && seed && seed_id && pk) {
+        joblist.push_back({ seed, seed_id, pk, out, ranges ? ranges : "" });
+    }
+    if (!model_path || joblist.empty() || !backend || !calib) {
         fprintf(stderr, "usage: SHIELDED_SO=.. GGML_CPU_SO=.. SHIELDED_CALIB=.. shielded-dealer model.gguf --out F --seed H64 --seed-id H32 --pk H64 [--index0 N] [--count N] | [--ranges i0:n,i0:n --out template{index0}{count}]\n");
         return 2;
     }
@@ -113,28 +135,31 @@ int main(int argc, char **argv) {
     uint8_t digest[32]; char digest_hex[65];
     if (!file_digest(calib, digest)) { fprintf(stderr, "cannot read calib %s\n", calib); return 2; }
     sh_pads_bin2hex(digest, 32, digest_hex);
-    /* One model load, any number of shipments: the loop that keeps a bank ahead
-     * of the ledger mints every missing range in one process. */
-    std::vector<std::pair<uint64_t, uint64_t>> plan;
-    if (ranges) {
-        std::string r = ranges;
-        for (size_t at = 0; at < r.size();) {
-            size_t comma = r.find(',', at); if (comma == std::string::npos) comma = r.size();
-            const std::string one = r.substr(at, comma - at); at = comma + 1;
-            const size_t colon = one.find(':');
-            if (colon == std::string::npos) { fprintf(stderr, "bad range %s\n", one.c_str()); return 2; }
-            plan.emplace_back(strtoull(one.substr(0, colon).c_str(), nullptr, 10), strtoull(one.substr(colon + 1).c_str(), nullptr, 10));
+    /* One model load, any number of shipments for any number of seeds: the
+     * loop that keeps banks ahead of their ledgers mints every missing range
+     * of every consumer in one process. */
+    for (const job &jb : joblist) {
+        std::vector<std::pair<uint64_t, uint64_t>> plan;
+        if (!jb.ranges.empty()) {
+            const std::string &r = jb.ranges;
+            for (size_t at = 0; at < r.size();) {
+                size_t comma = r.find(',', at); if (comma == std::string::npos) comma = r.size();
+                const std::string one = r.substr(at, comma - at); at = comma + 1;
+                const size_t colon = one.find(':');
+                if (colon == std::string::npos) { fprintf(stderr, "bad range %s\n", one.c_str()); return 2; }
+                plan.emplace_back(strtoull(one.substr(0, colon).c_str(), nullptr, 10), strtoull(one.substr(colon + 1).c_str(), nullptr, 10));
+            }
+        } else plan.emplace_back(index0, count);
+        for (auto &pr : plan) {
+            std::string path = jb.out;
+            auto sub = [&](const char *key, uint64_t v) { for (size_t k; (k = path.find(key)) != std::string::npos;) path.replace(k, strlen(key), std::to_string(v)); };
+            sub("{index0}", pr.first); sub("{count}", pr.second);
+            const int rc = mint(jb.seed.c_str(), jb.seed_id.c_str(), digest_hex, pr.first, pr.second, jb.pk.c_str(), path.c_str());
+            if (rc != 0) { fprintf(stderr, "mint failed: %d\n", rc); return 1; }
+            printf("minted %s: indices [%llu, %llu), model digest %s\n", path.c_str(), (unsigned long long)pr.first,
+                   (unsigned long long)(pr.first + pr.second), digest_hex);
+            fflush(stdout);
         }
-    } else plan.emplace_back(index0, count);
-    for (auto &pr : plan) {
-        std::string path = out;
-        auto sub = [&](const char *key, uint64_t v) { for (size_t k; (k = path.find(key)) != std::string::npos;) path.replace(k, strlen(key), std::to_string(v)); };
-        sub("{index0}", pr.first); sub("{count}", pr.second);
-        const int rc = mint(seed, seed_id, digest_hex, pr.first, pr.second, pk, path.c_str());
-        if (rc != 0) { fprintf(stderr, "mint failed: %d\n", rc); return 1; }
-        printf("minted %s: indices [%llu, %llu), model digest %s\n", path.c_str(), (unsigned long long)pr.first,
-               (unsigned long long)(pr.first + pr.second), digest_hex);
-        fflush(stdout);
     }
     llama_free(ctx);
     llama_model_free(model);
