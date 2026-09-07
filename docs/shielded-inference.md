@@ -536,6 +536,16 @@ the transport carries no trust):
   comes from the calibration file (SHA-512, first 32 bytes, the dealer's own
   label) when the config names none (`test/metal-agent-pads.test.mjs`).
 
+**Usage receipts from the CVM tier.** With a window agent configured the
+engine also reports usage: after every reserved window (outside the pool lock)
+and once more when the link closes, it POSTs the delta of cells consumed and
+rows reserved since its last receipt to the agent's `/receipt` sibling of the
+window URL; the guest agent signs it as this box (`enclave-pads-receipt`,
+P-256) and relays it to `POST /v1/pads/receipt`, so the platform's per-seed
+totals add up to exactly what the engine drew (2,033 pads / 56 rows on the
+x86 proof, 7 receipts). A missing route is logged once and never blocks a
+window. The pVM signs its own receipt on the control channel instead.
+
 **Minting at GPU speed.** `shielded-dealer --worker host:port` mints through a
 worker the dealer owns: with `SHIELDED_ZERO_PADS=1` every ring pad is zero, so
 the "masked" planes carry the seed's mask row r itself and the exchange returns

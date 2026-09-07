@@ -349,6 +349,9 @@ struct sh_link {
     char       win_url[1024];               /* http:// window agent: POST {want, seed_id} -> signed window */
     uint8_t    win_pk[32]; bool have_win_pk;
     char       pad_seed_id_hex[33];
+    bool       receipt_due;                 /* a window was taken: report the delta since the last receipt (outside the lock) */
+    uint64_t   receipt_pads, receipt_rows;  /* what has been reported so far */
+    bool       receipt_failed;              /* logged once */
     uint8_t    pad_seed[32], pad_seed_id[16], pad_sk[32];
     uint64_t   pad_window, win_lo, win_hi;
     int        pad_bank_wait_ms;
@@ -365,6 +368,7 @@ struct sh_link {
 
 static int dealt_reserve(sh_link *l, uint64_t *lo, uint64_t *hi);   /* dealt pads: below, after the refill loop */
 static void dealt_advanced(sh_link *l);
+static void dealt_receipt(sh_link *l);
 const char *sh_link_transport(const sh_link *l) { return l && l->transport[0] ? l->transport : "not connected"; }
 double sh_link_last_wire_us(const sh_link *l) { return l ? l->last_wire_us : 0.0; }
 
@@ -527,6 +531,7 @@ static void free_pools(sh_link *l) {
 void sh_link_close(sh_link *l) {
     if (!l) return;
     stop_threads(l);
+    if (l->dealt && l->win_url[0]) dealt_receipt(l);      /* the last window's usage, before the counters go */
     free_pools(l);
     for (size_t i = 0; i < l->n_nodes; i++) {
         free(l->nodes[i].s); free(l->nodes[i].s_tilde); free(l->nodes[i].s32); free(l->nodes[i].st32);
@@ -853,7 +858,9 @@ static void *refill_main(void *arg) {
             g->cursor += (uint64_t)b;
         }
         g->generating += b;
+        const bool receipt = l->receipt_due; l->receipt_due = false;
         pthread_mutex_unlock(&l->pool_mu);
+        if (receipt) dealt_receipt(l);
 
         const bool direct = first + b <= g->depth;
         int32_t *r_out = direct ? g->r_store + (size_t)first * g->K     : r;
@@ -973,6 +980,31 @@ static void dealt_advanced(sh_link *l) {
         const int n = sh_pads_reader_prune_below(l->pads, floor, true);
         if (n) fprintf(stderr, "[shielded] dealt pads: dropped %d spent shipment(s) below %llu\n", n, (unsigned long long)floor);
     }
+    if (l->win_url[0]) l->receipt_due = true;
+}
+
+/* Usage receipt through the window agent (the pVM signs its own on the
+ * control channel): the DELTA of cells consumed and rows reserved since the
+ * last one, so the platform's totals add up. Best effort, never on the
+ * request path, never blocking a window: a missing route is logged once. */
+static void dealt_receipt(sh_link *l) {
+    if (!l->win_url[0] || l->receipt_failed) return;
+    char url[1100]; snprintf(url, sizeof url, "%s", l->win_url);
+    char *tail = strrchr(url, '/');
+    if (!tail || strcmp(tail, "/window")) return;
+    snprintf(tail, sizeof url - (size_t)(tail - url), "/receipt");
+    pthread_mutex_lock(&l->pool_mu);
+    const uint64_t pads = l->pads_used, rows = l->win_hi;   /* rows reserved so far = the window's far edge */
+    pthread_mutex_unlock(&l->pool_mu);
+    if (pads <= l->receipt_pads && rows <= l->receipt_rows) return;
+    const uint64_t dp = pads - l->receipt_pads, dr = rows - l->receipt_rows;
+    char body[192]; snprintf(body, sizeof body, "{\"seed_id\":\"%s\",\"pads\":%llu,\"tokens\":%llu}", l->pad_seed_id_hex, (unsigned long long)dp, (unsigned long long)dr);
+    uint8_t *resp = NULL; size_t rlen = 0; int status = 0;
+    const int rc = sh_http_post_json(url, body, 10000, &resp, &rlen, &status);
+    free(resp);
+    if (rc == 0 && status == 200) { l->receipt_pads = pads; l->receipt_rows = rows; return; }
+    if (rc != 0 || status == 404) { l->receipt_failed = true; fprintf(stderr, "[shielded] dealt pads: no usage receipts (%s: %s%d)\n", url, rc ? "unreachable " : "http ", status); }
+    else fprintf(stderr, "[shielded] dealt pads: receipt refused (http %d); retrying at the next window\n", status);
 }
 
 void sh_link_set_window_provider(sh_link *l, sh_window_fn fn, void *ctx) {

@@ -252,10 +252,17 @@ verification failures, exit 0, exact text.
   `dealer-loop.py --worker` passes it through. The platform dealer for the
   27B is therefore a GPU box running worker.py (the dealer's own; an
   operator's worker would learn the masks).
-  Still to do for metal0: deploy the relay's pads routes, run the dealer on a
-  platform GPU box, SHIELDED_PAD_MODEL_DIGEST from the model volume, and
-  receipts from the CVM tier (the pVM signs its own; the manager would sign
-  for a tenant from ggml_backend_shielded_pads_used).
+- DONE 2026-09-07, CVM-tier receipts + store proxy + digest pin: the engine
+  POSTs usage deltas (cells, rows) to the window agent's /receipt after every
+  window and at link close; metal/guest/agent.mjs signs and relays them
+  (and proxies GET /pads/shipments so the engine never speaks TLS;
+  `nnShieldedPadSource: "platform"`); the manager pins
+  SHIELDED_PAD_MODEL_DIGEST from the calibration file (SHA-512[:32], the
+  dealer's label). x86 proof: totals 2,033 pads / 56 rows over 7 receipts,
+  exactly the engine's own counters.
+  Still to do for metal0: deploy the relay's pads routes (relay/deploy.sh,
+  Steven), run the dealer on a platform GPU box (`shielded-dealer --worker`),
+  and a deployment config with `nnShieldedPadSource: "platform"`.
 - Earlier design note (kept for the volume alternative):
 - The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
   ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine

@@ -90,6 +90,10 @@ async function padsWindow(want, seed_id) {
   const { nonce, sig } = padsSign('reserve', [seed_id, want]);
   return padsCall('/v1/pads/reserve', { name: NAME, seed_id, want, nonce, sig });
 }
+async function padsReceipt(seed_id, pads, tokens) {
+  const { nonce, sig } = padsSign('receipt', [seed_id, pads, tokens]);
+  return padsCall('/v1/pads/receipt', { name: NAME, seed_id, pads, tokens, nonce, sig });
+}
 // X25519(epk, pad key) -> HKDF-SHA512(shared, salt = epk || pad pk, "enclave-pads-seed-box") -> ChaCha20-Poly1305, tag last.
 function openSeedBox({ epk, nonce, box }) {
   const peer = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(epk, 'hex')]), format: 'der', type: 'spki' });
@@ -213,6 +217,20 @@ function buildRad() {
 
 // --- RAD endpoint (loopback; the supervisor's ATTESTATION_URL points here) ---
 http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/pads/receipt') {
+    // a tenant engine's usage since its last receipt: signed here as this box's word
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 4096) req.destroy(); });
+    req.on('end', async () => {
+      let body; try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
+      const pads = Number(body.pads), tokens = Number(body.tokens), seed_id = String(body.seed_id || '');
+      const reply = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+      if (!Number.isSafeInteger(pads) || pads < 0 || !Number.isSafeInteger(tokens) || tokens < 0 || !/^[0-9a-f]{32}$/.test(seed_id)) return reply(400, { error: 'bad_request' });
+      try { const r = await padsReceipt(seed_id, pads, tokens); reply(r.status, r.body); }
+      catch (e) { reply(502, { error: 'relay_unreachable', message: String(e && e.message || e) }); }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/pads/window') {
     // a ledger window for a tenant engine: signed here, answered by the platform
     let raw = '';

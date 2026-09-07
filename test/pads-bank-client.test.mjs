@@ -97,6 +97,11 @@ test("window agent (local mode): reserve-before-use windows signed by the key it
   assert.equal((await post({ want: 0, seed_id: seed })).status, 400);
   assert.equal((await post({ want: 5000, seed_id: seed })).status, 400);
   assert.equal((await post({ want: 8, seed_id: "nope" })).status, 400);
+  // receipts in local mode accrue next to the ledger
+  const rcpt = (body) => fetch(base + "/receipt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  assert.deepEqual((await rcpt({ seed_id: seed, pads: 97, tokens: 1 })).body.pads, 97);
+  assert.deepEqual((await rcpt({ seed_id: seed, pads: 3, tokens: 1 })).body, { ...(await rcpt({ seed_id: seed, pads: 0, tokens: 0 })).body, pads: 100, tokens: 2, runs: 2 });
+  assert.equal((await rcpt({ seed_id: seed, pads: -5, tokens: 1 })).status, 400);
   // the key persists: a restarted agent signs with the same key
   agent.kill();
   const again = spawn(process.execPath, [path.join(root, "shielded", "dealer", "window-agent.mjs"), "--port", String(port), "--ledger", path.join(dir, "ledger"), "--key", path.join(dir, "agent.pem")], { stdio: ["ignore", "pipe", "pipe"] });

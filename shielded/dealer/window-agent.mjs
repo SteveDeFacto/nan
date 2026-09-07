@@ -35,6 +35,7 @@ function loadOrMakeKey(file) {
 const rawPub = (priv) => Buffer.from(createPublicKey(priv).export({ type: "spki", format: "der" })).subarray(-32).toString("hex");
 
 let reserve;   // async ({ want, seed_id }) => { status, body }
+let receipt;   // async ({ seed_id, pads, tokens }) => { status, body }
 let keyHex = "";
 if (args.relay) {
   if (!args.name || !args["sign-key"]) { console.error("relay mode needs --name and --sign-key"); process.exit(2); }
@@ -46,6 +47,12 @@ if (args.relay) {
     const nonce = randomBytes(16).toString("hex");
     const sig = sign(null, Buffer.from(signedMessage("reserve", [args.name, seed_id, want, nonce])), sk).toString("hex");
     const r = await fetch(base + "/v1/pads/reserve", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: args.name, seed_id, want, nonce, sig }) });
+    return { status: r.status, body: await r.json() };
+  };
+  receipt = async ({ seed_id, pads, tokens }) => {
+    const nonce = randomBytes(16).toString("hex");
+    const sig = sign(null, Buffer.from(signedMessage("receipt", [args.name, seed_id, pads, tokens, nonce])), sk).toString("hex");
+    const r = await fetch(base + "/v1/pads/receipt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: args.name, seed_id, pads, tokens, nonce, sig }) });
     return { status: r.status, body: await r.json() };
   };
 } else {
@@ -63,12 +70,29 @@ if (args.relay) {
     const sig = sign(null, Buffer.from(windowMessage(seed_id, lo, hi, iat)), priv).toString("hex");
     return { status: 200, body: { seed_id, lo, hi, iat, sig } };
   };
+  // local receipts accrue next to the ledger (a single box's own accounting)
+  receipt = async ({ seed_id, pads, tokens }) => {
+    const file = ledger + ".receipts.json";
+    let all = {}; try { all = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+    const u = all[seed_id] || (all[seed_id] = { pads: 0, tokens: 0, runs: 0 });
+    u.pads += pads; u.tokens += tokens; u.runs += 1;
+    fs.writeFileSync(file + ".tmp", JSON.stringify(all)); fs.renameSync(file + ".tmp", file);
+    return { status: 200, body: { seed_id, pads: u.pads, tokens: u.tokens, runs: u.runs, iat: Math.floor(Date.now() / 1000) } };
+  };
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const json = (status, body) => { const b = JSON.stringify(body); res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(b) }); res.end(b); };
   if (req.method === "GET" && url.pathname === "/key") return json(200, { key: keyHex });
+  if (req.method === "POST" && url.pathname === "/receipt") {
+    let raw = ""; for await (const c of req) { raw += c; if (raw.length > 4096) { return json(413, { error: "too_big" }); } }
+    let body; try { body = JSON.parse(raw || "{}"); } catch { return json(400, { error: "bad_json" }); }
+    const pads = Number(body.pads), tokens = Number(body.tokens);
+    if (!Number.isSafeInteger(pads) || pads < 0 || !Number.isSafeInteger(tokens) || tokens < 0 || !/^[0-9a-f]{32}$/.test(String(body.seed_id || ""))) return json(400, { error: "bad_receipt" });
+    try { const r = await receipt({ seed_id: body.seed_id, pads, tokens }); return json(r.status, r.body); }
+    catch (e) { return json(502, { error: "receipt_failed", message: String(e && e.message || e) }); }
+  }
   if (req.method === "POST" && url.pathname === "/window") {
     let raw = ""; for await (const c of req) { raw += c; if (raw.length > 4096) { return json(413, { error: "too_big" }); } }
     let body; try { body = JSON.parse(raw || "{}"); } catch { return json(400, { error: "bad_json" }); }
