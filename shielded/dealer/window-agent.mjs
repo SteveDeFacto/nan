@@ -85,6 +85,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const json = (status, body) => { const b = JSON.stringify(body); res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(b) }); res.end(b); };
   if (req.method === "GET" && url.pathname === "/key") return json(200, { key: keyHex });
+  if (args.token && req.method === "POST" && req.headers.authorization !== "Bearer " + args.token) return json(401, { error: "no_token" });   // --token: the engine's SHIELDED_PAD_AGENT_TOKEN
   if (req.method === "POST" && url.pathname === "/receipt") {
     let raw = ""; for await (const c of req) { raw += c; if (raw.length > 4096) { return json(413, { error: "too_big" }); } }
     let body; try { body = JSON.parse(raw || "{}"); } catch { return json(400, { error: "bad_json" }); }

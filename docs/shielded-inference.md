@@ -543,6 +543,14 @@ for its seed; `shielded/dealer/dealer-loop.py --all --master <hex> --push
 every pass, pruning spent shipments from the store. A consumer that never
 asked for its seed gets nothing minted.
 
+**The agent's per-boot token.** Tenants share the loopback namespace, so the
+guest agent mints a token per boot, hands it to the manager in the bootstrap
+file, and refuses a window or a receipt without it (`401`); the manager passes
+it to the engine as `SHIELDED_PAD_AGENT_TOKEN`, sent as a bearer on those
+POSTs. With dealt pads configured and no way to run them (no window, no
+shipment, no worker) the engine fails the request rather than computing the
+model in the clear, exactly as it does on pad exhaustion.
+
 **Usage receipts from the CVM tier.** With a window agent configured the
 engine also reports usage: after every reserved window (outside the pool lock)
 and once more when the link closes, it POSTs the delta of cells consumed and

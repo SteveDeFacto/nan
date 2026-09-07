@@ -94,7 +94,9 @@ typedef struct sh_link sh_link;
  *                            POST {want, seed_id} with {lo, hi, iat, sig};
  *                            requires SHIELDED_PAD_LEDGER_PK (64 hex, the
  *                            platform's Ed25519 ledger key) and replaces the
- *                            ledger file, like the pVM's provider does */
+ *                            ledger file, like the pVM's provider does
+ *   SHIELDED_PAD_AGENT_TOKEN bearer sent to the window agent (its per-boot
+ *                            token, from the manager's bootstrap) */
 sh_link *sh_link_open(const char *host, int port, bool verify, int *err);
 /* Explicit per-link transport/reservation for a pooled tenant. Call before start;
  * avoids mutating process-wide environment while other links refill/reconnect. */

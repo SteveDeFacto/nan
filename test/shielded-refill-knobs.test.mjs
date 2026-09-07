@@ -61,11 +61,12 @@ test("dealt-pad knobs reach the engine together, seed and sk as substituted secr
   // a bank without explicit keys takes this box's own identity from the guest agent's bootstrap file, never a partial one
   assert.ok(manager.includes('if env["SHIELDED_PAD_SOURCE"].startswith("http://") and "SHIELDED_PAD_SEED" not in env:'), "bootstrap only fills a bank source without explicit keys");
   assert.ok(manager.includes('"METAL_PADS_BOOTSTRAP", "/run/enclave/pads/bootstrap.json"'), "the bootstrap path is the agent's");
-  for (const f of ['"SHIELDED_PAD_SEED": b["seed"]', '"SHIELDED_PAD_SEED_ID": b["seed_id"]', '"SHIELDED_PAD_SK": b["sk"]', '"SHIELDED_PAD_LEDGER_PK": b["ledger_pk"]', '"SHIELDED_PAD_WINDOW_URL": b["window_url"]'])
+  for (const f of ['"SHIELDED_PAD_SEED": b["seed"]', '"SHIELDED_PAD_SEED_ID": b["seed_id"]', '"SHIELDED_PAD_SK": b["sk"]', '"SHIELDED_PAD_LEDGER_PK": b["ledger_pk"]', '"SHIELDED_PAD_WINDOW_URL": b["window_url"]', 'out["SHIELDED_PAD_AGENT_TOKEN"] = b["token"]'])
     assert.ok(manager.includes(f), f);
   const agent = fs.readFileSync(path.join(ROOT, "metal/guest/agent.mjs"), "utf8");
-  for (const f of ["seed_id: r.body.seed_id", "seed: seed.toString('hex')", "sk: padSkHex", "ledger_pk: key.body.key", "window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`", "bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments`"])
+  for (const f of ["seed_id: r.body.seed_id", "seed: seed.toString('hex')", "sk: padSkHex", "ledger_pk: key.body.key", "window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`", "bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments`", "token: PADS_TOKEN"])
     assert.ok(agent.includes(f), "agent writes " + f);
+  assert.ok(tee.includes('getenv("SHIELDED_PAD_AGENT_TOKEN")') && agent.includes("!padsAuthorized(req)"), "the engine sends the token; the agent refuses without it");
   // "platform" as the source = the store through the agent's proxy, and never a half-configured link
   assert.ok(manager.includes('if env["SHIELDED_PAD_SOURCE"] == "platform":'), "platform keyword");
   assert.ok(manager.includes('env.pop("SHIELDED_PAD_SOURCE")'), "no identity -> no dealt env at all");

@@ -270,6 +270,12 @@ verification failures, exit 0, exact text.
   Found on the way: the worker mint's balanced reduction mapped u = -M/2 to
   M/2+1, which the writer refuses (1 in 14M values; fixed to the writer's
   [-M/2, M/2] like sh_balanced).
+- DONE 2026-09-07, hardening: the agent's per-boot token gates /pads/window
+  and /pads/receipt (SHIELDED_PAD_AGENT_TOKEN from the bootstrap; tenants
+  share the loopback namespace), and a dealt link that cannot START refuses
+  the request like exhaustion does (it used to fall back to computing the
+  whole model in the clear). Pixel 8 Pro run 10 consumed shipments minted by
+  `dealer-loop --all --worker` through the CPU worker: receipt recorded.
   Still to do for metal0: deploy the relay's pads routes (relay/deploy.sh,
   Steven), run `dealer-loop.py --all` on a platform GPU box with
   `--worker`, and a deployment config with `nnShieldedPadSource: "platform"`.

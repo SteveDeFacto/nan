@@ -23,6 +23,10 @@ int sh_http_request(const char *method, const char *url, const char *content_typ
                     const void *body, size_t body_len, int timeout_ms,
                     sh_http_sink sink, void *ctx, int *status);
 
+/* A bearer sent on every request from now on (the loopback agent's per-boot
+ * token: tenants share the loopback namespace, so a window or a receipt must
+ * carry proof it came from the engine the manager configured). NULL clears. */
+void sh_http_set_bearer(const char *token);
 /* GET into memory: *out is malloc'd and NUL-terminated (caller frees). */
 int sh_http_get(const char *url, int timeout_ms, uint8_t **out, size_t *out_len, int *status);
 /* POST a JSON body, answer into memory. */

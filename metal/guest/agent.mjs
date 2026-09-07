@@ -64,6 +64,12 @@ log(`transport key fingerprint ${keyFp.toString('hex').slice(0, 16)}…`);
 // the RAD port (POST /pads/window): a signed reserve by this transport key,
 // answered with the platform ledger's own signature, which the engine pins.
 const PADS_DIR = process.env.METAL_PADS_DIR || '/run/enclave/pads';
+// tenants share the loopback namespace: a window or a receipt must carry the
+// per-boot token the manager hands the engine (bootstrap.json), or it is
+// nobody's and refused - burning a tenant's windows or inflating its usage
+// would otherwise cost one loopback POST
+const PADS_TOKEN = randomBytes(32).toString('hex');
+const padsAuthorized = (req) => req.headers.authorization === 'Bearer ' + PADS_TOKEN;
 const padPair = generateKeyPairSync('x25519');
 const padPkHex = Buffer.from(padPair.publicKey.export({ type: 'spki', format: 'der' })).subarray(-32).toString('hex');
 const padSkHex = Buffer.from(padPair.privateKey.export({ type: 'pkcs8', format: 'der' })).subarray(-32).toString('hex');
@@ -117,7 +123,7 @@ async function padsBootstrap() {
   fs.mkdirSync(PADS_DIR, { recursive: true, mode: 0o700 });
   const out = { name: NAME, seed_id: r.body.seed_id, epoch: r.body.epoch, seed: seed.toString('hex'), sk: padSkHex,
                 ledger_pk: key.body.key, window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`,
-                bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments` };
+                bank_url: `http://127.0.0.1:${RAD_PORT}/pads/shipments`, token: PADS_TOKEN };
   const file = `${PADS_DIR}/bootstrap.json`, tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(out), { mode: 0o600 });
   fs.renameSync(tmp, file);
@@ -217,6 +223,9 @@ function buildRad() {
 
 // --- RAD endpoint (loopback; the supervisor's ATTESTATION_URL points here) ---
 http.createServer((req, res) => {
+  if (req.method === 'POST' && (req.url === '/pads/receipt' || req.url === '/pads/window') && !padsAuthorized(req)) {
+    res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'no_token', message: 'the engine sends the bootstrap token as a bearer' })); return;
+  }
   if (req.method === 'POST' && req.url === '/pads/receipt') {
     // a tenant engine's usage since its last receipt: signed here as this box's word
     let raw = '';

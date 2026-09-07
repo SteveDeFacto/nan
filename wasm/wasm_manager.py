@@ -2447,6 +2447,8 @@ def _pads_bootstrap_env(path=None):
            "SHIELDED_PAD_LEDGER_PK": b["ledger_pk"], "SHIELDED_PAD_WINDOW_URL": b["window_url"]}
     if isinstance(b.get("bank_url"), str) and b["bank_url"].startswith("http://"):
         out["SHIELDED_PAD_BANK_URL"] = b["bank_url"]          # not an engine env: the caller maps it to SHIELDED_PAD_SOURCE
+    if hexs(b.get("token"), 64):
+        out["SHIELDED_PAD_AGENT_TOKEN"] = b["token"]          # the agent's per-boot bearer for windows and receipts
     return out
 
 

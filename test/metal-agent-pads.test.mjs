@@ -21,7 +21,8 @@ import { createPadsLedger, windowMessage } from "../relay/pads.mjs";
 const AGENT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "metal", "guest", "agent.mjs");
 const freePort = () => new Promise((r) => { const s = net.createServer().listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const readJson = (req) => new Promise((resolve) => { let raw = ""; req.on("data", (c) => (raw += c)); req.on("end", () => { try { resolve(JSON.parse(raw || "{}")); } catch { resolve({}); } }); });
-const postJson = (url, body) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() }));
+let bearer = "";
+const postJson = (url, body, auth = true) => fetch(url, { method: "POST", headers: { "content-type": "application/json", ...(auth && bearer ? { authorization: "Bearer " + bearer } : {}) }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() }));
 
 test("agent: pad key in the RAD, seed bootstrapped after attach, /pads/window relays a reserve the ledger signs", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-pads-"));
@@ -87,6 +88,12 @@ test("agent: pad key in the RAD, seed bootstrapped after attach, /pads/window re
   assert.equal(boot.ledger_pk, ledger.key());
   assert.equal(boot.window_url, `http://127.0.0.1:${radPort}/pads/window`);
   assert.match(boot.sk, /^[0-9a-f]{64}$/);
+  assert.match(boot.token, /^[0-9a-f]{64}$/);
+  bearer = boot.token;
+  // without the per-boot token, windows and receipts are nobody's
+  assert.equal((await postJson(boot.window_url, { want: 8, seed_id: boot.seed_id }, false)).status, 401);
+  assert.equal((await postJson(`http://127.0.0.1:${radPort}/pads/receipt`, { seed_id: boot.seed_id, pads: 1, tokens: 1 }, false)).status, 401);
+  assert.equal(ledger.mark(boot.seed_id).mark, 0);
   // the pad secret in the file is the private half of the key in the RAD
   const pk = createPublicKey({ key: Buffer.concat([Buffer.from("302e020100300506032b656e04220420", "hex"), Buffer.from(boot.sk, "hex")]), format: "der", type: "pkcs8" });
   assert.equal(Buffer.from(pk.export({ type: "spki", format: "der" })).subarray(-32).toString("hex"), rad.padKey);

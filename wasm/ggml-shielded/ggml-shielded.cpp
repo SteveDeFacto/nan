@@ -884,6 +884,17 @@ static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
     if (s.dirty && s.link && !s.link_failed) {
         const double t0 = sh_now_ms();
         const int rc = sh_link_start(s.link);
+        if (rc != SH_OK && sh_link_is_dealt(s.link)) {
+            /* Dealt pads configured and no way to run them (no window, no
+             * shipment, no worker): the same refusal as exhaustion. Computing
+             * the whole model in the clear here would be silent and ten times
+             * slower; the request fails, the next one retries the start. */
+            SH_LOG("dealt pads: cannot start (%s); refusing to proceed without dealt pads, retrying in %.0f s\n",
+                   sh_link_last_error(s.link), s.link_backoff_ms / 1000);
+            sh_link_down(s);
+            s.dirty = false;
+            return GGML_STATUS_FAILED;
+        }
         if (rc != SH_OK) {
             SH_LOG("worker unavailable (%s); computing in the enclave, retrying in %.0f s\n",
                    sh_link_last_error(s.link), s.link_backoff_ms / 1000);

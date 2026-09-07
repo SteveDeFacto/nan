@@ -13,6 +13,11 @@
 
 typedef struct { char host[256]; char port[8]; char path[1200]; } sh_url;
 
+static char g_bearer[256] = "";
+void sh_http_set_bearer(const char *token) {
+    if (token && *token) snprintf(g_bearer, sizeof g_bearer, "%s", token); else g_bearer[0] = 0;
+}
+
 static int url_parse(const char *url, sh_url *u) {
     if (!url || strncmp(url, "http://", 7)) return -1;
     const char *p = url + 7, *slash = strchr(p, '/');
@@ -107,10 +112,11 @@ int sh_http_request(const char *method, const char *url, const char *content_typ
     if (fd < 0) return -1;
     char hdr[2048];
     int hn = snprintf(hdr, sizeof hdr,
-                      "%s %s HTTP/1.1\r\nHost: %s:%s\r\nUser-Agent: enclave-shielded/1\r\nAccept: */*\r\nConnection: close\r\n%s%s%s"
+                      "%s %s HTTP/1.1\r\nHost: %s:%s\r\nUser-Agent: enclave-shielded/1\r\nAccept: */*\r\nConnection: close\r\n%s%s%s%s%s%s"
                       "Content-Length: %zu\r\n\r\n",
                       method, u.path, u.host, u.port,
                       content_type ? "Content-Type: " : "", content_type ? content_type : "", content_type ? "\r\n" : "",
+                      g_bearer[0] ? "Authorization: Bearer " : "", g_bearer[0] ? g_bearer : "", g_bearer[0] ? "\r\n" : "",
                       body ? body_len : (size_t)0);
     if (hn <= 0 || (size_t)hn >= sizeof hdr || write_all(fd, hdr, (size_t)hn) || (body && body_len && write_all(fd, body, body_len))) { close(fd); return -1; }
 

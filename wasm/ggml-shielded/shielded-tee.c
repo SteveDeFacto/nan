@@ -473,6 +473,8 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
             }
             snprintf(l->win_url, sizeof l->win_url, "%s", wurl);
             l->have_win_pk = true;
+            const char *tok = getenv("SHIELDED_PAD_AGENT_TOKEN");
+            if (tok && *tok) sh_http_set_bearer(tok);      /* the agent's per-boot token: our windows and receipts, nobody else's */
         }
     }
     l->refill_cost_priority = env_int("SHIELDED_REFILL_COST_PRIORITY", 0, 0, 1);
