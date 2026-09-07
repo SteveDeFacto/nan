@@ -195,6 +195,10 @@ final class PadsClient {
 
     /** The bank on this phone (P3 fetches it from the operator's box): every .pads file in `dir`,
      *  streamed into the VM one connection each. Files already streamed are skipped by name. */
+    /** <seed>-<index0>-<count>.pads -> index0 (Long.MAX_VALUE when the name does not parse). */
+    static long indexOf(String name) {
+        try { String[] p = name.substring(0, name.length() - 5).split("-"); return Long.parseLong(p[p.length - 2]); } catch (Exception e) { return Long.MAX_VALUE; }
+    }
     static void streamBank(Object vm, java.io.File dir) {
         java.util.Set<String> done = new java.util.HashSet<>();
         for (int round = 0; round < 3600 && !Main.ended(); round++) {
@@ -202,7 +206,9 @@ final class PadsClient {
             final String mine = seedId.isEmpty() ? null : seedId + "-";
             java.io.File[] files = mine == null ? null : dir.listFiles((d, n) -> n.endsWith(".pads") && n.startsWith(mine));   // this seed only
             if (files != null) {
-                java.util.Arrays.sort(files);
+                // by first index, not by name: "…-128-64" sorts before "…-64-64" as a string, and the engine
+                // starves at index 64 while the store fills with the later shipment (seen with 4 in flight)
+                java.util.Arrays.sort(files, (x, y) -> Long.compare(indexOf(x.getName()), indexOf(y.getName())));
                 for (java.io.File f : files) {
                     if (done.contains(f.getName())) continue;
                     ParcelFileDescriptor pfd = Main.connect(vm, PADS_PORT, 50);
