@@ -275,11 +275,15 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
         return ++n_gen < n_predict; };
     int n_past = n_loaded + n, mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
     double t_draft = 0, t_verify = 0, t_observe = 0;   /* where a round's wall time goes (us) */
+    /* steady state = after the first decode step: when the prompt prefilled on the CPU (wider than
+     * the link's 8 rows) the first offloaded graph also ships the weights to the worker (~50 s) */
+    long t_steady0 = 0; int n_gen_steady0 = 0;
     const long t_tg0 = ggml_time_us();
     cur = argmax(llama_get_logits_ith(ctx, -1));
     if (mtp && n > 0) { if (anchor_mtp_harvest(mtp, ctx, n) || anchor_mtp_observe(mtp, n_loaded, toks.data(), n)) { outf("ENGINE MTP: the head could not observe the prompt; decoding plainly"); anchor_mtp_free(mtp); mtp = nullptr; } }
     bool go = n_predict > 0 && emit(cur);
     while (go) {
+        if (t_steady0 == 0 && n_gen > 1) { t_steady0 = ggml_time_us(); n_gen_steady0 = n_gen; }
         if (!mtp) {
             if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) { outf("ENGINE decode failed"); dump_err(); break; }
             n_past++; cur = argmax(llama_get_logits_ith(ctx, -1)); go = emit(cur); continue;
@@ -314,8 +318,9 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     uint64_t off = 0, loc = 0, macs = 0, vf = 0;
     if (stats) stats(&off, &loc, &macs, &vf);
     outf("{\"engine\":\"avf-pvm\",\"prompt_tokens\":%d,\"generated\":%d,\"completion\":\"%s\",\"prefill_ms\":%.0f,"
-         "\"decode_ms_per_tok\":%.1f,\"offloaded_nodes\":%llu,\"local_nodes\":%llu,\"gmac\":%.2f,\"verify_fail\":%llu,\"threads\":%d}",
+         "\"decode_ms_per_tok\":%.1f,\"decode_ms_per_tok_steady\":%.1f,\"offloaded_nodes\":%llu,\"local_nodes\":%llu,\"gmac\":%.2f,\"verify_fail\":%llu,\"threads\":%d}",
          n, n_gen, out.c_str(), (t_pp1 - t_pp0) / 1e3, n_gen ? (t_tg1 - t_tg0) / 1e3 / n_gen : 0.0,
+         (t_steady0 && n_gen > n_gen_steady0) ? (t_tg1 - t_steady0) / 1e3 / (n_gen - n_gen_steady0) : 0.0,
          (unsigned long long)off, (unsigned long long)loc, macs / 1e9, (unsigned long long)vf, n_threads);
     if (pads && pads_used) { uint64_t pu = 0, pm = 0; pads_used(&pu, &pm); pads_receipt(pads, pu, (uint64_t)n + (uint64_t)n_gen); }
     /* the backend's profile lines (SHIELDED_PROFILE=1: exchange counts, mask/wire/unmask
