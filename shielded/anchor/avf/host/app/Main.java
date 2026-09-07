@@ -63,6 +63,8 @@ public class Main extends Activity {
         String worker = "127.0.0.1:9500"; String mode = "bridge";
         String relay = null; String name = "phone-anchor";
         String model = "/data/local/tmp/anchor/gg/model.gguf"; String prompt = "The capital of France is"; int n = 8; int threads = 4; long storageMib = 0;
+        int mtp = 0;                         // engine: draft k tokens per round with the model's own MTP head (0 = plain decode)
+        int boost = 0;                       // engine: spinning threads in the VM that keep the phone's clocks up between exchanges
         String shapes = "256,256,1,30,0;896,896,1,30,0;896,4864,2,12,0";
         String pads = "";                    // dealt pads: bank dir of .pads files on this phone; "" = the VM mints its own
         String prefix = "", prefixPk = "";   // shared-prefix KV dir (prefix.kv + .sig + prefix.txt) and the platform's prefix key
@@ -83,7 +85,7 @@ public class Main extends Activity {
             if (i.getStringExtra("prefixpk") != null) p.prefixPk = i.getStringExtra("prefixpk");   // the platform's prefix key (64 hex) the VM pins
             if (i.getStringExtra("prefixname") != null) p.prefixName = i.getStringExtra("prefixname");       // fetch <name>.kv/.sig/.txt from the platform's store...
             if (i.getStringExtra("prefixdigest") != null) p.prefixDigest = i.getStringExtra("prefixdigest"); // ...for this model digest, into files/prefix
-            p.n = i.getIntExtra("n", p.n); p.threads = i.getIntExtra("threads", p.threads); p.storageMib = i.getIntExtra("storage", (int) p.storageMib);
+            p.n = i.getIntExtra("n", p.n); p.threads = i.getIntExtra("threads", p.threads); p.mtp = i.getIntExtra("mtp", p.mtp); p.boost = i.getIntExtra("boost", p.boost); paceBytesPerSec = (long) i.getIntExtra("pace_mbps", 0) << 20; p.storageMib = i.getIntExtra("storage", (int) p.storageMib);
             if (p.mode.equals("engine")) {                                         // the model lives in the VM
                 if (i.getIntExtra("mem", 0) == 0) p.memMib = 4096;
                 if (i.getIntExtra("storage", 0) == 0) p.storageMib = 2048;             // encrypted storage: the model's home, kept across runs
@@ -273,9 +275,9 @@ public class Main extends Activity {
             if (plan.mode.equals("engine")) {
                 long bytes = new java.io.File(plan.model).length();
                 String sha = RelayAttach.hex(fileSha256(plan.model));
-                cmd.append("ENGINE model_bytes=").append(bytes).append(" model_sha256=").append(sha).append(" n=").append(plan.n).append(" threads=").append(plan.threads)
+                cmd.append("ENGINE model_bytes=").append(bytes).append(" model_sha256=").append(sha).append(" n=").append(plan.n).append(" threads=").append(plan.threads).append(" mtp=").append(plan.mtp).append(" boost=").append(plan.boost)
                    .append(" prompt=").append(RelayAttach.hex(plan.prompt.getBytes("UTF-8"))).append(pads ? " pads=1" : "").append(prefix ? " prefix=1" : "").append('\n');
-                say("ENGINE plan: " + plan.model + " (" + (bytes >> 20) + " MiB), " + plan.n + " tokens, " + plan.threads + " threads" + (pads ? ", dealt pads from " + plan.pads : ""));
+                say("ENGINE plan: " + plan.model + " (" + (bytes >> 20) + " MiB), " + plan.n + " tokens, " + plan.threads + " threads" + (plan.mtp > 0 ? ", MTP draft k=" + plan.mtp : "") + (pads ? ", dealt pads from " + plan.pads : ""));
                 if (pads) { final java.io.File bank = new java.io.File(plan.pads); new Thread(() -> PadsClient.streamBank(vm, bank), "vsock-pads").start(); }
                 if (prefix) { final java.io.File pdir = new java.io.File(plan.prefix); new Thread(() -> PadsClient.streamFiles(vm, pdir, new String[] { "prefix.kv", "prefix.kv.sig", "prefix.txt" }), "vsock-prefix").start(); }
             }
@@ -355,7 +357,10 @@ public class Main extends Activity {
             ParcelFileDescriptor pfd = connect(vm, WORKER_PORT, 25);
             if (pfd == null) break;
             conn++;
-            try (Socket s = new Socket(host, port)) {
+            // A plain AF_INET socket (not Java's dual-stack v6-mapped one): over the USB NCM link the
+            // engine's stream from the app stalled the link within seconds while the same bytes from a
+            // shell (AF_INET) did not; bisecting that starts here.
+            try (Socket s = new Socket(java.net.Inet4Address.getByName(host), port)) {
                 s.setTcpNoDelay(true);
                 final int id = conn;
                 say("BRIDGE #" + id + " guest<->" + plan.worker);
@@ -374,9 +379,27 @@ public class Main extends Activity {
             }
         }
     }
+    static volatile long paceBytesPerSec = 0;   // > 0: cap the guest->worker pump (the weight upload) to this rate; bursts up to 2 MB pass
     static long pipe(InputStream in, OutputStream out, String dir) {
         long total = 0; byte[] buf = new byte[65536];
-        try { int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); out.flush(); total += n; } } catch (Exception ignored) { }
+        // Token bucket for the "up" pump: the USB NCM link to the host wedged under sustained line-rate
+        // uploads (netbench: nondeterministic at ~40 MB/s, never seen at <= 24 MB/s); an exchange's
+        // burst (<= 2 MB) is never delayed, only a long stream is.
+        long tokens = 2L << 20, tLast = System.nanoTime(); final boolean pace = dir.equals("up") && paceBytesPerSec > 0;
+        // (No spin on available(): the vsock stream lacks FIONREAD, and spinning the TCP side made the
+        //  exchange slower, 5.4 -> 18 ms, by starving the phone's other threads; run24.)
+        try {
+            int n;
+            for (;;) {
+                if ((n = in.read(buf)) <= 0) break;
+                if (pace) {
+                    long now = System.nanoTime(); tokens = Math.min(2L << 20, tokens + (now - tLast) * paceBytesPerSec / 1_000_000_000L); tLast = now;
+                    if (tokens < n) { long wait = (n - tokens) * 1_000_000_000L / paceBytesPerSec; try { Thread.sleep(wait / 1_000_000L, (int) (wait % 1_000_000L)); } catch (InterruptedException ignored) { } tokens = 0; }
+                    else tokens -= n;
+                }
+                out.write(buf, 0, n); out.flush(); total += n;
+            }
+        } catch (Exception ignored) { }
         try { out.close(); } catch (Exception ignored) { }
         return total;
     }

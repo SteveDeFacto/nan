@@ -121,7 +121,7 @@ def main():
             except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
                 print(f"  store listing failed ({getattr(e, 'code', None) or getattr(e, 'reason', e)}); nothing re-pushed", flush=True); have = None
             if have is not None:
-                for p in shipments(a.out, seed_id):
+                for _, _, p in shipments(a.out, seed_id):   # (index0, count, path)
                     name = os.path.basename(p)
                     if have.get(name) == os.path.getsize(p): continue
                     try:

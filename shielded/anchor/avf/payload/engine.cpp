@@ -56,6 +56,9 @@ typedef ggml_threadpool *(*tp_new_fn)(ggml_threadpool_params *);
 #include "anchor_pads.h"
 #include "shielded-pads.h"
 #include "prefix-kv.h"
+#include "anchor_mtp.h"
+#include <atomic>
+#include <thread>
 extern "C" {
 #include "tweetnacl.h"
 }
@@ -137,6 +140,17 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     };
     llama_log_set(quiet_log, nullptr);
     setenv("SHIELDED_HOST", "adopted-fd", 1); setenv("SHIELDED_PORT", "0", 1);
+    /* The contention detector models an exchange's cost from the weight
+     * bytes it moves (a microsecond wire inside the box). On the phone the
+     * wire is milliseconds by construction, so every exchange looks "8x
+     * slower than it should be" and the detector parks the whole model on
+     * the phone's CPU. Not a signal here: never conclude contention. */
+    setenv("SHIELDED_CONTENTION_ABS_X", "1000000000", 0);
+    setenv("SHIELDED_CONTENTION_X", "1000000000", 0);
+    /* Spin on the reply instead of blocking: a vCPU that halts between
+     * exchanges pays the phone's wake-up latency ~100 times per token. */
+    /* no SHIELDED_SPIN_US here: a 20 ms spin-poll on the link thread took the wire from 5.4 to 18 ms
+     * per exchange on the phone (run24): the spinning vCPU starves the compute threads */
     setenv("SHIELDED_CALIB", calib_path, 1);
     setenv("SHIELDED_PROFILE", "1", 1);
 
@@ -161,7 +175,15 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
          access(calib_path, R_OK) == 0 ? "readable" : "MISSING", calib_path);
 
     llama_backend_init();
+    /* ANCHOR_MTP_K > 0: decode with the model's own MTP head as the draft
+     * (anchor_mtp.h). k proposals + the sampled token ride ONE exchange chain
+     * as k+1 rows (the shielded link takes up to 8), the target's logits
+     * verify them, rejected rows roll back through n_rs_seq recurrent-state
+     * snapshots. Greedy on both sides, so the text equals plain greedy. */
+    int mtp_k = 0; { const char *e = getenv("ANCHOR_MTP_K"); if (e) mtp_k = atoi(e); if (mtp_k > 7) mtp_k = 7; if (mtp_k < 0) mtp_k = 0; }
+    float mtp_pmin = 0.0f; { const char *e = getenv("ANCHOR_MTP_PMIN"); if (e) mtp_pmin = (float)atof(e); }
     llama_model_params mp = llama_model_default_params(); mp.n_gpu_layers = 0;
+    mp.load_mtp = mtp_k > 0;   /* the nextn head is opt-in since the fork's ddd4ec1 pin; without it the head tensors load as "unused" */
     char path[64]; snprintf(path, sizeof path, "/proc/self/fd/%d", model_fd);
     const long t_load0 = ggml_time_us();
     llama_model *model = llama_model_load_from_file(path, mp);
@@ -171,8 +193,21 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 512; cp.n_batch = 512; cp.n_threads = n_threads; cp.n_threads_batch = n_threads;
+    if (mtp_k > 0) cp.n_rs_seq = (uint32_t)mtp_k;
     llama_context *ctx = llama_init_from_model(model, cp);
     if (!ctx) { outf("ENGINE context failed"); return 2; }
+    anchor_mtp *mtp = mtp_k > 0 ? anchor_mtp_new(model, ctx, 512, 8, n_threads) : nullptr;
+    /* ANCHOR_BOOST_THREADS=n: n threads that only spin. The decode is ~100 short compute
+     * bursts per token between link waits, and the phone's governor answers that duty cycle
+     * with 0.4 GHz on the mid cores (measured: 402 MHz during decode, 2.1 GHz with burners,
+     * token rate +57% even with the burners competing). Spinning vCPUs keep the cores'
+     * utilization high, so the compute threads run at full clock. Off by default. */
+    std::atomic<bool> boost_on{true}; std::vector<std::thread> boost;
+    struct boost_guard { std::atomic<bool> &on; std::vector<std::thread> &th; ~boost_guard() { on.store(false); for (auto &t : th) if (t.joinable()) t.join(); } } boost_stop{boost_on, boost};
+    { const char *e = getenv("ANCHOR_BOOST_THREADS"); int nb = e ? atoi(e) : 0; if (nb > 16) nb = 16;
+      for (int i = 0; i < nb; i++) boost.emplace_back([&boost_on] { while (boost_on.load(std::memory_order_relaxed)) { for (int k = 0; k < 256; k++) __asm__ __volatile__("" ::: "memory"); } });
+      if (nb > 0) outf("ENGINE boost: %d spinning threads keep the clocks up", nb); }
+    if (mtp_k > 0) outf("ENGINE MTP draft: %s (k=%d, p_min=%.2f, rollback depth %u)", mtp ? "on" : "UNAVAILABLE (no nextn layer or symbols); decoding plainly", mtp_k, mtp_pmin, llama_n_rs_seq(ctx));
     /* one persistent CPU pool: without it every scheduler split respawns the threads (REPORT.md 12) */
     void *cpu_h = dlopen(cpu_so.c_str(), RTLD_NOW);
     tp_new_fn tp_new = cpu_h ? (tp_new_fn)dlsym(cpu_h, "ggml_threadpool_new") : nullptr;
@@ -212,7 +247,17 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     if (n < 0) { outf("ENGINE tokenize failed"); return 2; }
     toks.resize(n);
     const long t_pp0 = ggml_time_us();
-    if (n > 0 && llama_decode(ctx, llama_batch_get_one(toks.data(), n))) { outf("ENGINE prefill failed (%d tokens)", n); dump_err(); return 2; }
+    if (n > 0) {
+        int rc;
+        if (mtp) {   /* the head mirrors the prompt: it needs the target's nextn row at every prompt position */
+            llama_batch pb = llama_batch_init(n, 0, 1);
+            for (int i = 0; i < n; i++) { pb.token[i] = toks[i]; pb.pos[i] = n_loaded + i; pb.n_seq_id[i] = 1; pb.seq_id[i][0] = 0; pb.logits[i] = 1; }
+            pb.n_tokens = n;
+            rc = llama_decode(ctx, pb);
+            llama_batch_free(pb);
+        } else rc = llama_decode(ctx, llama_batch_get_one(toks.data(), n));
+        if (rc) { outf("ENGINE prefill failed (%d tokens)", n); dump_err(); return 2; }
+    }
     const long t_pp1 = ggml_time_us();
     { uint64_t o = 0, l = 0, m = 0, v = 0; if (stats) stats(&o, &l, &m, &v);
       outf("ENGINE prefill %d tokens in %.0f ms: %llu nodes offloaded, %llu local, %.2f GMAC, verify_fail %llu (first graph = weights to the worker + pool warm-up)",
@@ -220,20 +265,50 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
       if (o == 0) outf("ENGINE WARNING: nothing offloaded; the CPU backend repacked the weights, or the calibration did not match this model"); }
 
     std::string out; llama_token cur = 0; int n_gen = 0;
-    const long t_tg0 = ggml_time_us();
-    for (int i = 0; i < n_predict; i++) {
-        const float *logits = llama_get_logits_ith(ctx, -1);
-        const int n_vocab = llama_vocab_n_tokens(vocab);
-        int best = 0; float bv = logits[0];
-        for (int t = 1; t < n_vocab; t++) if (logits[t] > bv) { bv = logits[t]; best = t; }
-        cur = best;
-        if (llama_vocab_is_eog(vocab, cur)) break;
-        char piece[256]; int pn = llama_token_to_piece(vocab, cur, piece, sizeof piece, 0, true);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    auto argmax = [&](const float *logits) { int best = 0; float bv = logits[0]; for (int t = 1; t < n_vocab; t++) if (logits[t] > bv) { bv = logits[t]; best = t; } return (llama_token)best; };
+    /* false = end of generation (eog or the budget) */
+    auto emit = [&](llama_token t) { if (llama_vocab_is_eog(vocab, t)) return false;
+        char piece[256]; int pn = llama_token_to_piece(vocab, t, piece, sizeof piece, 0, true);
         if (pn > 0) { out.append(piece, pn); outf("TOKEN %.*s", pn, piece); }
-        n_gen++;
-        if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) { outf("ENGINE decode failed"); dump_err(); break; }
+        return ++n_gen < n_predict; };
+    int n_past = n_loaded + n, mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
+    double t_draft = 0, t_verify = 0, t_observe = 0;   /* where a round's wall time goes (us) */
+    const long t_tg0 = ggml_time_us();
+    cur = argmax(llama_get_logits_ith(ctx, -1));
+    if (mtp && n > 0) { if (anchor_mtp_harvest(mtp, ctx, n) || anchor_mtp_observe(mtp, n_loaded, toks.data(), n)) { outf("ENGINE MTP: the head could not observe the prompt; decoding plainly"); anchor_mtp_free(mtp); mtp = nullptr; } }
+    bool go = n_predict > 0 && emit(cur);
+    while (go) {
+        if (!mtp) {
+            if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) { outf("ENGINE decode failed"); dump_err(); break; }
+            n_past++; cur = argmax(llama_get_logits_ith(ctx, -1)); go = emit(cur); continue;
+        }
+        int32_t d[8]; int k = mtp_k; if (k > n_predict - n_gen - 1) k = n_predict - n_gen - 1;
+        const long t_r0 = ggml_time_us();
+        const int nd = k > 0 ? anchor_mtp_draft(mtp, cur, n_past, k, mtp_pmin, d) : 0;
+        const long t_r1 = ggml_time_us();
+        llama_token rows[9]; rows[0] = cur; for (int i = 0; i < nd; i++) rows[i + 1] = d[i];
+        llama_batch vb = llama_batch_init(nd + 1, 0, 1);
+        for (int i = 0; i <= nd; i++) { vb.token[i] = rows[i]; vb.pos[i] = n_past + i; vb.n_seq_id[i] = 1; vb.seq_id[i][0] = 0; vb.logits[i] = 1; }
+        vb.n_tokens = nd + 1;
+        const int rc = llama_decode(ctx, vb); llama_batch_free(vb);
+        const long t_r2 = ggml_time_us();
+        if (rc) { outf("ENGINE decode failed (verify of %d rows)", nd + 1); dump_err(); break; }
+        int acc = 0; while (acc < nd && argmax(llama_get_logits_ith(ctx, acc)) == d[acc]) acc++;
+        const llama_token bonus = argmax(llama_get_logits_ith(ctx, acc));
+        if (acc < nd && !llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past + acc + 1, -1)) { outf("ENGINE MTP: rollback of %d rows REFUSED (n_rs_seq %u)", nd - acc, llama_n_rs_seq(ctx)); break; }
+        if (anchor_mtp_harvest(mtp, ctx, acc + 1) || anchor_mtp_observe(mtp, n_past, rows, acc + 1)) { outf("ENGINE MTP: observe failed; decoding plainly from here"); anchor_mtp_free(mtp); mtp = nullptr; }
+        n_past += acc + 1; mtp_rounds++; mtp_drafted += nd; mtp_accepted += acc;
+        t_draft += t_r1 - t_r0; t_verify += t_r2 - t_r1; t_observe += ggml_time_us() - t_r2;
+        go = true; for (int i = 0; i < acc && go; i++) go = emit(d[i]);
+        if (go) go = emit(bonus);
+        cur = bonus;
     }
     const long t_tg1 = ggml_time_us();
+    if (mtp_rounds) outf("ENGINE MTP: %d rounds, %d drafted, %d accepted (%.2f tokens per round, %.0f%% of drafts); per round: draft %.0f ms, verify %.0f ms, rollback+observe %.0f ms",
+                         mtp_rounds, mtp_drafted, mtp_accepted, (double)(mtp_accepted + mtp_rounds) / mtp_rounds, mtp_drafted ? 100.0 * mtp_accepted / mtp_drafted : 0.0,
+                         t_draft / 1e3 / mtp_rounds, t_verify / 1e3 / mtp_rounds, t_observe / 1e3 / mtp_rounds);
+    if (mtp) anchor_mtp_free(mtp);
     uint64_t off = 0, loc = 0, macs = 0, vf = 0;
     if (stats) stats(&off, &loc, &macs, &vf);
     outf("{\"engine\":\"avf-pvm\",\"prompt_tokens\":%d,\"generated\":%d,\"completion\":\"%s\",\"prefill_ms\":%.0f,"
@@ -241,6 +316,22 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
          n, n_gen, out.c_str(), (t_pp1 - t_pp0) / 1e3, n_gen ? (t_tg1 - t_tg0) / 1e3 / n_gen : 0.0,
          (unsigned long long)off, (unsigned long long)loc, macs / 1e9, (unsigned long long)vf, n_threads);
     if (pads && pads_used) { uint64_t pu = 0, pm = 0; pads_used(&pu, &pm); pads_receipt(pads, pu, (uint64_t)n + (uint64_t)n_gen); }
+    /* the backend's profile lines (SHIELDED_PROFILE=1: exchange counts, mask/wire/unmask
+     * time, pad waits) live in stderr; hand the owner the summary so a run explains itself */
+    if (err_path[0]) {
+        FILE *f = fopen(err_path, "r");
+        if (f) {
+            char line[1024]; int warned = 0;
+            while (fgets(line, sizeof line, f)) {
+                const bool summary = strstr(line, "[shielded] profile: exchanges") || strstr(line, "[shielded] widths:");
+                const bool warning = strstr(line, "[shielded]") && (strstr(line, "offload failed") || strstr(line, "refus") || strstr(line, "contend") || strstr(line, "unavailable") || strstr(line, "cannot") || strstr(line, "REJECT") || strstr(line, "stopped") || strstr(line, "link:"));
+                if (!summary && !(warning && warned < 12)) continue;
+                if (warning) warned++;
+                line[strcspn(line, "\n")] = 0; outf("ENGINE %s", line);
+            }
+            fclose(f);
+        }
+    }
     llama_free(ctx); llama_model_free(model);
     return 0;
 }
