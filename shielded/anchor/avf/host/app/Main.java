@@ -65,6 +65,8 @@ public class Main extends Activity {
         String model = "/data/local/tmp/anchor/gg/model.gguf"; String prompt = "The capital of France is"; int n = 8; int threads = 4; long storageMib = 0;
         String shapes = "256,256,1,30,0;896,896,1,30,0;896,4864,2,12,0";
         String pads = "";                    // dealt pads: bank dir of .pads files on this phone; "" = the VM mints its own
+        String prefix = "", prefixPk = "";   // shared-prefix KV dir (prefix.kv + .sig + prefix.txt) and the platform's prefix key
+        String prefixName = "", prefixDigest = "";   // or fetch them from the platform store by (model digest, name)
         static Plan from(Intent i) {
             Plan p = new Plan(); if (i == null) return p;
             if (i.getStringExtra("payload") != null) p.payload = i.getStringExtra("payload");
@@ -77,6 +79,10 @@ public class Main extends Activity {
             if (i.getStringExtra("model") != null) p.model = i.getStringExtra("model");
             if (i.getStringExtra("prompt") != null) p.prompt = i.getStringExtra("prompt");
             if (i.getStringExtra("pads") != null) p.pads = i.getStringExtra("pads");     // dealt pads: a bank dir of .pads files on this phone ("" = off)
+            if (i.getStringExtra("prefix") != null) p.prefix = i.getStringExtra("prefix");   // shared-prefix KV: a dir holding prefix.kv, prefix.kv.sig, prefix.txt
+            if (i.getStringExtra("prefixpk") != null) p.prefixPk = i.getStringExtra("prefixpk");   // the platform's prefix key (64 hex) the VM pins
+            if (i.getStringExtra("prefixname") != null) p.prefixName = i.getStringExtra("prefixname");       // fetch <name>.kv/.sig/.txt from the platform's store...
+            if (i.getStringExtra("prefixdigest") != null) p.prefixDigest = i.getStringExtra("prefixdigest"); // ...for this model digest, into files/prefix
             p.n = i.getIntExtra("n", p.n); p.threads = i.getIntExtra("threads", p.threads); p.storageMib = i.getIntExtra("storage", (int) p.storageMib);
             if (p.mode.equals("engine")) {                                         // the model lives in the VM
                 if (i.getIntExtra("mem", 0) == 0) p.memMib = 4096;
@@ -136,7 +142,9 @@ public class Main extends Activity {
         return ok;
     }
 
+    static java.io.File filesDir = new java.io.File("/data/user/0/host.enclave.anchor.avf/files");
     static void runVm(Context ctx, Plan plan) {
+        filesDir = ctx.getFilesDir();
         try {
             say("HOST start payload=" + plan.payload + " debug=" + plan.debug + " mem=" + plan.memMib + "MiB worker=" + plan.worker + " mode=" + plan.mode + " host=" + ctx.getClass().getSimpleName());
             Object vmm = ctx.getSystemService("virtualization");
@@ -247,15 +255,29 @@ public class Main extends Activity {
             boolean pads = false;
             if (relay != null && !padKey.isEmpty() && !plan.pads.isEmpty())
                 pads = PadsClient.bootstrap(PadsClient.httpBase(plan.relay), plan.name, out, r);
+            // 4c. shared-prefix KV: the VM pins the platform's prefix key; the files follow over the pads port
+            boolean prefix = false;
+            if (plan.prefix.isEmpty() && !plan.prefixName.isEmpty() && plan.prefixDigest.matches("[0-9a-f]{64}") && relay != null) {
+                java.io.File pdir = new java.io.File(filesDir, "prefix");
+                if (PadsClient.fetchPrefix(PadsClient.httpBase(plan.relay), plan.prefixDigest, plan.prefixName, pdir)) plan.prefix = pdir.getPath();
+                else say("PREFIX " + plan.prefixName + " not fetched; running without the shared prefix");
+            }
+            if (!plan.prefix.isEmpty() && plan.prefixPk.matches("[0-9a-f]{64}")) {
+                out.write(("PREFIXPK " + plan.prefixPk + "\n").getBytes()); out.flush();
+                String pl = PadsClient.until(r, "PREFIXPK ");
+                prefix = pl != null && pl.equals("PREFIXPK ok");
+                say("PREFIX key " + (prefix ? "pinned in the VM" : "NOT accepted: " + pl));
+            }
             // 5. the run plan
             StringBuilder cmd = new StringBuilder();
             if (plan.mode.equals("engine")) {
                 long bytes = new java.io.File(plan.model).length();
                 String sha = RelayAttach.hex(fileSha256(plan.model));
                 cmd.append("ENGINE model_bytes=").append(bytes).append(" model_sha256=").append(sha).append(" n=").append(plan.n).append(" threads=").append(plan.threads)
-                   .append(" prompt=").append(RelayAttach.hex(plan.prompt.getBytes("UTF-8"))).append(pads ? " pads=1" : "").append('\n');
+                   .append(" prompt=").append(RelayAttach.hex(plan.prompt.getBytes("UTF-8"))).append(pads ? " pads=1" : "").append(prefix ? " prefix=1" : "").append('\n');
                 say("ENGINE plan: " + plan.model + " (" + (bytes >> 20) + " MiB), " + plan.n + " tokens, " + plan.threads + " threads" + (pads ? ", dealt pads from " + plan.pads : ""));
                 if (pads) { final java.io.File bank = new java.io.File(plan.pads); new Thread(() -> PadsClient.streamBank(vm, bank), "vsock-pads").start(); }
+                if (prefix) { final java.io.File pdir = new java.io.File(plan.prefix); new Thread(() -> PadsClient.streamFiles(vm, pdir, new String[] { "prefix.kv", "prefix.kv.sig", "prefix.txt" }), "vsock-prefix").start(); }
             }
             if (plan.mode.equals("echo")) { cmd.append("ECHO\n"); new Thread(() -> echoBench(vm), "vsock-echo").start(); }
             cmd.append("WORKER ").append(plan.mode.equals("engine") ? "bridge" : plan.mode).append('\n');

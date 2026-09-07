@@ -143,6 +143,56 @@ final class PadsClient {
         } catch (Exception e) { Main.say("PADS sync error " + e); }
     }
 
+    /** The platform's shared-prefix artifacts (prefix-kv.h) for (model digest, name): prefix.kv,
+     *  prefix.kv.sig and prefix.txt fetched into `dir` (whole files, tmp-then-rename). True when all three are present. */
+    static boolean fetchPrefix(String httpBase, String digest, String name, java.io.File dir) {
+        try {
+            dir.mkdirs();
+            for (String ext : new String[] { ".kv", ".kv.sig", ".txt" }) {
+                java.io.File f = new java.io.File(dir, "prefix" + ext);
+                HttpURLConnection c = (HttpURLConnection) new URL(httpBase + "/v1/prefix-kv/" + digest + "/" + name + ext).openConnection();
+                c.setConnectTimeout(20000); c.setReadTimeout(120000);
+                if (c.getResponseCode() != 200) { Main.say("PREFIX fetch " + name + ext + " http " + c.getResponseCode()); return false; }
+                java.io.File tmp = new java.io.File(dir, ".prefix" + ext + ".part");
+                try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[1 << 20]; int n; while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                if (!tmp.renameTo(f)) { tmp.delete(); return false; }
+                Main.say("PREFIX fetched " + name + ext + " (" + (f.length() >> 10) + " KiB)");
+            }
+            return true;
+        } catch (Exception e) { Main.say("PREFIX fetch error " + e); return false; }
+    }
+
+    /** One file into the VM over the pads port (the H/G handshake, then the bytes). */
+    static boolean streamOne(Object vm, java.io.File f) {
+        ParcelFileDescriptor pfd = Main.connect(vm, PADS_PORT, 50);
+        if (pfd == null) { Main.say("PADS connect failed"); return false; }
+        try (OutputStream out = new FileOutputStream(pfd.getFileDescriptor()); InputStream in = new java.io.FileInputStream(f)) {
+            out.write(("PADS " + f.getName() + " " + f.length() + "\n").getBytes()); out.flush();
+            java.io.FileInputStream ackIn = new java.io.FileInputStream(pfd.getFileDescriptor());
+            int go = ackIn.read();
+            if (go == 'H') { Main.say("PADS " + f.getName() + " already in the VM"); return true; }
+            if (go != 'G') { Main.say("PADS " + f.getName() + " VM refused the header"); return false; }
+            byte[] buf = new byte[1 << 20]; int n; long sent = 0;
+            while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); sent += n; }
+            out.flush();
+            int ack = ackIn.read();
+            Main.say("PADS " + f.getName() + " " + (sent >> 10) + " KiB " + (ack == 'K' ? "accepted" : "REFUSED"));
+            return ack == 'K';
+        } catch (Exception e) { Main.say("PADS stream error " + e); return false; }
+        finally { try { pfd.close(); } catch (Exception ignored) { } }
+    }
+
+    /** A fixed set of files (the shared-prefix KV, its sidecar and the prefix text) into the VM. */
+    static void streamFiles(Object vm, java.io.File dir, String[] names) {
+        for (String name : names) {
+            java.io.File f = new java.io.File(dir, name);
+            if (!f.exists()) { Main.say("PREFIX missing " + f); continue; }
+            for (int attempt = 0; attempt < 30 && !streamOne(vm, f); attempt++) { try { Thread.sleep(1000); } catch (InterruptedException e) { return; } }
+        }
+    }
+
     /** The bank on this phone (P3 fetches it from the operator's box): every .pads file in `dir`,
      *  streamed into the VM one connection each. Files already streamed are skipped by name. */
     static void streamBank(Object vm, java.io.File dir) {

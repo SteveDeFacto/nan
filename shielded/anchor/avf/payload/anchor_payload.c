@@ -287,6 +287,7 @@ static int receive_model(int ls_model, uint64_t bytes, int *out_fd) {
 static uint8_t g_ppk[32], g_psk[32], g_ledger_pk[32], g_seed[32], g_seed_id[16];
 static char g_seed_id_hex[33] = "", g_pad_name[64] = "", g_pads_dir[512] = "";
 static int g_have_ledger = 0, g_have_seed = 0;
+static char g_prefix_pk_hex[65] = "";        /* PREFIXPK: the platform's shared-prefix key the engine pins (prefix-kv.h) */
 static void pads_dir(char *out, size_t cap) {
     const char *es = AVmPayload_getEncryptedStoragePath();
     if (es) snprintf(out, cap, "%s/pads", es); else snprintf(out, cap, "/data/anchor-pads");
@@ -351,7 +352,7 @@ static void *pads_receiver(void *arg) {
 }
 
 typedef int (*engine_main_fn)(int, int, int, const char *, const char *, const char *, int, int, const anchor_pads *);
-static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt, int n_predict, int threads, uint64_t model_bytes, int with_pads) {
+static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt, int n_predict, int threads, uint64_t model_bytes, int with_pads, int with_prefix) {
     const char *apk = AVmPayload_getApkContentsPath();
     char lib_dir[512], calib[512]; snprintf(lib_dir, sizeof lib_dir, "%s/lib/arm64-v8a", apk); snprintf(calib, sizeof calib, "%s/assets/model.calib", apk);
     int worker_fd = vs_accept(ls_wk, 60000);
@@ -367,8 +368,19 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
     }
     engine_main_fn em = (engine_main_fn)dlsym(h, "engine_main");
     if (!em) { OUT("ENGINE libengine.so has no engine_main"); return; }
+    if (AVmPayload_getEncryptedStoragePath()) setenv("ANCHOR_ENCRYPTED_STORE", AVmPayload_getEncryptedStoragePath(), 1);   /* engine.err lives there */
     anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex };
     const anchor_pads *pp = NULL;
+    if (with_prefix) {
+        /* the owner streams prefix.kv, prefix.kv.sig and prefix.txt over the
+         * pads port; the engine waits for them, verifies against PREFIXPK
+         * and this model, and prefills only the user's part */
+        if (!g_prefix_pk_hex[0]) { OUT("ENGINE prefix requested but no PREFIXPK from the owner; refusing"); close(worker_fd); close(model_fd); return; }
+        if (!g_pads_dir[0]) pads_dir(g_pads_dir, sizeof g_pads_dir);
+        char kv[600], pf[600]; snprintf(kv, sizeof kv, "%s/prefix.kv", g_pads_dir); snprintf(pf, sizeof pf, "%s/prefix.txt", g_pads_dir);
+        setenv("SHIELDED_PREFIX_KV", kv, 1); setenv("SHIELDED_PREFIX_FILE", pf, 1); setenv("SHIELDED_PREFIX_KV_PK", g_prefix_pk_hex, 1);
+        OUT("ENGINE shared-prefix KV expected at %s", kv);
+    }
     if (with_pads) {
         if (!g_have_seed || !g_have_ledger) { OUT("ENGINE pads requested but no seed/ledger from the owner; refusing to mint for myself"); close(worker_fd); close(model_fd); return; }
         pads_dir(g_pads_dir, sizeof g_pads_dir);
@@ -382,9 +394,12 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
         { FILE *cf = fopen(calib, "rb"); if (cf) { static uint8_t cb[1 << 20]; size_t n = fread(cb, 1, sizeof cb, cf); fclose(cf);
             uint8_t dg[64]; crypto_hash(dg, cb, n); char dh[65]; sh_pads_bin2hex(dg, 32, dh); setenv("SHIELDED_PAD_MODEL_DIGEST", dh, 1); } }
         memset(hs, 0, sizeof hs); memset(hsk, 0, sizeof hsk);
-        pthread_t th; pthread_create(&th, NULL, pads_receiver, (void *)(intptr_t)ls_pads); pthread_detach(th);
         pp = &pads;
         OUT("ENGINE dealt pads on: bank %s, seed %s", g_pads_dir, g_seed_id_hex);
+    }
+    if (with_pads || with_prefix) {
+        /* shipments, and the prefix files, ride the same port into the store */
+        pthread_t th; pthread_create(&th, NULL, pads_receiver, (void *)(intptr_t)ls_pads); pthread_detach(th);
     }
     OUT("ENGINE libraries loaded from %s; starting", lib_dir);
     int rc = em(g_ctl, worker_fd, model_fd, lib_dir, calib, prompt, n_predict, threads, pp);
@@ -496,12 +511,17 @@ int AVmPayload_main(void) {
     /* the owner's instructions; without an owner (a vm-tool run) the built-in local self-test */
     int bridge = 0, n_shapes = 0; int64_t SK[MAX_SHAPES], SN[MAX_SHAPES]; int Snode[MAX_SHAPES], Siter[MAX_SHAPES], Sx[MAX_SHAPES];
     int engine = 0, eng_n = 8, eng_threads = 4; uint64_t eng_model = 0; static char eng_prompt[2048] = "The capital of France is";
-    int echo = 0, with_pads = 0;
+    int echo = 0, with_pads = 0, with_prefix = 0;
     if (g_ctl >= 0) {
         char l[2400]; static char bound[2100] = "";
         while (read_line(g_ctl, l, sizeof l) >= 0) {
             if (!strncmp(l, "BOUND ", 6)) { strncpy(bound, l + 6, sizeof bound - 1); bound[sizeof bound - 1] = 0; }
             else if (!strncmp(l, "CHAL ", 5)) attest(l + 5, bound);
+            else if (!strncmp(l, "PREFIXPK ", 9)) {    /* the platform's shared-prefix key (prefix-kv.h) */
+                char h[65] = ""; uint8_t pk[32];
+                if (sscanf(l + 9, "%64s", h) == 1 && sh_pads_hex2bin(h, pk, 32)) { strncpy(g_prefix_pk_hex, h, 64); g_prefix_pk_hex[64] = 0; OUT("PREFIXPK ok"); }
+                else { g_prefix_pk_hex[0] = 0; OUT("PREFIXPK fail"); }
+            }
             else if (!strncmp(l, "PADLEDGER ", 10)) {  /* the relay's ledger key: windows are verified against it */
                 g_have_ledger = sh_pads_hex2bin(l + 10, g_ledger_pk, 32);
                 OUT("PADLEDGER %s", g_have_ledger ? "ok" : "fail");
@@ -535,6 +555,7 @@ int AVmPayload_main(void) {
                 if ((q = strstr(l, "threads="))) eng_threads = atoi(q + 8);
                 if ((q = strstr(l, "prompt="))) { size_t k = unhex(q + 7, (uint8_t *)eng_prompt, sizeof eng_prompt - 1); eng_prompt[k] = 0; }
                 with_pads = strstr(l, " pads=1") != NULL;
+                with_prefix = strstr(l, " prefix=1") != NULL;
             }
             else if (!strncmp(l, "SHAPE ", 6) && n_shapes < MAX_SHAPES) {
                 long long k, n; int nd, it, xm;
@@ -555,7 +576,7 @@ int AVmPayload_main(void) {
     }
     if (engine) {
         OUT("ANCHOR engine mode: model %" PRIu64 " bytes, %d tokens, %d threads", eng_model, eng_n, eng_threads);
-        run_engine(ls_wk, ls_model, ls_pads, eng_prompt, eng_n, eng_threads, eng_model, with_pads);
+        run_engine(ls_wk, ls_model, ls_pads, eng_prompt, eng_n, eng_threads, eng_model, with_pads, with_prefix);
         OUT("END");
         if (ls_model >= 0) close(ls_model); if (ls_wk >= 0) close(ls_wk); if (ls_ctl >= 0) close(ls_ctl);
         if (g_ctl >= 0) { shutdown(g_ctl, SHUT_WR); close(g_ctl); }

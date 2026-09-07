@@ -16,6 +16,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -36,7 +37,12 @@ static void outf(const char *fmt, ...) {
     __android_log_print(ANDROID_LOG_INFO, "anchor-engine", "%.*s", n, line);
     if (g_ctl >= 0) { const char *p = line; size_t left = (size_t)n + 1; while (left) { ssize_t w = write(g_ctl, p, left); if (w <= 0) break; p += w; left -= (size_t)w; } }
 }
-static void quiet_log(enum ggml_log_level, const char *, void *) {}   /* llama's load chatter stays off the control channel */
+/* llama's load chatter stays off the control channel; its warnings and errors
+ * go to stderr (the engine.err file in the encrypted store), which the owner
+ * sees as a tail when a step fails. */
+static void quiet_log(enum ggml_log_level level, const char *text, void *) {
+    if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) { fputs(text, stderr); fflush(stderr); }
+}
 
 typedef void (*stats_fn)(uint64_t *offloaded, uint64_t *local, uint64_t *macs, uint64_t *verify_fail);
 typedef void (*adopt_fn)(int fd);
@@ -49,6 +55,10 @@ typedef ggml_threadpool *(*tp_new_fn)(ggml_threadpool_params *);
  * ours to read for the whole run: the payload's loop is parked in engine_main. */
 #include "anchor_pads.h"
 #include "shielded-pads.h"
+#include "prefix-kv.h"
+extern "C" {
+#include "tweetnacl.h"
+}
 #include <sys/random.h>
 typedef int (*win_fn)(void *, uint64_t, uint64_t *, uint64_t *);
 typedef void (*set_win_fn)(win_fn, void *);
@@ -108,6 +118,23 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
                            const char *prompt, int n_predict, int n_threads, const anchor_pads *pads) {
     g_ctl = ctl_fd;
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* The backend's own diagnostics ("[shielded] ...") go to stderr, which
+     * nothing in the VM collects: keep them in the encrypted store and hand
+     * the tail to the owner when a step fails, so a refusal explains itself. */
+    static char err_path[512];
+    { const char *es = getenv("ANCHOR_ENCRYPTED_STORE"); snprintf(err_path, sizeof err_path, "%s/engine.err", es && *es ? es : "/data/local/tmp"); }
+    if (!freopen(err_path, "w", stderr)) { outf("ENGINE stderr not captured (%s: %s)", err_path, strerror(errno)); err_path[0] = 0; }
+    else outf("ENGINE stderr -> %s", err_path);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    auto dump_err = [&]() {
+        if (!err_path[0]) return;
+        FILE *f = fopen(err_path, "r"); if (!f) return;
+        std::vector<std::string> lines; char line[512];
+        while (fgets(line, sizeof line, f)) { line[strcspn(line, "\n")] = 0; if (line[0]) { lines.push_back(line); if (lines.size() > 400) lines.erase(lines.begin()); } }
+        fclose(f);
+        size_t from = lines.size() > 12 ? lines.size() - 12 : 0;
+        for (size_t i = from; i < lines.size(); i++) outf("ENGINE stderr: %s", lines[i].c_str());
+    };
     llama_log_set(quiet_log, nullptr);
     setenv("SHIELDED_HOST", "adopted-fd", 1); setenv("SHIELDED_PORT", "0", 1);
     setenv("SHIELDED_CALIB", calib_path, 1);
@@ -152,12 +179,40 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     if (tp_new) { ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads); ggml_threadpool *tp = tp_new(&tpp); llama_attach_threadpool(ctx, tp, tp); }
     outf("ENGINE context ready, %d threads, persistent pool=%s", n_threads, tp_new ? "yes" : "no");
 
-    std::vector<llama_token> toks(512);
-    int n = llama_tokenize(vocab, prompt, (int)strlen(prompt), toks.data(), (int)toks.size(), true, false);
+    /* The shared-prefix KV (prefix-kv.h): SHIELDED_PREFIX_KV names the file
+     * the owner streamed into the encrypted store, SHIELDED_PREFIX_FILE the
+     * prefix text, SHIELDED_PREFIX_KV_PK the platform's prefix key. The
+     * files may still be arriving over vsock: wait for them, verify the
+     * sidecar against this model (the calib digest) and the exact text,
+     * load the sequence, and prefill only the user's part. The prompt the
+     * owner sent is the user's part; the prefix goes in front of it here. */
+    int n_loaded = 0;
+    std::string full_prompt = prompt;
+    if (const char *kv = getenv("SHIELDED_PREFIX_KV"); kv && *kv) {
+        const char *pkh = getenv("SHIELDED_PREFIX_KV_PK"), *pf = getenv("SHIELDED_PREFIX_FILE");
+        uint8_t pk[32], digest[32];
+        if (!pkh || !sh_pads_hex2bin(pkh, pk, 32) || !pf) { outf("ENGINE prefix KV: missing SHIELDED_PREFIX_KV_PK / SHIELDED_PREFIX_FILE; refusing"); return 2; }
+        std::string side = std::string(kv) + ".sig";
+        for (int waited = 0; waited < 1200 && !(access(kv, R_OK) == 0 && access(side.c_str(), R_OK) == 0 && access(pf, R_OK) == 0); waited++) usleep(100000);
+        std::string prefix, cal;
+        auto slurp = [](const char *p, std::string &o) { FILE *f = fopen(p, "rb"); if (!f) return false; char b[65536]; size_t k; while ((k = fread(b, 1, sizeof b, f)) > 0) o.append(b, k); fclose(f); return true; };
+        if (!slurp(pf, prefix) || !slurp(calib_path, cal)) { outf("ENGINE prefix KV: files never arrived (%s)", pf); return 2; }
+        { uint8_t h[64]; crypto_hash(h, (const uint8_t *)cal.data(), cal.size()); memcpy(digest, h, 32); }
+        char err[256]; uint64_t ntok = 0;
+        if (sh_prefix_kv_verify(kv, pk, digest, prefix.data(), prefix.size(), &ntok, err, sizeof err)) { outf("ENGINE prefix KV REFUSED: %s", err); return 2; }
+        std::vector<llama_token> loaded(ntok + 16); size_t got = 0;
+        if (!llama_state_seq_load_file(ctx, kv, 0, loaded.data(), loaded.size(), &got) || got != ntok) { outf("ENGINE prefix KV load failed (%zu of %llu tokens)", got, (unsigned long long)ntok); return 2; }
+        n_loaded = (int)got;
+        full_prompt = prefix + prompt;
+        outf("ENGINE prefix KV: %d tokens loaded and verified (%s)", n_loaded, kv);
+    }
+    const char *rest = full_prompt.c_str() + (n_loaded ? full_prompt.size() - strlen(prompt) : 0);
+    std::vector<llama_token> toks(strlen(rest) + 16);
+    int n = llama_tokenize(vocab, rest, (int)strlen(rest), toks.data(), (int)toks.size(), n_loaded == 0, n_loaded != 0);
     if (n < 0) { outf("ENGINE tokenize failed"); return 2; }
     toks.resize(n);
     const long t_pp0 = ggml_time_us();
-    if (llama_decode(ctx, llama_batch_get_one(toks.data(), n))) { outf("ENGINE prefill failed"); return 2; }
+    if (n > 0 && llama_decode(ctx, llama_batch_get_one(toks.data(), n))) { outf("ENGINE prefill failed (%d tokens)", n); dump_err(); return 2; }
     const long t_pp1 = ggml_time_us();
     { uint64_t o = 0, l = 0, m = 0, v = 0; if (stats) stats(&o, &l, &m, &v);
       outf("ENGINE prefill %d tokens in %.0f ms: %llu nodes offloaded, %llu local, %.2f GMAC, verify_fail %llu (first graph = weights to the worker + pool warm-up)",
@@ -176,7 +231,7 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
         char piece[256]; int pn = llama_token_to_piece(vocab, cur, piece, sizeof piece, 0, true);
         if (pn > 0) { out.append(piece, pn); outf("TOKEN %.*s", pn, piece); }
         n_gen++;
-        if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) { outf("ENGINE decode failed"); break; }
+        if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) { outf("ENGINE decode failed"); dump_err(); break; }
     }
     const long t_tg1 = ggml_time_us();
     uint64_t off = 0, loc = 0, macs = 0, vf = 0;

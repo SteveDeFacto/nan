@@ -895,8 +895,8 @@ static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
              * shipment, no worker): the same refusal as exhaustion. Computing
              * the whole model in the clear here would be silent and ten times
              * slower; the request fails, the next one retries the start. */
-            SH_LOG("dealt pads: cannot start (%s); refusing to proceed without dealt pads, retrying in %.0f s\n",
-                   sh_link_last_error(s.link), s.link_backoff_ms / 1000);
+            fprintf(stderr, "[shielded] dealt pads: cannot start (%s); refusing to proceed without dealt pads, retrying in %.0f s\n",
+                    sh_link_last_error(s.link), s.link_backoff_ms / 1000);
             sh_link_down(s);
             s.dirty = false;
             return GGML_STATUS_FAILED;
