@@ -11,7 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync, writeFileSync } from "node:fs";
@@ -80,6 +80,28 @@ test("dealt pads: mint, read back, tamper, exhaustion, ledger window, link impor
 // the contract too. Truncating instead of rounding to nearest-even lands one ulp
 // low on about half of all blocks and fails NOWHERE -- the two sides simply derive
 // different weights and unmasking returns noise. Caught exactly once, here.
+test("dealt pads: minting through a worker (zero pads, product checked mod M) equals the in-process mint cell for cell", async (t) => {
+  // shielded/dealer/PLAN.md P4a: the dealer's OWN worker sees r unmasked and
+  // returns r.W = u at GPU speed. Proved here against the CPU reference
+  // worker (float64, exact); skipped where torch is not importable.
+  const py = spawnSync("python3", ["-c", "import torch, numpy"], { encoding: "utf8" });
+  if (py.status !== 0) return t.skip("worker.py needs torch + numpy");
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const worker = spawn("python3", [join(repo, "shielded", "worker.py"), "--host", "127.0.0.1", "--port", String(port), "--vram-gb", "1", "--device", "cpu"], { stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { try { worker.kill("SIGKILL"); } catch {} });
+  let wlog = "";
+  await new Promise((resolve, reject) => {
+    const onData = (d) => { wlog += d; if (wlog.includes("listening on")) resolve(); };
+    worker.stdout.on("data", onData); worker.stderr.on("data", onData);
+    worker.on("exit", (c) => reject(new Error("worker exited " + c + ":\n" + wlog)));
+    setTimeout(() => reject(new Error("worker never listened:\n" + wlog)), 30000);
+  });
+  const r = spawnSync(join(dir, "dealt-selftest"), { encoding: "utf8", timeout: 300_000, env: { ...process.env, SHIELDED_WORKER: `127.0.0.1:${port}` } });
+  assert.equal(r.status, 0, `dealt-selftest (worker mint) failed: ${r.signal || r.status} ${r.stderr || ""}`);
+  assert.match(r.stdout, /worker mint via 127\.0\.0\.1:\d+ identical on 40 cells/);
+  assert.match(r.stdout, /dealt-selftest: ok/);
+});
+
 test("the C fp16 conversion rounds like numpy, subnormals and overflow included", (t) => {
   if (!build()) return t.skip("no toolchain for the C backend");
   const out = execFileSync("python3", ["-c", `

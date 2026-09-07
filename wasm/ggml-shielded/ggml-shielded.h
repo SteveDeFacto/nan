@@ -55,6 +55,9 @@ GGML_BACKEND_API int ggml_backend_shielded_pool_version(void);
 /* Dealt pads: ledger windows from the host (a pVM's owner-app path) instead of
  * SHIELDED_PAD_LEDGER. Install before the first graph. */
 GGML_BACKEND_API void ggml_backend_shielded_set_window_provider(sh_window_fn fn, void *ctx);
+/* The same, through the card's worker (dealer runs with SHIELDED_ZERO_PADS=1). */
+GGML_BACKEND_API int ggml_backend_shielded_mint_worker(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
+                                                       uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path);
 GGML_BACKEND_API int ggml_backend_shielded_mint(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
                                                 uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path);
 

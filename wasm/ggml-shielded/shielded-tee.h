@@ -160,6 +160,9 @@ int sh_link_group_table(const sh_link *l, sh_pads_group *out, uint32_t cap);
 typedef int (*sh_window_fn)(void *ctx, uint64_t want, uint64_t *lo, uint64_t *hi);
 void sh_link_set_window_provider(sh_link *l, sh_window_fn fn, void *ctx);
 int sh_link_dealt_selftest(sh_link *l, int rows, int32_t *r_out, int32_t *u_out);
+/* The same shipment minted through the link's worker (needs SHIELDED_ZERO_PADS=1). */
+int sh_link_mint_shipment_worker(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
+                                 uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path);
 int sh_link_mint_shipment(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
                           uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path);
 /* Pool health: pads consumed, and how many had to be generated on the

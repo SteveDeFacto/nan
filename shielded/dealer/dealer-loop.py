@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--model"); ap.add_argument("--calib"); ap.add_argument("--out")
     ap.add_argument("--ahead", type=int, default=256); ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--once", action="store_true"); ap.add_argument("--interval", type=float, default=30.0)
+    ap.add_argument("--worker", default=os.environ.get("DEALER_WORKER", ""), help="host:port of the dealer's OWN worker (GPU minting; never an operator's)")
     ap.add_argument("--derive-only", action="store_true"); ap.add_argument("--plan-only", action="store_true")
     ap.add_argument("--push", action="store_true", help="upload each new shipment to the relay's store and delete spent ones there (needs PADS_DEALER_TOKEN)")
     a = ap.parse_args()
@@ -132,6 +133,7 @@ def main():
             ranges = ",".join(f"{i0}:{c}" for i0, c in want)
             tmpl = os.path.join(a.out, f"{seed_id}-{{index0}}-{{count}}.pads")
             cmd = [dealer, a.model, "--out", tmpl, "--seed", seed, "--seed-id", seed_id, "--pk", pk, "--ranges", ranges]
+            if a.worker: cmd += ["--worker", a.worker]
             env = {**os.environ, "SHIELDED_CALIB": a.calib}
             t0 = time.time()
             r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)

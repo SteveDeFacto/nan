@@ -40,7 +40,7 @@ static bool file_digest(const char *path, uint8_t out[32]) {
 
 int main(int argc, char **argv) {
     const char *model_path = argc > 1 ? argv[1] : nullptr;
-    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr, *ranges = nullptr;
+    const char *out = nullptr, *seed = nullptr, *seed_id = nullptr, *pk = nullptr, *ranges = nullptr, *worker = nullptr;
     uint64_t index0 = 0, count = 64;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--out")) out = argv[i + 1];
@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pk")) pk = argv[i + 1];
         else if (!strcmp(argv[i], "--index0")) index0 = strtoull(argv[i + 1], nullptr, 10);
         else if (!strcmp(argv[i], "--count")) count = strtoull(argv[i + 1], nullptr, 10);
+        else if (!strcmp(argv[i], "--worker")) worker = argv[i + 1];   /* host:port of the DEALER'S OWN worker: r goes to it unmasked, u = r.W comes back at GPU speed */
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     const char *backend = getenv("SHIELDED_SO"), *calib = getenv("SHIELDED_CALIB");
@@ -59,9 +60,21 @@ int main(int argc, char **argv) {
     }
     /* The weights register against a link that is never connected: a port
      * nothing listens on, and the whole card budget so every site registers. */
-    setenv("SHIELDED_HOST", "127.0.0.1", 0);
-    setenv("SHIELDED_PORT", "1", 0);
-    setenv("SHIELDED_RESERVE_BYTES", "1099511627776", 0);
+    if (worker) {
+        /* Minting through a worker the dealer owns: zero pads, so the wire
+         * carries r itself and the product IS u. Never point this at an
+         * operator's worker - it would learn every mask it later unmasks. */
+        std::string w = worker; const size_t c = w.rfind(':');
+        if (c == std::string::npos) { fprintf(stderr, "--worker needs host:port\n"); return 2; }
+        setenv("SHIELDED_HOST", w.substr(0, c).c_str(), 1);
+        setenv("SHIELDED_PORT", w.substr(c + 1).c_str(), 1);
+        setenv("SHIELDED_ZERO_PADS", "1", 1);
+        setenv("SHIELDED_PAD_CHECK", "1", 1);      /* builds the mod-M check vectors the mint verifies the worker with */
+    } else {
+        setenv("SHIELDED_HOST", "127.0.0.1", 0);
+        setenv("SHIELDED_PORT", "1", 0);
+        setenv("SHIELDED_RESERVE_BYTES", "1099511627776", 0);   /* dead link: the whole "card" so every site registers */
+    }
     setenv("SHIELDED_WARM_MS", "0", 0);
     if (const char *cpu_so = getenv("GGML_CPU_SO")) {
         if (!ggml_backend_load(cpu_so)) { fprintf(stderr, "cpu backend failed to load\n"); return 2; }
@@ -70,8 +83,8 @@ int main(int argc, char **argv) {
     if (!r) { fprintf(stderr, "shielded backend failed to load\n"); return 2; }
     void *h = dlopen(backend, RTLD_NOW | RTLD_NOLOAD);
     if (!h) h = dlopen(backend, RTLD_NOW);
-    mint_fn mint = h ? (mint_fn)dlsym(h, "ggml_backend_shielded_mint") : nullptr;
-    if (!mint) { fprintf(stderr, "ggml_backend_shielded_mint not exported by %s\n", backend); return 2; }
+    mint_fn mint = h ? (mint_fn)dlsym(h, worker ? "ggml_backend_shielded_mint_worker" : "ggml_backend_shielded_mint") : nullptr;
+    if (!mint) { fprintf(stderr, "ggml_backend_shielded_mint%s not exported by %s\n", worker ? "_worker" : "", backend); return 2; }
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();

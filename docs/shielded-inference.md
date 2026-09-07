@@ -530,6 +530,21 @@ the transport carries no trust):
   `nnShieldedPadSource` is a bank and that names no keys from that file, so a
   tenant config carries only the bank URL (`test/metal-agent-pads.test.mjs`).
 
+**Minting at GPU speed.** `shielded-dealer --worker host:port` mints through a
+worker the dealer owns: with `SHIELDED_ZERO_PADS=1` every ring pad is zero, so
+the "masked" planes carry the seed's mask row r itself and the exchange returns
+r·W mod M, which is u. The dealer checks each row against the worker with the
+same identity a consumer uses for a shipment, (u·s) ≡ (r·(W s)) mod M
+(`SHIELDED_PAD_CHECK=1` builds the vectors), because the field-range product
+check cannot hold for a 24-bit input. Never point it at an operator's worker:
+that worker would learn every mask it later unmasks. The dealer never sees a
+tenant's x either way. On the 0.8B, 16 rows through the CPU reference worker
+are byte-identical to the in-process mint on all 1,552 cells
+(`dealt-selftest` with `SHIELDED_WORKER=`, in `test/shielded-cbackend.test.mjs`);
+`dealer-loop.py --worker` passes the address through. For the 27B this turns
+minting from a 30 GB weight stream per row on CPU cores into a batched GEMV on
+whatever GPU the platform dealer owns.
+
 Proved on x86 against the local hub: four 16-row shipments in the store,
 8-row windows from the agent, 16 tokens: 2363 nodes offloaded, 0 local, 0
 missed, pad check clean, text identical to self-minting; shipments dropped at

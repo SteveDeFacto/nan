@@ -341,6 +341,7 @@ struct sh_link {
      * ever minted on the request path (a dry ring stalls the request). */
     bool       dealt;
     char       pad_dir[512], pad_ledger[512];
+    bool       zero_pads;                   /* SHIELDED_ZERO_PADS: r = u = 0, x goes to the worker IN THE CLEAR - the dealer's own worker only */
     char       bank_url[1024];              /* http:// bank (shielded-bank.c); pad_dir is then the local cache */
     sh_bank   *padbank;
     uint64_t   bank_cache_max;
@@ -471,6 +472,17 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
         }
     }
     l->refill_cost_priority = env_int("SHIELDED_REFILL_COST_PRIORITY", 0, 0, 1);
+    /* The dealer minting through its OWN worker: every pad is zero, so the
+     * "masked" planes carry x itself. Never a tenant's setting - the wasm
+     * manager does not know this name, and the link says so loudly. */
+    l->zero_pads = env_int("SHIELDED_ZERO_PADS", 0, 0, 1) != 0;
+    if (l->zero_pads) {
+        /* The product check assumes |x.W| < M/2 (true for encoded activations,
+         * never for a 24-bit mask row); the mint checks u = r.W mod M itself
+         * with the pad-check vectors instead. */
+        l->verify = false;
+        fprintf(stderr, "[shielded] SHIELDED_ZERO_PADS: activations go to %s:%d UNMASKED, products checked mod M by the mint (dealer mode)\n", host ? host : "?", port);
+    }
     if (err) *err = SH_OK;
     return l;
 }
@@ -699,6 +711,11 @@ static int gen_scratch_init(const sh_link *l, gen_scratch *s, int b) {
 
 static int generate(sh_link *l, const sh_group *g, int b, int32_t *r_out, int32_t *u_out, gen_scratch *s) {
     const int64_t K = g->K;
+    if (l->zero_pads) {
+        memset(r_out, 0, (size_t)b * K * sizeof *r_out);
+        memset(u_out, 0, (size_t)b * g->u_len * sizeof *u_out);
+        return SH_OK;
+    }
     int rc = maskbank_issue(&l->bank, r_out, (size_t)b * K);
     if (rc != SH_OK) return rc;
     l->simd->pad_planes(r_out, (size_t)b * K, s->planes, s->planes + (size_t)b * K, s->planes + (size_t)2 * b * K);
@@ -1574,6 +1591,80 @@ int sh_link_mint_shipment(sh_link *l, const uint8_t seed[32], const uint8_t seed
         }
     }
     free(r); free(u); free(s.planes); free(s.acc);
+    const int crc = sh_pads_writer_close(w);
+    return rc != SH_OK ? rc : crc;
+}
+
+/* Mint through the link's worker: with SHIELDED_ZERO_PADS the exchange sends
+ * x unmasked and returns x.W mod M balanced, so feeding x = r (the seed's mask
+ * row) yields exactly the u a shipment carries - on whatever GPU the dealer
+ * owns, Freivalds-checked like any exchange, instead of the CPU refill kernel
+ * (a 27B row is a 30 GB weight stream either way, but a GPU streams it at
+ * memory speed and a batch of rows streams it once). The dealer never sees a
+ * tenant's x; this worker sees the dealer's r, which the dealer holds anyway. */
+int sh_link_mint_shipment_worker(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
+                                 uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path) {
+    if (!l || !l->n_groups || !count) return SH_ERR_RANGE;
+    if (!l->zero_pads) { snprintf(l->err, sizeof l->err, "mint via worker needs SHIELDED_ZERO_PADS=1 (the masked path would return x.W, not r.W)"); return SH_ERR_RANGE; }
+    if (!l->pipe) { snprintf(l->err, sizeof l->err, "mint via worker: no worker link"); return SH_ERR_IO; }
+    sh_pads_group *table = (sh_pads_group *)calloc(l->n_groups, sizeof *table);
+    if (!table) return SH_ERR_NOMEM;
+    int rc = sh_link_group_table(l, table, (uint32_t)l->n_groups);
+    if (rc < 0) { free(table); return rc; }
+    int err = SH_OK;
+    sh_pads_writer *w = sh_pads_writer_open(path, model_digest, seed_id, table, (uint32_t)l->n_groups, index0, count, consumer_pk, &err);
+    free(table);
+    if (!w) return err;
+    int mmax = 1;
+    for (size_t i = 0; i < l->n_groups; i++) if (l->groups[i].max_m > mmax) mmax = l->groups[i].max_m;
+    int32_t *r = (int32_t *)malloc((size_t)mmax * l->Kmax * sizeof(int32_t));
+    int64_t *x = (int64_t *)malloc((size_t)mmax * l->Kmax * sizeof(int64_t));
+    int32_t *u = (int32_t *)malloc((size_t)mmax * l->ulen_max * sizeof(int32_t));
+    int64_t *ybuf = (int64_t *)malloc((size_t)mmax * l->ulen_max * sizeof(int64_t));
+    int64_t *yout[SH_GROUP_MAX];
+    if (!r || !x || !u || !ybuf) { free(r); free(x); free(u); free(ybuf); sh_pads_writer_close(w); return SH_ERR_NOMEM; }
+    rc = SH_OK;
+    for (size_t gi = 0; gi < l->n_groups && rc == SH_OK; gi++) {
+        const sh_group *g = &l->groups[gi];
+        const int64_t K = g->K;
+        const int B = g->max_m > 0 ? g->max_m : 1;
+        for (uint64_t i0 = 0; i0 < count && rc == SH_OK; i0 += (uint64_t)B) {
+            const int b = (int)((count - i0) < (uint64_t)B ? (count - i0) : (uint64_t)B);
+            for (int i = 0; i < b; i++) {
+                sh_pad_r(seed, (uint32_t)gi, index0 + i0 + (uint64_t)i, K, r + (size_t)i * K);
+                for (int64_t k = 0; k < K; k++) x[(size_t)i * K + k] = r[(size_t)i * K + k];
+            }
+            /* one exchange for the whole group: every node reads the same planes */
+            size_t off = 0;
+            for (int n = 0; n < g->n_nodes; n++) { yout[n] = ybuf + off; off += (size_t)b * l->nodes[g->nodes[n]].N; }
+            rc = sh_link_gemm(l, g->nodes, (size_t)g->n_nodes, x, b, yout);
+            if (rc != SH_OK) break;
+            for (int n = 0; n < g->n_nodes; n++) {
+                const sh_node *nd = &l->nodes[g->nodes[n]];
+                if (!nd->sM || !nd->stM) { snprintf(l->err, sizeof l->err, "mint via worker: no mod-M check vectors (set SHIELDED_PAD_CHECK=1 before the model loads)"); rc = SH_ERR_RANGE; break; }
+                for (int i = 0; i < b; i++) {
+                    __int128 lhs = 0, rhs = 0;
+                    for (int64_t j = 0; j < nd->N; j++) {
+                        int64_t v = yout[n][(size_t)i * nd->N + j] % SH_M_MOD;      /* balanced representative of r.W mod M */
+                        if (v > SH_M_MOD / 2) v -= SH_M_MOD;
+                        if (v <= -(SH_M_MOD / 2)) v += SH_M_MOD;
+                        u[(size_t)i * g->u_len + nd->u_off + j] = (int32_t)v;
+                        lhs += (__int128)v * nd->sM[j];
+                    }
+                    /* the worker's word is checked here, the way a consumer checks a shipment: (u . s) == (r . (W s)) mod M */
+                    for (int64_t k = 0; k < K; k++) rhs += (__int128)r[(size_t)i * K + k] * nd->stM[k];
+                    int64_t a = (int64_t)(lhs % SH_M_MOD), c = (int64_t)(rhs % SH_M_MOD);
+                    if (a < 0) a += SH_M_MOD;
+                    if (c < 0) c += SH_M_MOD;
+                    if (a != c) { snprintf(l->err, sizeof l->err, "mint via worker: the worker's product for %s row %llu FAILED the mod-M check", nd->name, (unsigned long long)(index0 + i0 + (uint64_t)i)); rc = SH_ERR_VERIFY; break; }
+                }
+                if (rc != SH_OK) break;
+            }
+            if (rc != SH_OK) break;
+            for (int i = 0; i < b && rc == SH_OK; i++) rc = sh_pads_writer_cell(w, index0 + i0 + (uint64_t)i, (uint32_t)gi, u + (size_t)i * g->u_len);
+        }
+    }
+    free(r); free(x); free(u); free(ybuf);
     const int crc = sh_pads_writer_close(w);
     return rc != SH_OK ? rc : crc;
 }

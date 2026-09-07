@@ -410,6 +410,16 @@ int sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int32
     return rc;
 }
 
+uint32_t sh_pads_reader_groups(const sh_pads_reader *r, sh_pads_group *out, uint32_t cap) {
+    if (!r || !r->n_files) return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&r->mu);
+    const sh_pads_file *f = &r->files[0];
+    uint32_t n = f->hdr.group_count < cap ? f->hdr.group_count : cap;
+    if (out) memcpy(out, f->groups, (size_t)n * sizeof *out);
+    pthread_mutex_unlock((pthread_mutex_t *)&r->mu);
+    return n;
+}
+
 int sh_pads_reader_prune_below(sh_pads_reader *r, uint64_t floor, bool unlink_files) {
     if (!r || !floor) return 0;
     int dropped = 0;

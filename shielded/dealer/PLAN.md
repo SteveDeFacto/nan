@@ -242,11 +242,20 @@ verification failures, exit 0, exact text.
   manager fills SHIELDED_PAD_SEED/SEED_ID/SK/LEDGER_PK/WINDOW_URL from that
   file for a bank source with no explicit keys. test/metal-agent-pads.test.mjs
   runs the real agent against the real ledger behind a fake tunnel.
-  Still to do for metal0: deploy the relay's pads routes, a dealer for the
-  27B (a platform GPU box: u = r.W is a GEMV the dealer may run on any GPU it
-  owns, since it never sees x), SHIELDED_PAD_MODEL_DIGEST from the model
-  volume, and receipts from the CVM tier (the pVM signs its own; the manager
-  would sign for a tenant from ggml_backend_shielded_pads_used).
+- DONE 2026-09-07, GPU minting: `shielded-dealer --worker host:port`
+  (SHIELDED_ZERO_PADS=1: zero ring pads, so the exchange carries r and
+  returns r.W mod M = u; the mint checks every row mod M against the worker
+  with the pad-check vectors, the field-range Freivalds being off for 24-bit
+  inputs). Byte-identical to the in-process mint on all 1,552 cells of 16
+  rows of the 0.8B through the CPU reference worker; dealt-selftest has the
+  case (SHIELDED_WORKER=), shielded-cbackend.test.mjs spawns the worker.
+  `dealer-loop.py --worker` passes it through. The platform dealer for the
+  27B is therefore a GPU box running worker.py (the dealer's own; an
+  operator's worker would learn the masks).
+  Still to do for metal0: deploy the relay's pads routes, run the dealer on a
+  platform GPU box, SHIELDED_PAD_MODEL_DIGEST from the model volume, and
+  receipts from the CVM tier (the pVM signs its own; the manager would sign
+  for a tenant from ggml_backend_shielded_pads_used).
 - Earlier design note (kept for the volume alternative):
 - The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
   ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine

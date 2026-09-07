@@ -1346,3 +1346,16 @@ extern "C" int ggml_backend_shielded_mint(const char *seed_hex, const char *seed
     memset(seed, 0, sizeof seed);
     return rc;
 }
+extern "C" int ggml_backend_shielded_mint_worker(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
+                                                                  uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path) {
+    sh_state &s = sh_get();
+    if (!s.link) { SH_LOG("mint: no link\n"); return SH_ERR_RANGE; }
+    uint8_t seed[32], seed_id[16], digest[32], pk[32];
+    if (!sh_pads_hex2bin(seed_hex, seed, 32) || !sh_pads_hex2bin(seed_id_hex, seed_id, 16) ||
+        !sh_pads_hex2bin(digest_hex, digest, 32) || !sh_pads_hex2bin(consumer_pk_hex, pk, 32)) return SH_ERR_RANGE;
+    std::lock_guard<std::mutex> lk(s.mu);
+    const int rc = sh_link_mint_shipment_worker(s.link, seed, seed_id, digest, index0, count, pk, path);
+    if (rc != SH_OK) SH_LOG("mint via worker: %s\n", sh_link_last_error(s.link));
+    memset(seed, 0, sizeof seed);
+    return rc;
+}

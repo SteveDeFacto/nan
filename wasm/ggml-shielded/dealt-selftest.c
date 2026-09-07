@@ -210,6 +210,42 @@ int main(void) {
         int e3 = 0; assert(sh_link_open("127.0.0.1", 1, false, &e3) == NULL && e3 == SH_ERR_RANGE);
         unsetenv("SHIELDED_PAD_SOURCE");
     }
+    /* --- the same shipment minted THROUGH A WORKER (SHIELDED_WORKER=host:port
+     * offered by the harness): zero pads carry r itself, the mint checks the
+     * worker's product mod M, and every cell must equal the in-process mint. */
+    const char *wk = getenv("SHIELDED_WORKER");
+    if (wk && *wk) {
+        const char *colon = strrchr(wk, ':'); assert(colon);
+        char host[128]; snprintf(host, sizeof host, "%.*s", (int)(colon - wk), wk);
+        setenv("SHIELDED_ZERO_PADS", "1", 1); setenv("SHIELDED_PAD_CHECK", "1", 1);
+        int e4 = 0; sh_link *wl = sh_link_open(host, atoi(colon + 1), true, &e4); assert(wl);
+        const int a2 = sh_link_add_weight(wl, "blk.0.attn_q.weight", wa, KA, NA, 8, -1); assert(a2 >= 0);
+        const int b2 = sh_link_add_weight(wl, "blk.0.attn_k.weight", wb, KA, NB, 8, a2); assert(b2 >= 0);
+        const int c2 = sh_link_add_weight(wl, "blk.0.ffn_down.weight", wc, KC, NC, 8, -1); assert(c2 >= 0);
+        const int src = sh_link_start(wl);
+        if (src != SH_OK) { fprintf(stderr, "worker link did not start: %s\n", sh_link_last_error(wl)); assert(src == SH_OK); }
+        char dir3[] = "/tmp/dealt-selftest-worker-XXXXXX"; assert(mkdtemp(dir3));
+        char ship3[700]; snprintf(ship3, sizeof ship3, "%s/seed-0-20.pads", dir3);
+        const int mrc = sh_link_mint_shipment_worker(wl, seed, seed_id, digest, 0, COUNT, pk, ship3);
+        if (mrc != SH_OK) { fprintf(stderr, "worker mint failed: %s\n", sh_link_last_error(wl)); assert(mrc == SH_OK); }
+        int e5 = 0; sh_pads_reader *rd3 = sh_pads_reader_open(dir3, seed_id, sk, &e5);
+        assert(rd3 && sh_pads_reader_bind(rd3, table, (uint32_t)ng) == SH_OK && sh_pads_reader_extent(rd3) == COUNT);
+        int e6 = 0; sh_pads_reader *rd0 = sh_pads_reader_open(dir, seed_id, sk, &e6);      /* the in-process shipment, reopened */
+        assert(rd0 && sh_pads_reader_bind(rd0, table, (uint32_t)ng) == SH_OK);
+        int32_t *u3 = malloc((NA + NB) * sizeof *u3);
+        size_t cells = 0;
+        for (uint64_t idx = 0; idx < COUNT; idx++)
+            for (int g = 0; g < ng; g++) {
+                assert(sh_pads_reader_cell(rd0, (uint32_t)g, idx, u) == SH_OK);
+                assert(sh_pads_reader_cell(rd3, (uint32_t)g, idx, u3) == SH_OK);
+                if (memcmp(u, u3, table[g].u_len * sizeof *u)) { fprintf(stderr, "worker mint differs at g%d idx%llu\n", g, (unsigned long long)idx); assert(0); }
+                cells++;
+            }
+        free(u3); sh_pads_reader_close(rd3); sh_pads_reader_close(rd0); sh_link_close(wl);
+        unsetenv("SHIELDED_ZERO_PADS"); unsetenv("SHIELDED_PAD_CHECK");
+        char rm3[700]; snprintf(rm3, sizeof rm3, "rm -rf %s", dir3); (void)!system(rm3);
+        printf("dealt-selftest: worker mint via %s identical on %zu cells\n", wk, cells);
+    }
     sh_link_close(dealer);
     free(r); free(u); free(wa); free(wb); free(wc);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); (void)!system(cmd);
