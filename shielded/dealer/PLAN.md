@@ -169,7 +169,11 @@ the mark to 64 BEFORE answering, the VM verified the signed window, imported
 dealt pads, prefilled 5 tokens and decoded 16 with 2363 nodes offloaded, 0
 local, 0 verification failures, exit 0, and the exact text of the x86
 baseline ("Paris. The capital of France is Paris..."). Recipe: work dir
-`device-dealt-run.sh` (hub / app / dealer / log).
+`device-dealt-run.sh` (hub / app / dealer / log). A second run with the pad
+check on and the digest pinned (a fresh seed, since the transport key is
+per boot; the previous seed's shipments still in the bank were streamed and
+ignored as foreign) gave the same result: 2363 offloaded, 0 local, 0
+verification failures, exit 0, exact text.
 - relay (`relay/pads.mjs`, routes in api-relay.js): `/v1/pads/key` (the
   Ed25519 ledger key), `/v1/pads/seed` (the pVM's seed, derived
   HKDF(master, keyFp, epoch), boxed X25519 -> HKDF-SHA512 -> ChaCha20-Poly1305
