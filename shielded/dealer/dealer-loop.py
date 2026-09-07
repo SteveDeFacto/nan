@@ -112,6 +112,23 @@ def main():
         for p in spent:
             os.unlink(p); print(f"pruned {os.path.basename(p)} (below mark {mark})", flush=True)
             if a.push: print(f"  relay delete -> {relay_delete(a.relay, seed_id, os.path.basename(p), token)}", flush=True)
+        if a.push:
+            # the store must hold what the bank holds above the mark: a daemon
+            # restart, a wiped store or an upload that broke mid-way otherwise
+            # leaves a consumer starving next to a full local bank
+            try:
+                have = {s["name"]: s.get("bytes") for s in relay_get(a.relay, f"/v1/pads/shipments?seed_id={seed_id}").get("shipments", [])}
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+                print(f"  store listing failed ({getattr(e, 'code', None) or getattr(e, 'reason', e)}); nothing re-pushed", flush=True); have = None
+            if have is not None:
+                for p in shipments(a.out, seed_id):
+                    name = os.path.basename(p)
+                    if have.get(name) == os.path.getsize(p): continue
+                    try:
+                        res = relay_put_file(a.relay, seed_id, p, token)
+                        print(f"  re-pushed {name}: {res.get('bytes')} bytes (the store lacked it)", flush=True)
+                    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+                        print(f"  push of {name} failed: {getattr(e, 'code', None) or getattr(e, 'reason', e)} (is PADS_DEALER_TOKEN the relay's?)", flush=True)
         if not want:
             print(f"bank for {seed_id} covers [{mark}, {mark + a.ahead}); nothing to mint", flush=True)
         return want
@@ -146,8 +163,13 @@ def main():
             if a.push:
                 for i0, c in want:
                     fpath = os.path.join(a.out, f"{seed_id}-{i0}-{c}.pads")
-                    res = relay_put_file(a.relay, seed_id, fpath, token)
-                    print(f"  pushed {os.path.basename(fpath)}: {res.get('bytes')} bytes, sha256 {str(res.get('sha256'))[:16]}", flush=True)
+                    try:
+                        res = relay_put_file(a.relay, seed_id, fpath, token)
+                        print(f"  pushed {os.path.basename(fpath)}: {res.get('bytes')} bytes, sha256 {str(res.get('sha256'))[:16]}", flush=True)
+                    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+                        # a refused upload (wrong bearer, relay restarting) is retried by the
+                        # store sync on the next pass; the bank keeps the file
+                        print(f"  push of {os.path.basename(fpath)} failed: {getattr(e, 'code', None) or getattr(e, 'reason', e)} (is PADS_DEALER_TOKEN the relay's?); next pass retries", flush=True)
 
     def serve(seed, seed_id, pk, mark):
         mint([(seed, seed_id, pk, prune_and_plan(seed_id, mark))])
