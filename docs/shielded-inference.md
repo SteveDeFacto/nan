@@ -569,7 +569,10 @@ same identity a consumer uses for a shipment, (u·s) ≡ (r·(W s)) mod M
 (`SHIELDED_PAD_CHECK=1` builds the vectors), because the field-range product
 check cannot hold for a 24-bit input. Never point it at an operator's worker:
 that worker would learn every mask it later unmasks. The dealer never sees a
-tenant's x either way. On the 0.8B, 16 rows through the CPU reference worker
+tenant's x either way. The zero-pad path exists only in the dealer's own
+build of the trusted half (`libggml-shielded-dealer.so`, `SHIELDED_DEALER_MODE`);
+the production and phone libraries compile without it, so no environment can
+turn it on there (`nm -D libggml-shielded.so` shows no `mint_worker`). On the 0.8B, 16 rows through the CPU reference worker
 are byte-identical to the in-process mint on all 1,552 cells
 (`dealt-selftest` with `SHIELDED_WORKER=`, in `test/shielded-cbackend.test.mjs`);
 `dealer-loop.py --worker` passes the address through. For the 27B this turns

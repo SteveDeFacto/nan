@@ -481,7 +481,11 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
     /* The dealer minting through its OWN worker: every pad is zero, so the
      * "masked" planes carry x itself. Never a tenant's setting - the wasm
      * manager does not know this name, and the link says so loudly. */
+#ifdef SHIELDED_DEALER_MODE
     l->zero_pads = env_int("SHIELDED_ZERO_PADS", 0, 0, 1) != 0;
+#else
+    l->zero_pads = false;                       /* not a thing outside the dealer's own build */
+#endif
     if (l->zero_pads) {
         /* The product check assumes |x.W| < M/2 (true for encoded activations,
          * never for a 24-bit mask row); the mint checks u = r.W mod M itself
@@ -718,11 +722,13 @@ static int gen_scratch_init(const sh_link *l, gen_scratch *s, int b) {
 
 static int generate(sh_link *l, const sh_group *g, int b, int32_t *r_out, int32_t *u_out, gen_scratch *s) {
     const int64_t K = g->K;
+#ifdef SHIELDED_DEALER_MODE
     if (l->zero_pads) {
         memset(r_out, 0, (size_t)b * K * sizeof *r_out);
         memset(u_out, 0, (size_t)b * g->u_len * sizeof *u_out);
         return SH_OK;
     }
+#endif
     int rc = maskbank_issue(&l->bank, r_out, (size_t)b * K);
     if (rc != SH_OK) return rc;
     l->simd->pad_planes(r_out, (size_t)b * K, s->planes, s->planes + (size_t)b * K, s->planes + (size_t)2 * b * K);
@@ -1638,6 +1644,11 @@ int sh_link_mint_shipment(sh_link *l, const uint8_t seed[32], const uint8_t seed
  * tenant's x; this worker sees the dealer's r, which the dealer holds anyway. */
 int sh_link_mint_shipment_worker(sh_link *l, const uint8_t seed[32], const uint8_t seed_id[16], const uint8_t model_digest[32],
                                  uint64_t index0, uint64_t count, const uint8_t consumer_pk[32], const char *path) {
+#ifndef SHIELDED_DEALER_MODE
+    (void)seed; (void)seed_id; (void)model_digest; (void)index0; (void)count; (void)consumer_pk; (void)path;
+    if (l) snprintf(l->err, sizeof l->err, "mint via worker: not in this build (libggml-shielded-dealer.so carries it)");
+    return SH_ERR_RANGE;
+#else
     if (!l || !l->n_groups || !count) return SH_ERR_RANGE;
     if (!l->zero_pads) { snprintf(l->err, sizeof l->err, "mint via worker needs SHIELDED_ZERO_PADS=1 (the masked path would return x.W, not r.W)"); return SH_ERR_RANGE; }
     if (!l->pipe) { snprintf(l->err, sizeof l->err, "mint via worker: no worker link"); return SH_ERR_IO; }
@@ -1701,7 +1712,14 @@ int sh_link_mint_shipment_worker(sh_link *l, const uint8_t seed[32], const uint8
     free(r); free(x); free(u); free(ybuf);
     const int crc = sh_pads_writer_close(w);
     return rc != SH_OK ? rc : crc;
+#endif
 }
+
+/* The bank client's counters for the profile line (zeros without a bank). */
+void sh_link_bank_stats(const sh_link *l, uint64_t *files, uint64_t *bytes, int *last_status, char *err, size_t err_cap) {
+    sh_bank_stats(l ? l->padbank : NULL, files, bytes, last_status, err, err_cap);
+}
+bool sh_link_has_bank(const sh_link *l) { return l && l->padbank; }
 
 /* Test hook: dealt mode without a worker. Opens the shipments, binds the
  * groups, takes a window, and imports `rows` pads per group through the same

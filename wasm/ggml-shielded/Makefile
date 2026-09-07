@@ -10,6 +10,14 @@ LDLIBS  += -lm
 
 CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c shielded-bank.c shielded-http.c tweetnacl.c poly1305-donna.c
 CORE_OBJ := $(CORE_SRC:.c=.o) shielded-simd-avx512.o shielded-simd-generic.o
+# The dealer's build of the trusted half is the ONLY one carrying the zero-pad
+# mint path (SHIELDED_DEALER_MODE: r goes to the dealer's own worker in the
+# clear). Production and phone builds compile without it, so no env can turn
+# it on there.
+DEALER_OBJ := $(CORE_SRC:.c=.dealer.o) shielded-simd-avx512.o shielded-simd-generic.o
+%.dealer.o: %.c
+	$(CC) $(CFLAGS) -DSHIELDED_DEALER_MODE -c $< -o $@
+shielded-field.dealer.o: CFLAGS += -ffp-contract=off
 LDLIBS   += -lpthread
 
 # The field encoder must not be contracted into FMAs: the worker runs the same
@@ -70,7 +78,7 @@ refill-selftest: refill-selftest.c shielded-simd-avx512.o shielded-field.o
 
 # Dealt pads end to end on synthetic weights: mint, read back against an
 # exact oracle, tamper, exhaustion, ledger window, the link's own import.
-dealt-selftest: dealt-selftest.c $(CORE_OBJ)
+dealt-selftest: dealt-selftest.c $(DEALER_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Node<->C interop helpers for dealt pads (test/pads-interop.test.mjs).
@@ -95,6 +103,11 @@ ggml-shielded-dl.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielde
 libggml-shielded.so: ggml-shielded-dl.o $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) -shared -o $@ $^ -L$(GGML_LIB) -lggml-base $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 
+ggml-shielded-dealer.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shielded-tee.h shielded-field.h shielded-simd.h
+	$(CXX) $(CXXFLAGS) -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED -DSHIELDED_DEALER_MODE $(GGML_INC) -c $< -o $@
+libggml-shielded-dealer.so: ggml-shielded-dealer.o $(DEALER_OBJ)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $^ -L$(GGML_LIB) -lggml-base $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
+
 shielded-run: shielded-run.cpp libggml-shielded.so
 	$(CXX) $(CXXFLAGS) -I$(GGML_SRC)/include $(GGML_INC) -o $@ $< \
 	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl -Wl,-rpath,$(GGML_LIB)
@@ -117,7 +130,7 @@ bench: bench-batch bench-spec
 
 # The dealer: mint .pads shipments from a model; libllama for the load, the
 # backend module for the registration and the mint (shielded/dealer/PLAN.md).
-shielded-dealer: shielded-dealer.cpp $(CORE_OBJ)
+shielded-dealer: shielded-dealer.cpp $(DEALER_OBJ)
 	$(CXX) $(CXXFLAGS) $(LLAMA_INC) $(GGML_INC) -I../llama-shim -o $@ $^ \
 	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 

@@ -319,6 +319,12 @@ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, u
         if (s.link) sh_link_pool_stats(s.link, &used, &missed);
         uint64_t waited = 0; double wait_ms = 0;
         sh_link_pad_wait_stats(s.link, &waited, &wait_ms);
+        if (sh_link_has_bank(s.link)) {
+            uint64_t bf = 0, bb = 0; int bst = 0; char berr[256];
+            sh_link_bank_stats(s.link, &bf, &bb, &bst, berr, sizeof berr);
+            fprintf(stderr, "[shielded] bank: fetched %llu shipment(s) %.0f MB, last listing http %d%s%s\n",
+                    (unsigned long long)bf, bb / 1e6, bst, berr[0] ? "; " : "", berr);
+        }
         fprintf(stderr, "[shielded] profile: exchanges=%llu nodes=%llu (completions=%llu served=%llu) | link: mask=%.1fms wire=%.1fms "
                         "refill-on-path=%.1fms unmask+lhs=%.1fms rhs=%.1fms total=%.1fms | backend: encode=%.1fms "
                         "post=%.1fms graph_compute=%.1fms | pads used=%llu missed=%llu waited=%llu wait=%.1fms | contended=%d events=%llu | simd=%s refill_threads=%d refill_priority=%s omp_spincount=%s\n",
@@ -1357,6 +1363,7 @@ extern "C" int ggml_backend_shielded_mint(const char *seed_hex, const char *seed
     memset(seed, 0, sizeof seed);
     return rc;
 }
+#ifdef SHIELDED_DEALER_MODE
 extern "C" int ggml_backend_shielded_mint_worker(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
                                                                   uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path) {
     sh_state &s = sh_get();
@@ -1370,3 +1377,4 @@ extern "C" int ggml_backend_shielded_mint_worker(const char *seed_hex, const cha
     memset(seed, 0, sizeof seed);
     return rc;
 }
+#endif

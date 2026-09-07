@@ -251,7 +251,9 @@ verification failures, exit 0, exact text.
   case (SHIELDED_WORKER=), shielded-cbackend.test.mjs spawns the worker.
   `dealer-loop.py --worker` passes it through. The platform dealer for the
   27B is therefore a GPU box running worker.py (the dealer's own; an
-  operator's worker would learn the masks).
+  operator's worker would learn the masks). Since 2026-09-07 the zero-pad
+  path is compiled only into `libggml-shielded-dealer.so`
+  (SHIELDED_DEALER_MODE); production and phone builds have no such symbol.
 - DONE 2026-09-07, CVM-tier receipts + store proxy + digest pin: the engine
   POSTs usage deltas (cells, rows) to the window agent's /receipt after every
   window and at link close; metal/guest/agent.mjs signs and relays them

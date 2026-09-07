@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
     void *h = dlopen(backend, RTLD_NOW | RTLD_NOLOAD);
     if (!h) h = dlopen(backend, RTLD_NOW);
     mint_fn mint = h ? (mint_fn)dlsym(h, worker ? "ggml_backend_shielded_mint_worker" : "ggml_backend_shielded_mint") : nullptr;
-    if (!mint) { fprintf(stderr, "ggml_backend_shielded_mint%s not exported by %s\n", worker ? "_worker" : "", backend); return 2; }
+    if (!mint) { fprintf(stderr, "ggml_backend_shielded_mint%s not exported by %s%s\n", worker ? "_worker" : "", backend, worker ? " (--worker needs the dealer build: SHIELDED_SO=libggml-shielded-dealer.so)" : ""); return 2; }
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
