@@ -153,7 +153,23 @@ bank must be sized for the largest prompt burst, not the decode rate.
   dealt engine vs self-minting engine produce identical tokens, and a
   tampered `u` row fails the Freivalds check.
 
-### P2. Ledger window, attestation-gated release, pad key in the binding - BUILT 2026-09-06 (device test pending)
+### P2. Ledger window, attestation-gated release, pad key in the binding - RUN ON THE PIXEL 8 PRO 2026-09-07
+
+**Device run, 2026-09-07 00:0x (Pixel 8 Pro, protected VM, dev attach; local
+hub on the workstation over adb reverse; `worker.py --device cpu` as the
+accelerator so no GPU was touched):** the VM announced its pad key after its
+transport key; the owner presented it with the attestation and the hub bound
+the tunnel; the app fetched the ledger key, had the VM sign the seed request,
+and installed the boxed seed in the VM (`PADSEED ok`); the dealer loop read
+the phone's public pad identity from the hub, derived the same seed from the
+master, minted two 64-row shipments of the 0.8B and pushed them; the app
+fetched them (117 MiB each) and streamed them into the VM's encrypted
+storage; the engine asked for a ledger window (`PADWIN 64`), the hub advanced
+the mark to 64 BEFORE answering, the VM verified the signed window, imported
+dealt pads, prefilled 5 tokens and decoded 16 with 2363 nodes offloaded, 0
+local, 0 verification failures, exit 0, and the exact text of the x86
+baseline ("Paris. The capital of France is Paris..."). Recipe: work dir
+`device-dealt-run.sh` (hub / app / dealer / log).
 - relay (`relay/pads.mjs`, routes in api-relay.js): `/v1/pads/key` (the
   Ed25519 ledger key), `/v1/pads/seed` (the pVM's seed, derived
   HKDF(master, keyFp, epoch), boxed X25519 -> HKDF-SHA512 -> ChaCha20-Poly1305
