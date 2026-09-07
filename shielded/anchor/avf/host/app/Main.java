@@ -156,6 +156,11 @@ public class Main extends Activity {
             gate(vmm);      // informative; the run proceeds so an unsupported phone still shows what it can do
 
             Class<?> cBuilder = Class.forName(PKG + "VirtualMachineConfig$Builder");
+            {   // what this phone's AVF can configure (network for the pVM would remove the vsock bridge from every exchange)
+                StringBuilder caps = new StringBuilder();
+                for (java.lang.reflect.Method m : cBuilder.getMethods()) { String n = m.getName(); if (n.startsWith("set") && n.matches(".*(Network|Vsock|Cpu|Vendor|Os|Console|Gpu|Balloon|Hugepages|Extra).*")) caps.append(n).append(' '); }
+                say("HOST VirtualMachineConfig.Builder: " + caps);
+            }
             Object b = cBuilder.getConstructor(Context.class).newInstance(ctx);
             call(b, "setPayloadBinaryName", plan.payload);
             call(b, "setProtectedVm", true);

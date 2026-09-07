@@ -86,24 +86,29 @@ int anchor_mtp_harvest(anchor_mtp *m, struct llama_context *target, int32_t n_ro
 }
 
 int32_t anchor_mtp_observe(anchor_mtp *m, int32_t pos0, const int32_t *tokens, int32_t n) {
-    if (!m || n <= 0 || n > m->batch_cap || pos0 < 0) return -1;
+    if (!m || n <= 0 || pos0 < 0) return -1;
     if (m->verify_rows < n) return -1;          /* rows 0..n-2 pair tokens 1..n-1; row n-1 becomes pending */
     llama_memory_seq_rm(llama_get_memory(m->head), 0, pos0, -1);   /* drop a previous round's proposals */
     const size_t row = (size_t)m->n_embd;
-    for (int32_t j = 0; j < n; j++) {
-        m->batch.token[j] = tokens[j];
-        m->batch.pos[j] = pos0 + j;
-        m->batch.n_seq_id[j] = 1;
-        m->batch.seq_id[j][0] = 0;
-        m->batch.logits[j] = 0;
-        const float *h = (j == 0) ? m->pending_h : m->verify_h + (size_t)(j - 1) * row;
-        memcpy(m->batch.embd + (size_t)j * row, h, row * sizeof(float));
+    /* in batches of the head's capacity (a prompt is longer than a round): token c+j pairs with the
+     * target's row c+j-1, the very first with the seed carried from before pos0 */
+    for (int32_t c = 0; c < n; c += m->batch_cap) {
+        const int32_t len = n - c < m->batch_cap ? n - c : m->batch_cap;
+        for (int32_t j = 0; j < len; j++) {
+            m->batch.token[j] = tokens[c + j];
+            m->batch.pos[j] = pos0 + c + j;
+            m->batch.n_seq_id[j] = 1;
+            m->batch.seq_id[j][0] = 0;
+            m->batch.logits[j] = 0;
+            const float *h = (c + j == 0) ? m->pending_h : m->verify_h + (size_t)(c + j - 1) * row;
+            memcpy(m->batch.embd + (size_t)j * row, h, row * sizeof(float));
+        }
+        m->batch.n_tokens = len;
+        const double t0 = now_us();
+        const int32_t rc = llama_decode(m->head, m->batch);
+        m->t_observe += now_us() - t0;
+        if (rc != 0) return rc;
     }
-    m->batch.n_tokens = n;
-    const double t0 = now_us();
-    const int32_t rc = llama_decode(m->head, m->batch);
-    m->t_observe += now_us() - t0;
-    if (rc != 0) return rc;
     memcpy(m->pending_h, m->verify_h + (size_t)(n - 1) * row, row * sizeof(float));
     return 0;
 }
