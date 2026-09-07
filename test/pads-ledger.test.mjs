@@ -123,3 +123,24 @@ test("receipt: signed usage accrues to the seed; replay, foreign seeds and bad c
   assert.deepEqual([tot.pads, tot.tokens, tot.runs, tot.last.length], [2133, 68, 2, 2]);
   assert.equal(L.receipts("0".repeat(32)), null);
 });
+
+test("a metal box's P-256 transport key signs requests too (ECDSA over sha256); the key on record decides", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pads-"));
+  const ec = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const x = generateKeyPairSync("x25519");
+  const spkiDer = Buffer.from(ec.publicKey.export({ type: "spki", format: "der" }));
+  const box = { keyFp: createHash("sha256").update(spkiDer).digest("hex"), spki: spkiDer.toString("base64"),
+                padKey: Buffer.from(x.publicKey.export({ type: "spki", format: "der" })).subarray(-32).toString("hex") };
+  const signReq = (kind, name, fields, nonce) => sign("sha256", Buffer.from(signedMessage(kind, [name, ...fields, nonce])), ec.privateKey).toString("hex");
+  const L = createPadsLedger({ dir, hub: hubWith({ metal0: box }), log: () => {} });
+  const n0 = randomBytes(16).toString("hex");
+  const s = L.seed({ name: "metal0", nonce: n0, sig: signReq("seed", "metal0", [], n0) });
+  assert.equal(s.status, 200, JSON.stringify(s));
+  const n1 = randomBytes(16).toString("hex");
+  const w = L.reserve({ name: "metal0", seed_id: s.body.seed_id, want: 16, nonce: n1, sig: signReq("reserve", "metal0", [s.body.seed_id, 16], n1) });
+  assert.equal(w.status, 200, JSON.stringify(w));
+  assert.deepEqual([w.body.lo, w.body.hi], [0, 16]);
+  // an Ed25519 signature under a P-256 record, or a P-256 one under an Ed25519 record, is just a bad signature
+  const ed = pvm();
+  assert.equal(L.reserve({ name: "metal0", seed_id: s.body.seed_id, want: 16, nonce: randomBytes(16).toString("hex"), sig: ed.signReq("reserve", "metal0", [s.body.seed_id, 16], "00") }).status, 403);
+});

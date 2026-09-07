@@ -17,7 +17,7 @@
 // No secret in this file leaves the CVM; the transport key is minted per boot.
 import http from 'node:http';
 import net from 'node:net';
-import { createHash, createHmac, generateKeyPairSync } from 'node:crypto';
+import { createHash, createHmac, createDecipheriv, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 
@@ -54,6 +54,72 @@ const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
 const keyFp = createHash('sha256').update(spkiDer).digest();         // 32 bytes
 log(`transport key fingerprint ${keyFp.toString('hex').slice(0, 16)}…`);
 
+// --- dealt pads: the pad key, minted in-CVM like the transport key ----------
+// shielded/dealer/PLAN.md (P4a). The X25519 public half rides in the RAD
+// document (the relay records it at attach); the platform boxes this box's
+// pad seed to it. After a successful attach the agent fetches the seed, opens
+// it here, and leaves {seed, seed_id, sk, ledger_pk, window_url} for the wasm
+// manager in METAL_PADS_DIR/bootstrap.json (root-only) - never on a socket,
+// since tenants share the loopback namespace. Ledger windows are relayed on
+// the RAD port (POST /pads/window): a signed reserve by this transport key,
+// answered with the platform ledger's own signature, which the engine pins.
+const PADS_DIR = process.env.METAL_PADS_DIR || '/run/enclave/pads';
+const padPair = generateKeyPairSync('x25519');
+const padPkHex = Buffer.from(padPair.publicKey.export({ type: 'spki', format: 'der' })).subarray(-32).toString('hex');
+const padSkHex = Buffer.from(padPair.privateKey.export({ type: 'pkcs8', format: 'der' })).subarray(-32).toString('hex');
+function relayHttpBase() {
+  const u = new URL(RELAY_URL);
+  return (u.protocol === 'wss:' ? 'https://' : 'http://') + u.host;
+}
+async function padsCall(path, body) {
+  const r = await fetch(relayHttpBase() + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'content-type': 'application/json', ...(RELAY_HOST ? { host: RELAY_HOST } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: r.status, body: await r.json().catch(() => ({})) };
+}
+// The canonical request line set relay/pads.mjs verifies (signedMessage):
+// "enclave-pads-<kind>\n<name>\n<fields...>\n<nonce>", ECDSA P-256 over sha256.
+function padsSign(kind, fields) {
+  const nonce = randomBytes(16).toString('hex');
+  const msg = ['enclave-pads-' + kind, NAME, ...fields.map(String), nonce].join('\n');
+  return { nonce, sig: sign('sha256', Buffer.from(msg), privateKey).toString('hex') };
+}
+async function padsWindow(want, seed_id) {
+  const { nonce, sig } = padsSign('reserve', [seed_id, want]);
+  return padsCall('/v1/pads/reserve', { name: NAME, seed_id, want, nonce, sig });
+}
+// X25519(epk, pad key) -> HKDF-SHA512(shared, salt = epk || pad pk, "enclave-pads-seed-box") -> ChaCha20-Poly1305, tag last.
+function openSeedBox({ epk, nonce, box }) {
+  const peer = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(epk, 'hex')]), format: 'der', type: 'spki' });
+  const shared = diffieHellman({ privateKey: padPair.privateKey, publicKey: peer });
+  const key = Buffer.from(hkdfSync('sha512', shared, Buffer.concat([Buffer.from(epk, 'hex'), Buffer.from(padPkHex, 'hex')]), 'enclave-pads-seed-box', 32));
+  const ct = Buffer.from(box, 'hex');
+  const d = createDecipheriv('chacha20-poly1305', key, Buffer.from(nonce, 'hex'), { authTagLength: 16 });
+  d.setAuthTag(ct.subarray(-16));
+  return Buffer.concat([d.update(ct.subarray(0, -16)), d.final()]);
+}
+let padsBootstrapped = false;
+async function padsBootstrap() {
+  if (padsBootstrapped) return;
+  const key = await padsCall('/v1/pads/key');
+  if (key.status !== 200 || !/^[0-9a-f]{64}$/.test(String(key.body.key || ''))) { log(`pads: the platform has no pad ledger (http ${key.status}); dealt pads off`); return; }
+  const { nonce, sig } = padsSign('seed', []);
+  const r = await padsCall('/v1/pads/seed', { name: NAME, nonce, sig });
+  if (r.status !== 200) { log(`pads: seed refused (http ${r.status} ${r.body.error || ''})`); return; }
+  const seed = openSeedBox(r.body);
+  if (seed.length !== 32) throw new Error('seed box opened to the wrong size');
+  fs.mkdirSync(PADS_DIR, { recursive: true, mode: 0o700 });
+  const out = { name: NAME, seed_id: r.body.seed_id, epoch: r.body.epoch, seed: seed.toString('hex'), sk: padSkHex,
+                ledger_pk: key.body.key, window_url: `http://127.0.0.1:${RAD_PORT}/pads/window` };
+  const file = `${PADS_DIR}/bootstrap.json`, tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(out), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  padsBootstrapped = true;
+  log(`pads: seed ${r.body.seed_id} (epoch ${r.body.epoch}) installed for the wasm manager at ${file}`);
+}
+
 // --- hardware attestation via configfs-tsm ----------------------------------
 const TSM = '/sys/kernel/config/tsm/report';
 function tsmReport(reportData64) {
@@ -76,10 +142,22 @@ function tsmReport(reportData64) {
 function radWithReportData(first32) {
   const reportData = Buffer.alloc(64);
   first32.copy(reportData, 0);
-  const { outblob, auxblob, provider } = tsmReport(reportData);
-  const fmt = (provider || '').includes('tdx') || MODE === 'tdx' ? 'tdx-guest-metal-v1' : 'sev-snp-guest-metal-v1';
-  const doc = { format: fmt, body: outblob.toString('base64'), transportKey: spkiDer.toString('base64'), transportKeyFp: keyFp.toString('hex'), name: NAME };
-  if (auxblob) doc.certs = auxblob.toString('base64');
+  let doc;
+  if (MODE === 'dev') {
+    // the same clearly-labeled UNATTESTED shape buildRad() serves in dev mode,
+    // with the challenge binding in the report-data slot (nothing here proves
+    // hardware; the relay only accepts it behind its own dev gate)
+    const body = Buffer.alloc(0x4a0);
+    reportData.copy(body, 0x50);
+    doc = { format: 'dev-unattested-metal-v1', body: body.toString('base64') };
+  } else {
+    const { outblob, auxblob, provider } = tsmReport(reportData);
+    const fmt = (provider || '').includes('tdx') || MODE === 'tdx' ? 'tdx-guest-metal-v1' : 'sev-snp-guest-metal-v1';
+    doc = { format: fmt, body: outblob.toString('base64') };
+    if (auxblob) doc.certs = auxblob.toString('base64');
+  }
+  doc.transportKey = spkiDer.toString('base64'); doc.transportKeyFp = keyFp.toString('hex'); doc.name = NAME;
+  doc.padKey = padPkHex;                                                  // the relay records it at attach (dealt pads)
   try { doc.manifest = JSON.parse(fs.readFileSync('/opt/metal/manifest.json', 'utf8')); } catch {}
   // Attached model volumes, as the guest actually set them up (gsup writes this
   // after checking the table against the measured metal.vols digest). It is
@@ -118,6 +196,7 @@ function buildRad() {
   }
   doc.transportKey = spkiDer.toString('base64');
   doc.transportKeyFp = keyFp.toString('hex');
+  doc.padKey = padPkHex;
   doc.name = NAME;
   try { doc.manifest = JSON.parse(fs.readFileSync('/opt/metal/manifest.json', 'utf8')); } catch {}
   // Attached model volumes, as the guest actually set them up (gsup writes this
@@ -133,6 +212,20 @@ function buildRad() {
 
 // --- RAD endpoint (loopback; the supervisor's ATTESTATION_URL points here) ---
 http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/pads/window') {
+    // a ledger window for a tenant engine: signed here, answered by the platform
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 4096) req.destroy(); });
+    req.on('end', async () => {
+      let body; try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
+      const want = Number(body.want), seed_id = String(body.seed_id || '');
+      const reply = (status, b) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)); };
+      if (!Number.isInteger(want) || want < 1 || want > 4096 || !/^[0-9a-f]{32}$/.test(seed_id)) return reply(400, { error: 'bad_request' });
+      try { const r = await padsWindow(want, seed_id); reply(r.status, r.body); }
+      catch (e) { reply(502, { error: 'relay_unreachable', message: String(e && e.message || e) }); }
+    });
+    return;
+  }
   if (req.url.startsWith('/.well-known/enclave-attestation') || req.url === '/health') {
     try {
       const body = req.url === '/health' ? { ok: true } : buildRad();
@@ -309,7 +402,10 @@ function connectTunnel() {
             log(`sent attestation for tunnel challenge${operatorSig ? ' + operator signature' : ''}`);
           } catch (e) { log(`attest failed: ${e.message}`); }
         })();
-      } else if (f.t === 'attest-result') log(`attest ${f.ok ? 'ACCEPTED' + (f.measurement ? ' meas=' + String(f.measurement).slice(0, 16) + '…' : '') : 'REJECTED: ' + f.reason}`);
+      } else if (f.t === 'attest-result') {
+        log(`attest ${f.ok ? 'ACCEPTED' + (f.measurement ? ' meas=' + String(f.measurement).slice(0, 16) + '…' : '') : 'REJECTED: ' + f.reason}`);
+        if (f.ok) padsBootstrap().catch((e) => log(`pads: bootstrap failed: ${e.message}`));
+      }
     });
     ws.on('unexpected-response', (_req, res) => { log(`tunnel handshake rejected: HTTP ${res.statusCode}`); try { ws.terminate(); } catch {} });
     ws.on('close', () => { clearInterval(liveness); if (alive) log('tunnel closed'); alive = false; for (const s of [...streams.values()]) s.destroy(); streams.clear(); setTimeout(dial, 2000); });

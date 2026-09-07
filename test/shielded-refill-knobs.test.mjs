@@ -58,6 +58,14 @@ test("dealt-pad knobs reach the engine together, seed and sk as substituted secr
   // a window agent without the platform's ledger key would let the agent sign its own windows: refused as a pair, on both sides
   assert.match(tee, /a window URL without the ledger key is refused/, "engine refuses SHIELDED_PAD_WINDOW_URL without SHIELDED_PAD_LEDGER_PK");
   assert.ok(manager.includes('wu.startswith("http://") and isinstance(lk, str) and len(lk) == 64'), "manager sets the window URL only together with a 64-hex ledger key");
+  // a bank without explicit keys takes this box's own identity from the guest agent's bootstrap file, never a partial one
+  assert.ok(manager.includes('if env["SHIELDED_PAD_SOURCE"].startswith("http://") and "SHIELDED_PAD_SEED" not in env:'), "bootstrap only fills a bank source without explicit keys");
+  assert.ok(manager.includes('"METAL_PADS_BOOTSTRAP", "/run/enclave/pads/bootstrap.json"'), "the bootstrap path is the agent's");
+  for (const f of ['"SHIELDED_PAD_SEED": b["seed"]', '"SHIELDED_PAD_SEED_ID": b["seed_id"]', '"SHIELDED_PAD_SK": b["sk"]', '"SHIELDED_PAD_LEDGER_PK": b["ledger_pk"]', '"SHIELDED_PAD_WINDOW_URL": b["window_url"]'])
+    assert.ok(manager.includes(f), f);
+  const agent = fs.readFileSync(path.join(ROOT, "metal/guest/agent.mjs"), "utf8");
+  for (const f of ["seed_id: r.body.seed_id", "seed: seed.toString('hex')", "sk: padSkHex", "ledger_pk: key.body.key", "window_url: `http://127.0.0.1:${RAD_PORT}/pads/window`"])
+    assert.ok(agent.includes(f), "agent writes " + f);
   // secrets are substituted before this block sees the config
   assert.ok(manager.indexOf("enclave_config = _subst_secrets(enclave_config, secrets)") < manager.indexOf('env["SHIELDED_PAD_SOURCE"]'), "secret refs substituted before the pad env is built");
 });

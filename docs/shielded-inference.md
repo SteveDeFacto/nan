@@ -520,7 +520,15 @@ the transport carries no trust):
   mode signs `/v1/pads/reserve` requests with the tunnel's transport key,
   `--ledger` mode is a self-signed local ledger for tests and single boxes.
   The two knobs are refused separately: an agent without a pinned key could
-  sign its own windows.
+  sign its own windows. On a metal box the guest agent (`metal/guest/agent.mjs`)
+  is that agent: it mints an X25519 pad key in-CVM (published in the RAD
+  document, recorded by the relay at attach), fetches and opens this box's seed
+  after a successful attach, leaves `{seed, seed_id, sk, ledger_pk, window_url}`
+  root-only at `/run/enclave/pads/bootstrap.json`, and serves
+  `POST /pads/window` on its loopback RAD port with a reserve signed by the
+  P-256 transport key. The wasm manager fills a deployment whose
+  `nnShieldedPadSource` is a bank and that names no keys from that file, so a
+  tenant config carries only the bank URL (`test/metal-agent-pads.test.mjs`).
 
 Proved on x86 against the local hub: four 16-row shipments in the store,
 8-row windows from the agent, 16 tokens: 2363 nodes offloaded, 0 local, 0

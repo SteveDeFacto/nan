@@ -2413,6 +2413,27 @@ def _shielded_profile_tail(rec: dict) -> None:
     threading.Thread(target=run, daemon=True, name=f"shielded-profile-{rec.get('id')}").start()
 
 
+def _pads_bootstrap_env(path=None):
+    """The dealt-pad identity the guest agent left for this box (see
+    metal/guest/agent.mjs padsBootstrap): seed, seed id, pad secret, the
+    platform ledger key and the loopback window URL, as engine env. Empty
+    when the file is missing or malformed, so the engine refuses to open the
+    link rather than minting its own pads."""
+    path = path or os.environ.get("METAL_PADS_BOOTSTRAP", "/run/enclave/pads/bootstrap.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            b = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    def hexs(v, n):
+        return isinstance(v, str) and len(v) == n and all(c in "0123456789abcdef" for c in v)
+    if not (isinstance(b, dict) and hexs(b.get("seed"), 64) and hexs(b.get("seed_id"), 32) and hexs(b.get("sk"), 64)
+            and hexs(b.get("ledger_pk"), 64) and isinstance(b.get("window_url"), str) and b["window_url"].startswith("http://")):
+        return {}
+    return {"SHIELDED_PAD_SEED": b["seed"], "SHIELDED_PAD_SEED_ID": b["seed_id"], "SHIELDED_PAD_SK": b["sk"],
+            "SHIELDED_PAD_LEDGER_PK": b["ledger_pk"], "SHIELDED_PAD_WINDOW_URL": b["window_url"]}
+
+
 def _nn_shielded_transport_for(config: str) -> dict:
     """Optional transport comparison, without changing any card reservation."""
     try:
@@ -5623,6 +5644,12 @@ def _spawn_and_wait(rec, ctx):
                 env["SHIELDED_PAD_PRUNE"] = "1"
             elif pads.get("nnShieldedPadPrune") is False:
                 env["SHIELDED_PAD_PRUNE"] = "0"
+            # A bank without explicit keys: this box's own seed, as the guest
+            # agent fetched and opened it after attach (metal/guest/agent.mjs
+            # writes METAL_PADS_BOOTSTRAP, root-only), plus the agent's
+            # loopback window relay and the platform ledger key it pins.
+            if env["SHIELDED_PAD_SOURCE"].startswith("http://") and "SHIELDED_PAD_SEED" not in env:
+                env.update(_pads_bootstrap_env())
         env.update(_nn_shielded_transport_for(enclave_config))
         env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's

@@ -232,11 +232,21 @@ verification failures, exit 0, exact text.
   hypervisor with a NIC; the operator's NVMe box is an HTTP cache of the
   platform store. Proved on x86 against the local hub (four 16-row shipments,
   8-row windows: 0 missed, prunes at floors 20/36, text exact); pinned by
-  test/pads-bank-client.test.mjs. Still to do for metal0: the wasm manager
-  runs the agent in --relay mode with the VM's transport key, the dealer for
-  the 27B (a platform GPU box: u = r.W is a GEMV the dealer may run on any
-  GPU it owns, since it never sees x), and SHIELDED_PAD_MODEL_DIGEST from the
-  model volume.
+  test/pads-bank-client.test.mjs.
+- DONE 2026-09-07, the metal box's identity: metal/guest/agent.mjs mints an
+  X25519 pad key in-CVM (in the RAD document, recorded at attach), fetches and
+  opens the seed after attest-result ok, writes METAL_PADS_DIR/bootstrap.json
+  (0600) for the wasm manager, and relays windows on its RAD port
+  (POST /pads/window, reserve signed with the P-256 transport key; the relay
+  ledger now verifies ECDSA/sha256 for EC records and Ed25519 for pVMs). The
+  manager fills SHIELDED_PAD_SEED/SEED_ID/SK/LEDGER_PK/WINDOW_URL from that
+  file for a bank source with no explicit keys. test/metal-agent-pads.test.mjs
+  runs the real agent against the real ledger behind a fake tunnel.
+  Still to do for metal0: deploy the relay's pads routes, a dealer for the
+  27B (a platform GPU box: u = r.W is a GEMV the dealer may run on any GPU it
+  owns, since it never sees x), SHIELDED_PAD_MODEL_DIGEST from the model
+  volume, and receipts from the CVM tier (the pVM signs its own; the manager
+  would sign for a tenant from ggml_backend_shielded_pads_used).
 - Earlier design note (kept for the volume alternative):
 - The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
   ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine

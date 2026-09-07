@@ -224,7 +224,10 @@ export function createPadsLedger({ dir, hub, log = console.log, masterSeed = nul
     try { key = createPublicKey({ key: Buffer.from(t.spki, "base64"), format: "der", type: "spki" }); }
     catch { return { error: "bad_key", message: "the tunnel's transport key is not a public key" }; }
     let ok = false;
-    try { ok = edVerify(null, Buffer.from(signedMessage(kind, [name, ...fields, nonce])), key, Buffer.from(String(sig || ""), "hex")); } catch {}
+    // a pVM signs with Ed25519 (TweetNaCl in the payload); a metal box's agent
+    // with its P-256 transport key (ECDSA over sha256) - the key on record decides
+    const alg = key.asymmetricKeyType === "ed25519" ? null : "sha256";
+    try { ok = edVerify(alg, Buffer.from(signedMessage(kind, [name, ...fields, nonce])), key, Buffer.from(String(sig || ""), "hex")); } catch {}
     if (!ok) return { error: "bad_signature", message: "the request is not signed by this tunnel's attested key" };
     return { tunnel: t };
   }
