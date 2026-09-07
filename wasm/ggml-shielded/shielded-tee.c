@@ -262,6 +262,7 @@ typedef struct {
     int64_t   u_off;            /* this node's columns within its group's u rows */
     int64_t  *s, *s_tilde;      /* Freivalds, reference layout: (N,REPS) and (K,REPS) mod P2 */
     int32_t  *s32, *st32;       /* the same values as the request path reads them: [REPS][N], [REPS][K] */
+    int32_t  *sM, *stM;         /* dealt-pad check (SHIELDED_PAD_CHECK): s over N and (W.s) mod M over K */
 } sh_node;
 
 /* THE RING. `depth` slots of (r, u). Around it, in ring order:
@@ -485,6 +486,7 @@ void sh_link_close(sh_link *l) {
     free_pools(l);
     for (size_t i = 0; i < l->n_nodes; i++) {
         free(l->nodes[i].s); free(l->nodes[i].s_tilde); free(l->nodes[i].s32); free(l->nodes[i].st32);
+        free(l->nodes[i].sM); free(l->nodes[i].stM);
     }
     free(l->nodes); free(l->groups);
     free(l->rp); free(l->up); free(l->slots);
@@ -624,6 +626,26 @@ int sh_link_add_weight(sh_link *l, const char *name, const int8_t *w_fixed,
         int rc = fv_prepare(l, nd);
         if (rc != SH_OK) return rc;
     }
+    /* Dealt-pad check, opt-in: a shipment's u must satisfy u = r.W (mod M).
+     * Freivalds over M with one random s per node: (u . s) == (r . (W s))
+     * mod M, both dot products O(N)/O(K) per pad; W.s costs one pass over the
+     * weights here, once. Catches a wrong dealer at import, before any use,
+     * and tells it apart from a worker the product check would catch later. */
+    if (getenv("SHIELDED_PAD_CHECK") && *getenv("SHIELDED_PAD_CHECK") && strcmp(getenv("SHIELDED_PAD_CHECK"), "0")) {
+        nd->sM = (int32_t *)malloc((size_t)N * sizeof(int32_t));
+        nd->stM = (int32_t *)calloc((size_t)K, sizeof(int32_t));
+        if (nd->sM && nd->stM) {
+            uint32_t rs[8]; os_random(rs, sizeof rs);
+            uint64_t st = ((uint64_t)rs[0] << 32) | rs[1];
+            for (int64_t j = 0; j < N; j++) { st = st * 6364136223846793005ULL + 1442695040888963407ULL; nd->sM[j] = 1 + (int32_t)((st >> 33) % (SH_FV_S_RANGE - 1)); }
+            for (int64_t k = 0; k < K; k++) {
+                __int128 acc = 0;
+                for (int64_t j = 0; j < N; j++) acc += (__int128)w_fixed[j * K + k] * nd->sM[j];
+                int64_t v = (int64_t)(acc % SH_M_MOD); if (v < 0) v += SH_M_MOD;
+                nd->stM[k] = (int32_t)v;
+            }
+        } else { free(nd->sM); free(nd->stM); nd->sM = nd->stM = NULL; }
+    }
     return (int)l->n_nodes++;
 }
 
@@ -707,6 +729,21 @@ static int dealt_import(sh_link *l, const sh_group *g, uint32_t gi, uint64_t ind
             snprintf(l->err, sizeof l->err, "dealt pads: group %u index %llu %s", gi, (unsigned long long)index,
                      rc == SH_ERR_EXHAUST ? "not in any shipment (bank behind)" : rc == SH_ERR_VERIFY ? "failed to open (tampered or wrong key)" : "unreadable");
             return rc;
+        }
+        /* The pad check: every node of the group, (u . s) == (r . (W s)) mod M. */
+        for (int n = 0; n < g->n_nodes; n++) {
+            const sh_node *nd = &l->nodes[g->nodes[n]];
+            if (!nd->sM) continue;
+            const int32_t *rr = r_out + (size_t)i * g->K, *uu = u_out + (size_t)i * g->u_len + nd->u_off;
+            __int128 lhs = 0, rhs = 0;
+            for (int64_t j = 0; j < nd->N; j++) lhs += (__int128)uu[j] * nd->sM[j];
+            for (int64_t k = 0; k < nd->K; k++) rhs += (__int128)rr[k] * nd->stM[k];
+            int64_t a = (int64_t)(lhs % SH_M_MOD), b = (int64_t)(rhs % SH_M_MOD);
+            if (a < 0) a += SH_M_MOD; if (b < 0) b += SH_M_MOD;
+            if (a != b) {
+                snprintf(l->err, sizeof l->err, "dealt pads: group %u index %llu: pad FAILED the check on %s (the dealer minted u != r.W for this seed)", gi, (unsigned long long)index, nd->name);
+                return SH_ERR_VERIFY;
+            }
         }
     }
     return SH_OK;

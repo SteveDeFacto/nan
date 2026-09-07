@@ -345,6 +345,11 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
         char hs[65], hid[33], hsk[65];
         sh_pads_bin2hex(g_seed, 32, hs); sh_pads_bin2hex(g_seed_id, 16, hid); sh_pads_bin2hex(g_psk, 32, hsk);
         setenv("SHIELDED_PAD_SOURCE", g_pads_dir, 1); setenv("SHIELDED_PAD_SEED", hs, 1); setenv("SHIELDED_PAD_SEED_ID", hid, 1); setenv("SHIELDED_PAD_SK", hsk, 1);
+        setenv("SHIELDED_PAD_CHECK", "1", 0);        /* the pVM checks every imported pad against the weights: a wrong dealer is refused before use */
+        /* Pin the model: only shipments the dealer minted for THIS calibration
+         * (SHA-512/256 of the calib file, what shielded-dealer records) are used. */
+        { FILE *cf = fopen(calib, "rb"); if (cf) { static uint8_t cb[1 << 20]; size_t n = fread(cb, 1, sizeof cb, cf); fclose(cf);
+            uint8_t dg[64]; crypto_hash(dg, cb, n); char dh[65]; sh_pads_bin2hex(dg, 32, dh); setenv("SHIELDED_PAD_MODEL_DIGEST", dh, 1); } }
         memset(hs, 0, sizeof hs); memset(hsk, 0, sizeof hsk);
         pthread_t th; pthread_create(&th, NULL, pads_receiver, (void *)(intptr_t)ls_pads); pthread_detach(th);
         pp = &pads;

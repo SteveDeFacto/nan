@@ -189,8 +189,13 @@ baseline ("Paris. The capital of France is Paris..."). Recipe: work dir
   `.pads` files from `--es pads <dir>`. Compile-checked (arm64 payload links,
   Java builds); no device attached to run it. AOSP's `vm_payload.h`/map are
   vendored in `avfref/` so the build is reproducible.
-- Still to do here: the pad check (`u.s~ == r.(W s~)`), the shipment digest
-  pinned from the calib in the pVM, and the seed epoch rotation.
+- DONE 2026-09-07: the pad check (`SHIELDED_PAD_CHECK`: Freivalds mod M
+  with a per-node random s and one weight pass at registration; every
+  imported cell must satisfy `u.s == r.(W s)` mod M, so a dealer minting for
+  the wrong seed is refused at import and named, before any use; on by
+  default in the pVM), the model digest pinned in the pVM from the bundled
+  calib (`SHIELDED_PAD_MODEL_DIGEST`), and epoch rotation by `PADS_EPOCH`
+  on the relay (old shipments become foreign).
 
 ### P3. Operator bank and prefetch - IN PROGRESS
 - DONE 2026-09-06: `shielded/dealer/dealer-loop.py` keeps one pVM's bank

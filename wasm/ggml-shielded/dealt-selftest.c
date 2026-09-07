@@ -182,6 +182,29 @@ int main(void) {
             sh_link_close(none);
         }
         setenv("SHIELDED_PAD_LEDGER", ledger, 1);
+        /* the pad check (SHIELDED_PAD_CHECK): the good shipment passes; a shipment
+         * minted for ANOTHER seed opens (same consumer key) but fails u = r.W */
+        {
+            uint8_t seed2[32]; for (int i = 0; i < 32; i++) seed2[i] = (uint8_t)(seed[i] ^ 0xA5);
+            char dir2[] = "/tmp/dealt-selftest2-XXXXXX"; assert(mkdtemp(dir2));
+            char ship2[600], led2[600]; snprintf(ship2, sizeof ship2, "%s/seed-0-20.pads", dir2); snprintf(led2, sizeof led2, "%s/ledger", dir2);
+            assert(sh_link_mint_shipment(dealer, seed2, seed_id, digest, 0, COUNT, pk, ship2) == SH_OK);   /* same seed_id on the label, wrong r inside */
+            setenv("SHIELDED_PAD_CHECK", "1", 1);
+            char led3[600]; snprintf(led3, sizeof led3, "%s/ledger3", dir);
+            setenv("SHIELDED_PAD_LEDGER", led3, 1);                   /* the good bank, a fresh ledger: rows 0..2 */
+            sh_link *ok = build(wa, wb, wc, KA, NA, NB, KC, NC);
+            int32_t *R4 = calloc((size_t)2 * 3 * KA, sizeof *R4), *U4 = calloc((size_t)2 * 3 * (NA + NB), sizeof *U4);
+            { const int got = sh_link_dealt_selftest(ok, 3, R4, U4); if (got != 6) { fprintf(stderr, "pad check on the good shipment: rc %d err '%s'\n", got, sh_link_last_error(ok)); return 1; } }
+            sh_link_close(ok);
+            setenv("SHIELDED_PAD_SOURCE", dir2, 1); setenv("SHIELDED_PAD_LEDGER", led2, 1);
+            sh_link *bad = build(wa, wb, wc, KA, NA, NB, KC, NC);
+            assert(sh_link_dealt_selftest(bad, 3, R4, U4) == SH_ERR_VERIFY);   /* refused at import: u != r.W for our seed */
+            assert(strstr(sh_link_last_error(bad), "FAILED the check"));
+            sh_link_close(bad);
+            free(R4); free(U4);
+            unsetenv("SHIELDED_PAD_CHECK"); setenv("SHIELDED_PAD_SOURCE", dir, 1); setenv("SHIELDED_PAD_LEDGER", ledger, 1);
+            char rm2[700]; snprintf(rm2, sizeof rm2, "rm -rf %s", dir2); (void)!system(rm2);
+        }
         /* a partial env refuses to open */
         unsetenv("SHIELDED_PAD_SK");
         int e3 = 0; assert(sh_link_open("127.0.0.1", 1, false, &e3) == NULL && e3 == SH_ERR_RANGE);

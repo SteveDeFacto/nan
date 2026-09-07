@@ -142,7 +142,7 @@ export function createShipmentStore({ dir }) {
   };
 }
 
-export const PADS_EPOCH = 1;                     // bump to re-key every pVM's seed
+export const PADS_EPOCH = Number(process.env.PADS_EPOCH || 1);   // bump (env) to re-key every pVM's seed; old shipments become foreign
 export const MAX_WINDOW = 4096;
 const NONCE_MEMORY = 256;                        // recent request nonces kept per seed (replay guard)
 
