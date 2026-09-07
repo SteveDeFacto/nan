@@ -47,12 +47,17 @@ test("nnShieldedRefillThreads reaches the engine as the SHIELDED_REFILL_THREADS 
 test("dealt-pad knobs reach the engine together, seed and sk as substituted secrets, never partially", () => {
   for (const [key, env] of [["nnShieldedPadSource", "SHIELDED_PAD_SOURCE"], ["nnShieldedPadSeed", "SHIELDED_PAD_SEED"], ["nnShieldedPadSeedId", "SHIELDED_PAD_SEED_ID"],
                             ["nnShieldedPadSk", "SHIELDED_PAD_SK"], ["nnShieldedPadLedger", "SHIELDED_PAD_LEDGER"], ["nnShieldedPadModelDigest", "SHIELDED_PAD_MODEL_DIGEST"],
-                            ["nnShieldedPadWindow", "SHIELDED_PAD_WINDOW"], ["nnShieldedPadCheck", "SHIELDED_PAD_CHECK"]]) {
+                            ["nnShieldedPadWindow", "SHIELDED_PAD_WINDOW"], ["nnShieldedPadCheck", "SHIELDED_PAD_CHECK"],
+                            ["nnShieldedPadCache", "SHIELDED_PAD_CACHE"], ["nnShieldedPadCacheMb", "SHIELDED_PAD_CACHE_MB"], ["nnShieldedPadWindowUrl", "SHIELDED_PAD_WINDOW_URL"],
+                            ["nnShieldedPadLedgerPk", "SHIELDED_PAD_LEDGER_PK"], ["nnShieldedPadPrune", "SHIELDED_PAD_PRUNE"]]) {
     assert.ok(manager.includes(`"${key}"`) && manager.includes(`"${env}"`), `${key} -> ${env}`);   // seed/seedId/sk go through one loop of (key, env) pairs
     assert.ok(tee.includes(`"${env}"`), `the engine reads ${env}`);
   }
   // the engine refuses a partial set rather than minting: the manager must not paper over that
   assert.match(tee, /Dealt mode: all four are required together/, "engine refuses a partial dealt env");
+  // a window agent without the platform's ledger key would let the agent sign its own windows: refused as a pair, on both sides
+  assert.match(tee, /a window URL without the ledger key is refused/, "engine refuses SHIELDED_PAD_WINDOW_URL without SHIELDED_PAD_LEDGER_PK");
+  assert.ok(manager.includes('wu.startswith("http://") and isinstance(lk, str) and len(lk) == 64'), "manager sets the window URL only together with a 64-hex ledger key");
   // secrets are substituted before this block sees the config
   assert.ok(manager.indexOf("enclave_config = _subst_secrets(enclave_config, secrets)") < manager.indexOf('env["SHIELDED_PAD_SOURCE"]'), "secret refs substituted before the pad env is built");
 });

@@ -293,8 +293,10 @@ static void pads_dir(char *out, size_t cap) {
     mkdir(out, 0700);
 }
 /* Shipments are named <seed_id>-<index0>-<count>.pads. Files of another
- * seed (an older key or epoch) can never open here and are dropped; files
- * wholly below `below` (a reserved window's lo) are spent by construction. */
+ * seed (an older key or epoch) can never open here and are dropped at
+ * PADSEED. Spent shipments are the engine's call (SHIELDED_PAD_PRUNE: it
+ * knows the lowest live cursor; a window edge alone is NOT safe, a lagging
+ * group may still read below it). `below` stays for that engine-side use. */
 static int pads_prune(const char *keep_seed, unsigned long long below) {
     if (!g_pads_dir[0]) return 0;
     DIR *d = opendir(g_pads_dir); if (!d) return 0;
@@ -365,7 +367,7 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
     }
     engine_main_fn em = (engine_main_fn)dlsym(h, "engine_main");
     if (!em) { OUT("ENGINE libengine.so has no engine_main"); return; }
-    anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex, pads_prune };
+    anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex };
     const anchor_pads *pp = NULL;
     if (with_pads) {
         if (!g_have_seed || !g_have_ledger) { OUT("ENGINE pads requested but no seed/ledger from the owner; refusing to mint for myself"); close(worker_fd); close(model_fd); return; }
@@ -373,6 +375,7 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
         char hs[65], hid[33], hsk[65];
         sh_pads_bin2hex(g_seed, 32, hs); sh_pads_bin2hex(g_seed_id, 16, hid); sh_pads_bin2hex(g_psk, 32, hsk);
         setenv("SHIELDED_PAD_SOURCE", g_pads_dir, 1); setenv("SHIELDED_PAD_SEED", hs, 1); setenv("SHIELDED_PAD_SEED_ID", hid, 1); setenv("SHIELDED_PAD_SK", hsk, 1);
+        setenv("SHIELDED_PAD_PRUNE", "1", 1);      /* the encrypted store's copy is ours: spent shipments go */
         setenv("SHIELDED_PAD_CHECK", "1", 0);        /* the pVM checks every imported pad against the weights: a wrong dealer is refused before use */
         /* Pin the model: only shipments the dealer minted for THIS calibration
          * (SHA-512/256 of the calib file, what shielded-dealer records) are used. */

@@ -8,7 +8,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC
 LDLIBS  += -lm
 
-CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c tweetnacl.c poly1305-donna.c
+CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c shielded-bank.c shielded-http.c tweetnacl.c poly1305-donna.c
 CORE_OBJ := $(CORE_SRC:.c=.o) shielded-simd-avx512.o shielded-simd-generic.o
 LDLIBS   += -lpthread
 
@@ -76,6 +76,9 @@ dealt-selftest: dealt-selftest.c $(CORE_OBJ)
 # Node<->C interop helpers for dealt pads (test/pads-interop.test.mjs).
 pads-unbox: pads-unbox.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+bank-probe: bank-probe.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 pads-keygen: pads-keygen.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 

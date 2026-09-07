@@ -410,6 +410,24 @@ int sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int32
     return rc;
 }
 
+int sh_pads_reader_prune_below(sh_pads_reader *r, uint64_t floor, bool unlink_files) {
+    if (!r || !floor) return 0;
+    int dropped = 0;
+    pthread_mutex_lock(&r->mu);
+    for (size_t i = 0; i < r->n_files; ) {
+        sh_pads_file *f = &r->files[i];
+        if (f->hdr.index0 + f->hdr.index_count > floor) { i++; continue; }
+        char path[512]; snprintf(path, sizeof path, "%s", f->path);
+        file_close(f);
+        if (unlink_files) unlink(path);
+        r->n_files--;
+        if (i < r->n_files) { r->files[i] = r->files[r->n_files]; memset(&r->files[r->n_files], 0, sizeof r->files[0]); r->files[r->n_files].fd = -1; }
+        dropped++;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return dropped;
+}
+
 uint64_t sh_pads_reader_extent(const sh_pads_reader *r) {
     uint64_t hi = 0;
     if (!r) return 0;

@@ -10,6 +10,5 @@ typedef struct {
     const uint8_t *ledger_pk;      /* 32 bytes, the relay's ledger key (verifies PADWIN replies) */
     const char    *name;           /* this host's tunnel name (part of every signed request) */
     const char    *seed_id_hex;    /* 32 hex, the seed the platform issued to this pVM */
-    int          (*prune)(const char *seed_id_hex, unsigned long long below);  /* drop shipments wholly below a reserved window; may be NULL */
 } anchor_pads;
 #endif

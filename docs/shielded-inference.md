@@ -497,6 +497,38 @@ verification failures, the same text). For a CVM tenant the manager keys are
 seed and sk as deployment secrets; the bank transport for a metal box is
 not built yet.
 
+### The CVM tier as a consumer: bank over HTTP, windows from an agent
+
+A metal box's trusted half has no phone app to stream shipments and relay
+windows, so the engine does both itself over plain HTTP (no TLS in the
+enclave; shipments are ciphertext to the pad key and windows are signed, so
+the transport carries no trust):
+
+- `nnShieldedPadSource: "http://<bank>/v1/pads/shipments"` - a bank that
+  speaks the platform store's shape (the relay itself, or the operator's NVMe
+  box on the LAN). The engine fetches shipments into `nnShieldedPadCache`
+  (default `/tmp/shielded-pads-<seed_id>`) in index order: everything covering
+  the current ledger window plus one ahead regardless of budget, then up to
+  `nnShieldedPadCacheMb` (default 2048) further. Spent shipments (wholly below
+  the lowest live group cursor, never a window edge alone) are unlinked
+  (`nnShieldedPadPrune`, default on for a bank cache, off for a directory).
+- `nnShieldedPadWindowUrl: "http://127.0.0.1:<port>/window"` with
+  `nnShieldedPadLedgerPk` (64 hex): the engine POSTs `{want, seed_id}` to a
+  loopback agent and verifies the answer's Ed25519 signature against the
+  pinned platform ledger key, exactly as the pVM verifies windows relayed by
+  its owner app. `shielded/dealer/window-agent.mjs` is that agent: `--relay`
+  mode signs `/v1/pads/reserve` requests with the tunnel's transport key,
+  `--ledger` mode is a self-signed local ledger for tests and single boxes.
+  The two knobs are refused separately: an agent without a pinned key could
+  sign its own windows.
+
+Proved on x86 against the local hub: four 16-row shipments in the store,
+8-row windows from the agent, 16 tokens: 2363 nodes offloaded, 0 local, 0
+missed, pad check clean, text identical to self-minting; shipments dropped at
+floors 20 and 36 and the cache never held more than its 64 MB budget
+(`test/pads-bank-client.test.mjs` pins the fetcher and the agent without a
+model).
+
 ## Worker protocol (hardened ggml-rpc derivative)
 
 Transport: TCP loopback CVM↔host (repo has no vsock anywhere; house pattern is TCP +

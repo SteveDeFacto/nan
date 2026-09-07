@@ -220,7 +220,24 @@ verification failures, exit 0, exact text.
   and the phone fetches over LAN/USB), prefetch depth from link rate and
   the largest expected prompt.
 
-### P4a. The CVM tier as a consumer (metal boxes) - DESIGN, not built
+### P4a. The CVM tier as a consumer (metal boxes) - BUILT 2026-09-07 (transport), volume design below superseded
+- The engine fetches its own bank and windows over plain HTTP instead of a
+  host-synced volume: `SHIELDED_PAD_SOURCE=http://<bank>/v1/pads/shipments`
+  (shielded-bank.c: index-ordered fetches into SHIELDED_PAD_CACHE covering the
+  current window plus one, then up to SHIELDED_PAD_CACHE_MB ahead; spent
+  shipments unlinked below the lowest group cursor) and
+  `SHIELDED_PAD_WINDOW_URL` + `SHIELDED_PAD_LEDGER_PK` (a loopback agent,
+  shielded/dealer/window-agent.mjs, relays the signed reserve; the engine
+  verifies the platform's signature, so the agent cannot widen). Works on any
+  hypervisor with a NIC; the operator's NVMe box is an HTTP cache of the
+  platform store. Proved on x86 against the local hub (four 16-row shipments,
+  8-row windows: 0 missed, prunes at floors 20/36, text exact); pinned by
+  test/pads-bank-client.test.mjs. Still to do for metal0: the wasm manager
+  runs the agent in --relay mode with the VM's transport key, the dealer for
+  the 27B (a platform GPU box: u = r.W is a GEMV the dealer may run on any
+  GPU it owns, since it never sees x), and SHIELDED_PAD_MODEL_DIGEST from the
+  model volume.
+- Earlier design note (kept for the volume alternative):
 - The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
   ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine
   inside the guest already consumes. What is missing is the bank's way into

@@ -82,7 +82,19 @@ typedef struct sh_link sh_link;
  *                            import, before any use
  *   SHIELDED_PAD_WINDOW      indices reserved per ledger call (default 64)
  *   SHIELDED_PAD_WAIT_MS     how long a refill waits for a missing index
- *                            before the link stops (default 10000) */
+ *                            before the link stops (default 10000)
+ *   SHIELDED_PAD_SOURCE=http://host:port/v1/pads/shipments
+ *                            a bank instead of a directory (shielded-bank.c):
+ *                            shipments are fetched into SHIELDED_PAD_CACHE
+ *                            (default /tmp/shielded-pads-<seed_id>), at most
+ *                            SHIELDED_PAD_CACHE_MB (2048) ahead of the window
+ *   SHIELDED_PAD_PRUNE       unlink spent shipments in the source directory
+ *                            (default 1 for a bank cache, 0 for a directory)
+ *   SHIELDED_PAD_WINDOW_URL  an http:// window agent answering
+ *                            POST {want, seed_id} with {lo, hi, iat, sig};
+ *                            requires SHIELDED_PAD_LEDGER_PK (64 hex, the
+ *                            platform's Ed25519 ledger key) and replaces the
+ *                            ledger file, like the pVM's provider does */
 sh_link *sh_link_open(const char *host, int port, bool verify, int *err);
 /* Explicit per-link transport/reservation for a pooled tenant. Call before start;
  * avoids mutating process-wide environment while other links refill/reconnect. */

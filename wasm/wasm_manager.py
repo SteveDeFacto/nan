@@ -5606,6 +5606,23 @@ def _spawn_and_wait(rec, ctx):
                 env["SHIELDED_PAD_WINDOW"] = str(pw)
             if pads.get("nnShieldedPadCheck") is True:
                 env["SHIELDED_PAD_CHECK"] = "1"
+            # The CVM tier as a consumer (PLAN P4a): an http:// source is a
+            # bank the trusted half fetches from into a cache; windows come
+            # from an http:// agent whose answers carry the platform ledger's
+            # signature (the key is pinned here, so the agent cannot widen).
+            if isinstance(pads.get("nnShieldedPadCache"), str) and pads["nnShieldedPadCache"].startswith("/"):
+                env["SHIELDED_PAD_CACHE"] = pads["nnShieldedPadCache"]
+            pc = _nn_cfg_int(enclave_config, "nnShieldedPadCacheMb", 64, 1 << 20)
+            if pc is not None:
+                env["SHIELDED_PAD_CACHE_MB"] = str(pc)
+            wu, lk = pads.get("nnShieldedPadWindowUrl"), pads.get("nnShieldedPadLedgerPk")
+            if isinstance(wu, str) and wu.startswith("http://") and isinstance(lk, str) and len(lk) == 64 and all(c in "0123456789abcdefABCDEF" for c in lk):
+                env["SHIELDED_PAD_WINDOW_URL"] = wu
+                env["SHIELDED_PAD_LEDGER_PK"] = lk
+            if pads.get("nnShieldedPadPrune") is True:
+                env["SHIELDED_PAD_PRUNE"] = "1"
+            elif pads.get("nnShieldedPadPrune") is False:
+                env["SHIELDED_PAD_PRUNE"] = "0"
         env.update(_nn_shielded_transport_for(enclave_config))
         env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's

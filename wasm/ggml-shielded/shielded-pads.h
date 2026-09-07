@@ -88,6 +88,10 @@ int  sh_pads_reader_cell(sh_pads_reader *r, uint32_t group, uint64_t index, int3
 /* Pin the model: shipments whose header digest differs are ignored (the
  * dealer prints the digest it recorded; SHIELDED_PAD_MODEL_DIGEST carries it). */
 void sh_pads_reader_require_digest(sh_pads_reader *r, const uint8_t model_digest[32]);
+/* Drop (and, when `unlink_files`, delete) every shipment wholly below
+ * `floor`: the caller's lowest live cursor, so nothing still to be imported
+ * can go. Returns the number dropped. */
+int  sh_pads_reader_prune_below(sh_pads_reader *r, uint64_t floor, bool unlink_files);
 /* The highest index any shipment on disk covers, plus one (0 = none). */
 uint64_t sh_pads_reader_extent(const sh_pads_reader *r);
 void sh_pads_reader_close(sh_pads_reader *r);

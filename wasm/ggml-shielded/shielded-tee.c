@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "shielded-tee.h"
 #include "shielded-pads.h"
+#include "shielded-bank.h"
+#include "shielded-http.h"
 #include "shielded-field.h"
 
 #include <errno.h>
@@ -339,6 +341,13 @@ struct sh_link {
      * ever minted on the request path (a dry ring stalls the request). */
     bool       dealt;
     char       pad_dir[512], pad_ledger[512];
+    char       bank_url[1024];              /* http:// bank (shielded-bank.c); pad_dir is then the local cache */
+    sh_bank   *padbank;
+    uint64_t   bank_cache_max;
+    bool       pad_prune;                   /* unlink spent shipments in pad_dir (the consumer's own copy) */
+    char       win_url[1024];               /* http:// window agent: POST {want, seed_id} -> signed window */
+    uint8_t    win_pk[32]; bool have_win_pk;
+    char       pad_seed_id_hex[33];
     uint8_t    pad_seed[32], pad_seed_id[16], pad_sk[32];
     uint64_t   pad_window, win_lo, win_hi;
     int        pad_bank_wait_ms;
@@ -354,6 +363,7 @@ struct sh_link {
 };
 
 static int dealt_reserve(sh_link *l, uint64_t *lo, uint64_t *hi);   /* dealt pads: below, after the refill loop */
+static void dealt_advanced(sh_link *l);
 const char *sh_link_transport(const sh_link *l) { return l && l->transport[0] ? l->transport : "not connected"; }
 double sh_link_last_wire_us(const sh_link *l) { return l ? l->last_wire_us : 0.0; }
 
@@ -435,8 +445,30 @@ sh_link *sh_link_open(const char *host, int port, bool verify, int *err) {
             free(l); if (err) *err = SH_ERR_RANGE; return NULL;
         }
         l->dealt = true;
+        sh_pads_bin2hex(l->pad_seed_id, 16, l->pad_seed_id_hex);
         l->pad_window  = (uint64_t)env_int("SHIELDED_PAD_WINDOW", 64, 1, 1 << 20);
         l->pad_bank_wait_ms = env_int("SHIELDED_PAD_WAIT_MS", 10000, 0, 600000);
+        /* An http:// source is a bank: shipments are fetched into a local
+         * cache (SHIELDED_PAD_CACHE, default under /tmp) that the reader
+         * scans; spent files are unlinked there since the copy is ours. */
+        if (!strncmp(pad_dir, "http://", 7)) {
+            snprintf(l->bank_url, sizeof l->bank_url, "%s", pad_dir);
+            const char *cache = getenv("SHIELDED_PAD_CACHE");
+            if (cache && *cache) snprintf(l->pad_dir, sizeof l->pad_dir, "%s", cache);
+            else snprintf(l->pad_dir, sizeof l->pad_dir, "/tmp/shielded-pads-%s", l->pad_seed_id_hex);
+            l->bank_cache_max = (uint64_t)env_int("SHIELDED_PAD_CACHE_MB", 2048, 64, 1 << 20) << 20;
+        }
+        l->pad_prune = env_int("SHIELDED_PAD_PRUNE", l->bank_url[0] ? 1 : 0, 0, 1) != 0;
+        const char *wurl = getenv("SHIELDED_PAD_WINDOW_URL"), *wpk = getenv("SHIELDED_PAD_LEDGER_PK");
+        if (wurl && *wurl) {
+            if (strncmp(wurl, "http://", 7) || !wpk || !sh_pads_hex2bin(wpk, l->win_pk, 32)) {
+                pthread_mutex_destroy(&l->pool_mu); pthread_cond_destroy(&l->need_refill); pthread_cond_destroy(&l->pool_filled);
+                pthread_mutex_destroy(&l->bank.mu);
+                free(l); if (err) *err = SH_ERR_RANGE; return NULL;      /* a window URL without the ledger key is refused */
+            }
+            snprintf(l->win_url, sizeof l->win_url, "%s", wurl);
+            l->have_win_pk = true;
+        }
     }
     l->refill_cost_priority = env_int("SHIELDED_REFILL_COST_PRIORITY", 0, 0, 1);
     if (err) *err = SH_OK;
@@ -492,6 +524,7 @@ void sh_link_close(sh_link *l) {
     free(l->rp); free(l->up); free(l->slots);
     free(l->r); free(l->u); free(l->planes); free(l->gplanes); free(l->acc); free(l->hdr);
     sh_pipe_close(l->pipe);
+    sh_bank_close(l->padbank);
     sh_pads_reader_close(l->pads);
     pthread_mutex_destroy(&l->pool_mu); pthread_cond_destroy(&l->need_refill); pthread_cond_destroy(&l->pool_filled);
     pthread_mutex_destroy(&l->bank.mu);
@@ -797,6 +830,7 @@ static void *refill_main(void *arg) {
                     goto done;
                 }
                 l->win_hi = hi;
+                dealt_advanced(l);
             }
             index0 = g->cursor;
             g->cursor += (uint64_t)b;
@@ -878,9 +912,50 @@ static int derive_threads(const sh_link *l) {
 
 /* One ledger window, through the provider when the host supplied one (the
  * pVM asks its owner app, which asks the platform) and the file otherwise. */
+/* A window from an http:// agent (the wasm manager inside the CVM, or a
+ * test stub): POST {"want","seed_id"} and verify the platform's signature
+ * exactly as the pVM does; an agent cannot hand out a window the ledger
+ * did not sign. */
+static int dealt_reserve_http(sh_link *l, uint64_t *lo, uint64_t *hi) {
+    char body[128]; snprintf(body, sizeof body, "{\"want\":%llu,\"seed_id\":\"%s\"}", (unsigned long long)l->pad_window, l->pad_seed_id_hex);
+    uint8_t *resp = NULL; size_t rlen = 0; int status = 0;
+    if (sh_http_post_json(l->win_url, body, 30000, &resp, &rlen, &status) != 0) { snprintf(l->err, sizeof l->err, "dealt pads: window agent %s unreachable", l->win_url); return SH_ERR_IO; }
+    int rc = SH_ERR_IO;
+    if (status == 200 && resp) {
+        const char *s = (const char *)resp;
+        const char *pl = strstr(s, "\"lo\":"), *ph = strstr(s, "\"hi\":"), *pi = strstr(s, "\"iat\":"), *ps = strstr(s, "\"sig\":\"");
+        if (pl && ph && pi && ps) {
+            const unsigned long long L = strtoull(pl + 5, NULL, 10), H = strtoull(ph + 5, NULL, 10), I = strtoull(pi + 6, NULL, 10);
+            char sig_hex[129] = ""; snprintf(sig_hex, sizeof sig_hex, "%.128s", ps + 7);
+            uint8_t sig[64];
+            if (strlen(sig_hex) == 128 && sh_pads_hex2bin(sig_hex, sig, 64) && sh_pads_window_verify(l->win_pk, l->pad_seed_id_hex, L, H, I, sig) && H > L) {
+                *lo = L; *hi = H; rc = SH_OK;
+            } else snprintf(l->err, sizeof l->err, "dealt pads: window signature REJECTED (agent %s)", l->win_url);
+        } else snprintf(l->err, sizeof l->err, "dealt pads: malformed window from %s", l->win_url);
+    } else snprintf(l->err, sizeof l->err, "dealt pads: window agent %s answered http %d", l->win_url, status);
+    free(resp);
+    return rc;
+}
+
 static int dealt_reserve(sh_link *l, uint64_t *lo, uint64_t *hi) {
     if (l->win_fn) return l->win_fn(l->win_ctx, l->pad_window, lo, hi);
+    if (l->win_url[0]) return dealt_reserve_http(l, lo, hi);
     return sh_pads_window_reserve(l->pad_ledger, l->pad_window, lo, hi);
+}
+
+/* After a new window (pool mutex held): the lowest cursor over the groups is
+ * the floor below which nothing is imported again - the bank stops fetching
+ * there and, when the copy is ours, spent shipments are unlinked. The bank
+ * is asked to stay one window ahead of the new edge. */
+static void dealt_advanced(sh_link *l) {
+    uint64_t floor = UINT64_MAX;
+    for (size_t i = 0; i < l->n_groups; i++) if (l->groups[i].cursor < floor) floor = l->groups[i].cursor;
+    if (floor == UINT64_MAX) floor = l->win_lo;
+    if (l->padbank) { sh_bank_set_floor(l->padbank, floor); sh_bank_set_need(l->padbank, l->win_hi + l->pad_window); }
+    if (l->pad_prune && l->pads) {
+        const int n = sh_pads_reader_prune_below(l->pads, floor, true);
+        if (n) fprintf(stderr, "[shielded] dealt pads: dropped %d spent shipment(s) below %llu\n", n, (unsigned long long)floor);
+    }
 }
 
 void sh_link_set_window_provider(sh_link *l, sh_window_fn fn, void *ctx) {
@@ -892,9 +967,13 @@ void sh_link_set_window_provider(sh_link *l, sh_window_fn fn, void *ctx) {
  * take the first ledger window. Every group starts at the window's low edge. */
 static int dealt_open(sh_link *l) {
     if (!l->dealt) return SH_OK;
-    if (!l->win_fn && !l->pad_ledger[0]) { snprintf(l->err, sizeof l->err, "dealt pads: no ledger (SHIELDED_PAD_LEDGER) and no window provider"); return SH_ERR_RANGE; }
+    if (!l->win_fn && !l->win_url[0] && !l->pad_ledger[0]) { snprintf(l->err, sizeof l->err, "dealt pads: no ledger (SHIELDED_PAD_LEDGER), no window agent (SHIELDED_PAD_WINDOW_URL) and no window provider"); return SH_ERR_RANGE; }
     if (!l->pads) {
         int err = SH_OK;
+        if (l->bank_url[0] && !l->padbank) {
+            l->padbank = sh_bank_open(l->bank_url, l->pad_seed_id_hex, l->pad_dir, l->bank_cache_max, &err);
+            if (!l->padbank) { snprintf(l->err, sizeof l->err, "dealt pads: cannot start the bank client for %s (cache %s)", l->bank_url, l->pad_dir); return err ? err : SH_ERR_IO; }
+        }
         l->pads = sh_pads_reader_open(l->pad_dir, l->pad_seed_id, l->pad_sk, &err);
         if (!l->pads) { snprintf(l->err, sizeof l->err, "dealt pads: cannot read %s", l->pad_dir); return err ? err : SH_ERR_IO; }
         const char *dh = getenv("SHIELDED_PAD_MODEL_DIGEST");
@@ -914,6 +993,7 @@ static int dealt_open(sh_link *l) {
     if (dealt_reserve(l, &lo, &hi) != SH_OK) { snprintf(l->err, sizeof l->err, "dealt pads: no ledger window (%s)", l->win_fn ? "provider refused" : l->pad_ledger); return SH_ERR_IO; }
     l->win_lo = lo; l->win_hi = hi;
     for (size_t i = 0; i < l->n_groups; i++) l->groups[i].cursor = lo;
+    if (l->padbank) { sh_bank_set_floor(l->padbank, lo); sh_bank_set_need(l->padbank, hi + l->pad_window); }
     return SH_OK;
 }
 

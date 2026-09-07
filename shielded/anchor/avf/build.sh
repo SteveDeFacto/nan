@@ -69,11 +69,12 @@ case "$NAME" in
          "$CLANG" "${PF[@]}" -c "$GG/shielded-wire.c" -o "$OUT/wire.o"
          "$CLANG" "${PF[@]}" -c "$GG/shielded-tee.c" -o "$OUT/tee.o"
          "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$OUT/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+         "$CLANG" "${PF[@]}" -c "$GG/shielded-bank.c" -o "$OUT/bank.o"; "$CLANG" "${PF[@]}" -c "$GG/shielded-http.c" -o "$OUT/http.o"
          "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$OUT/nacl.o"
          "$CLANG" "${PF[@]}" -O3 -w -c "$GG/poly1305-donna.c" -o "$OUT/poly.o"
-         "$CLANG" "${PF[@]}" -static -o "$OUT/shielded-probe" "$GG/shielded-probe.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/nacl.o" "$OUT/poly.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
+         "$CLANG" "${PF[@]}" -static -o "$OUT/shielded-probe" "$GG/shielded-probe.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/bank.o" "$OUT/http.o" "$OUT/nacl.o" "$OUT/poly.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
          printf '#include "shielded-simd.h"\n#include <stdio.h>\nint main(void){printf("simd=%%s\\n", sh_simd_get()->name);return 0;}\n' > "$OUT/simd-check.c"
-         "$CLANG" "${PF[@]}" -static -o "$OUT/simd-check" "$OUT/simd-check.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/nacl.o" "$OUT/poly.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
+         "$CLANG" "${PF[@]}" -static -o "$OUT/simd-check" "$OUT/simd-check.c" "$OUT/tee.o" "$OUT/pads.o" "$OUT/bank.o" "$OUT/http.o" "$OUT/nacl.o" "$OUT/poly.o" "$OUT/field.o" "$OUT/wire.o" "$OUT/simd-neon.o" "$OUT/simd-generic.o" -lm
          echo "probe: $OUT/shielded-probe ($(stat -c %s "$OUT/shielded-probe") bytes), simd-check"; exit 0 ;;
   engine)  # the COMPLETE engine for the phone, normal world: libggml-shielded.so (the backend module),
            # ggml-test and shielded-run, against the arm64 llama.cpp from build-ggml-arm64.sh.
@@ -90,9 +91,10 @@ case "$NAME" in
            "$CLANG" "${PF[@]}" -c "$GG/shielded-wire.c" -o "$E/wire.o"
            "$CLANG" "${PF[@]}" -c "$GG/shielded-tee.c" -o "$E/tee.o"
            "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$E/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+           "$CLANG" "${PF[@]}" -c "$GG/shielded-bank.c" -o "$E/bank.o"; "$CLANG" "${PF[@]}" -c "$GG/shielded-http.c" -o "$E/http.o"
            "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$E/nacl.o"
            "$CLANG" "${PF[@]}" -O3 -w -c "$GG/poly1305-donna.c" -o "$E/poly.o"
-           CORE=("$E/tee.o" "$E/pads.o" "$E/nacl.o" "$E/poly.o" "$E/field.o" "$E/wire.o" "$E/simd-neon.o" "$E/simd-generic.o")
+           CORE=("$E/tee.o" "$E/pads.o" "$E/bank.o" "$E/http.o" "$E/nacl.o" "$E/poly.o" "$E/field.o" "$E/wire.o" "$E/simd-neon.o" "$E/simd-generic.o")
            "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED "${INC[@]}" -I"$GG" -c "$GG/ggml-shielded.cpp" -o "$E/ggml-shielded-dl.o"
            # bionic does not resolve a dlopened module's symbols against the executable's other libraries: link libggml too
            "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "${CORE[@]}" -L"$GA/lib" -lggml -lggml-base -lm
@@ -114,11 +116,12 @@ case "$NAME" in
            "$CLANG" "${PF[@]}" -c "$HERE/../harness/wire-fd.c" -o "$E/wire-fd.o"                       # shielded-wire.c + sh_pipe_open_fd + the hook
            "$CLANG" "${PF[@]}" -Dsh_pipe_open=sh_pipe_open_hook -c "$GG/shielded-tee.c" -o "$E/tee.o"    # the trusted half dials through the hook
            "$CLANG" "${PF[@]}" -c "$GG/shielded-pads.c" -o "$E/pads.o"      # dealt pads (shielded/dealer/PLAN.md)
+           "$CLANG" "${PF[@]}" -c "$GG/shielded-bank.c" -o "$E/bank.o"; "$CLANG" "${PF[@]}" -c "$GG/shielded-http.c" -o "$E/http.o"
            "$CLANG" "${PF[@]}" -w -c "$GG/tweetnacl.c" -o "$E/nacl.o"
            "$CLANG" "${PF[@]}" -O3 -w -c "$GG/poly1305-donna.c" -o "$E/poly.o"
            "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 -DGGML_BACKEND_DL -DGGML_BACKEND_SHARED "${INC[@]}" -I"$GG" -c "$GG/ggml-shielded.cpp" -o "$E/ggml-shielded-dl.o"
-           "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "$E/tee.o" "$E/pads.o" "$E/nacl.o" "$E/poly.o" "$E/field.o" "$E/wire-fd.o" "$E/simd-neon.o" "$E/simd-generic.o" -L"$GA/lib" -lggml -lggml-base -lm -Wl,-soname,libggml-shielded.so
-           "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 "${INC[@]}" -I"$GG" -I"$HERE/payload" -shared -o "$E/libengine.so" "$HERE/payload/engine.cpp" "$E/pads.o" "$E/nacl.o" "$E/poly.o" -L"$GA/lib" -lllama -lggml -lggml-base -llog -ldl -Wl,-soname,libengine.so
+           "$CXX" -shared -o "$E/libggml-shielded.so" "$E/ggml-shielded-dl.o" "$E/tee.o" "$E/pads.o" "$E/bank.o" "$E/http.o" "$E/nacl.o" "$E/poly.o" "$E/field.o" "$E/wire-fd.o" "$E/simd-neon.o" "$E/simd-generic.o" -L"$GA/lib" -lggml -lggml-base -lm -Wl,-soname,libggml-shielded.so
+           "$CXX" -O2 -std=c++17 -fPIC -march=armv8.2-a+dotprod -DGGML_MAX_NAME=128 "${INC[@]}" -I"$GG" -I"$HERE/payload" -shared -o "$E/libengine.so" "$HERE/payload/engine.cpp" "$E/pads.o" "$E/bank.o" "$E/http.o" "$E/nacl.o" "$E/poly.o" -L"$GA/lib" -lllama -lggml -lggml-base -llog -ldl -Wl,-soname,libengine.so
            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$E/libggml-shielded.so" | grep -E ' T (sh_pipe_adopt_fd|sh_pipe_open_hook|ggml_backend_shielded_stats)$' | sed 's/^/  /'
            echo "engine-pvm: $E/libggml-shielded.so ($(stat -c %s "$E/libggml-shielded.so") B), libengine.so ($(stat -c %s "$E/libengine.so") B)"; exit 0 ;;
   attest_probe) SRCS=("$HERE/payload/attest_probe.c") ;;
@@ -127,7 +130,7 @@ case "$NAME" in
                 # shielded-simd.c is built twice, generic and -DSH_SIMD_NEON; the core's refill is pointed at SDOT.
                 "$CLANG" -O3 -fPIC -march=armv8.2-a+dotprod -DSH_SIMD_NEON -I"$GG" -c "$GG/shielded-simd.c" -o "$OUT/simd-neon-pic.o"
                 SRCS=("$HERE/payload/anchor_payload.c" "$CORE/anchor-core.c" "$GG/shielded-simd.c" "$GG/shielded-field.c"
-                      "$HERE/../harness/worker-client.c" "$HERE/../harness/wire-fd.c" "$GG/shielded-pads.c" "$GG/poly1305-donna.c"
+                      "$HERE/../harness/worker-client.c" "$HERE/../harness/wire-fd.c" "$GG/shielded-pads.c" "$GG/shielded-bank.c" "$GG/shielded-http.c" "$GG/poly1305-donna.c"
                       "$HERE/payload/third_party/tweetnacl.c" "$OUT/simd-neon-pic.o")
                 CFLAGS+=(-ffp-contract=off -I"$HERE/../harness" -DAN_REFILL=sh_simd_neon_refill)
                 # the engine rides along when it has been built (build.sh engine-pvm): six libraries + the calibration
