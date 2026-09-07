@@ -13,7 +13,7 @@ GGML_CPU_SO, LD_LIBRARY_PATH. The seed is derived exactly as relay/pads.mjs does
 (HKDF-SHA512, salt = keyFp bytes, info "enclave-pads-seed:<epoch>"); the master
 seed is the platform's secret and never leaves the dealer's process.
 """
-import argparse, hashlib, hmac, json, os, re, subprocess, sys, time, urllib.request
+import argparse, hashlib, hmac, json, os, re, subprocess, sys, time, urllib.error, urllib.request
 
 
 def hkdf_sha512(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
@@ -63,6 +63,25 @@ def relay_get(base: str, path: str):
         return json.loads(r.read().decode())
 
 
+def relay_put_file(base: str, seed_id: str, path: str, token: str):
+    """Stream one shipment into the platform's store; the relay renames it only if the sha256 matches."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
+    url = f"{base.rstrip('/')}/v1/pads/shipments/{seed_id}/{os.path.basename(path)}?sha256={h.hexdigest()}"
+    with open(path, "rb") as f:
+        req = urllib.request.Request(url, data=f, method="PUT", headers={"Authorization": "Bearer " + token, "Content-Length": str(os.path.getsize(path)), "Content-Type": "application/octet-stream"})
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            return json.loads(r.read().decode())
+
+
+def relay_delete(base: str, seed_id: str, name: str, token: str):
+    req = urllib.request.Request(f"{base.rstrip('/')}/v1/pads/shipments/{seed_id}/{name}", method="DELETE", headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r: return r.status
+    except urllib.error.HTTPError as e: return e.code
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--relay"); ap.add_argument("--name")
@@ -72,6 +91,7 @@ def main():
     ap.add_argument("--ahead", type=int, default=256); ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--once", action="store_true"); ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--derive-only", action="store_true"); ap.add_argument("--plan-only", action="store_true")
+    ap.add_argument("--push", action="store_true", help="upload each new shipment to the relay's store and delete spent ones there (needs PADS_DEALER_TOKEN)")
     a = ap.parse_args()
 
     if a.derive_only:
@@ -92,8 +112,11 @@ def main():
         want, spent = plan(existing, mark, a.ahead, a.chunk)
         if a.plan_only:
             print(json.dumps({"seed_id": seed_id, "mark": mark, "mint": want, "prune": spent})); return 0
+        token = os.environ.get("PADS_DEALER_TOKEN", "")
+        if a.push and not (a.relay and token): sys.exit("--push needs --relay and PADS_DEALER_TOKEN")
         for p in spent:
             os.unlink(p); print(f"pruned {os.path.basename(p)} (below mark {mark})", flush=True)
+            if a.push: print(f"  relay delete -> {relay_delete(a.relay, seed_id, os.path.basename(p), token)}", flush=True)
         if want:
             if not (seed and pk and a.model and a.calib):
                 sys.exit("minting needs --seed (or --master) and --pk (or a pVM with a pad key), --model, --calib")
@@ -106,6 +129,11 @@ def main():
             r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             if r.returncode != 0: sys.exit(f"shielded-dealer failed ({r.returncode}) for {ranges}")
             print(f"minted {len(want)} shipment(s) for {seed_id} covering up to {want[-1][0] + want[-1][1]} in {time.time() - t0:.1f} s", flush=True)
+            if a.push:
+                for i0, c in want:
+                    f = os.path.join(a.out, f"{seed_id}-{i0}-{c}.pads")
+                    res = relay_put_file(a.relay, seed_id, f, token)
+                    print(f"  pushed {os.path.basename(f)}: {res.get('bytes')} bytes, sha256 {str(res.get('sha256'))[:16]}", flush=True)
         else:
             print(f"bank for {seed_id} covers [{mark}, {mark + a.ahead}); nothing to mint", flush=True)
         if a.once: return 0

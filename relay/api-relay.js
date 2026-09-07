@@ -93,7 +93,7 @@ import { handleSecrets, initSecrets, secretsEnabled, startSecretsSweep } from ".
 import { handleDomains, initDomains, domainsEnabled, startDomainSweep, domainDeployment, tlsAskAllowed } from "./domains.js";
 import { handleCerts, initCerts } from "./certs.js";
 import { createTunnelHub } from "./tunnel.js";
-import { createPadsLedger, PADS_EPOCH } from "./pads.mjs";
+import { createPadsLedger, createShipmentStore, PADS_EPOCH } from "./pads.mjs";
 import { dataDir } from "./store.js";
 import { boxOrigin, boxLabelOfHost } from "./boxhost.js";
 installProcessGuards("api-relay");
@@ -1619,6 +1619,48 @@ async function gateway(u, req, res) {
     const L = padsLedger();
     if (!L) return json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }, req);
     if (p === "/v1/pads/key" && req.method === "GET") return json(res, 200, { key: L.key(), epoch: PADS_EPOCH }, req);
+    // Shipments: the dealer streams them in (bearer PADS_DEALER_TOKEN), the
+    // phone lists and streams them out (ciphertext to its pad key: public).
+    if (p === "/v1/pads/shipments" && req.method === "GET") {
+      const store = createShipmentStore({ dir: dataDir() });
+      return json(res, 200, { seed_id: u.searchParams.get("seed_id") || "", shipments: store.list(u.searchParams.get("seed_id") || "") }, req);
+    }
+    const ship = p.match(/^\/v1\/pads\/shipments\/([0-9a-f]{32})\/([A-Za-z0-9._-]{1,120})$/);
+    if (ship) {
+      const store = createShipmentStore({ dir: dataDir() });
+      if (req.method === "GET") {
+        const f = store.file(ship[1], ship[2]);
+        if (!f) return json(res, 404, { error: "no_such_shipment" }, req);
+        const st = fs.statSync(f);
+        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": st.size, "cache-control": "private, max-age=3600" });
+        return fs.createReadStream(f).pipe(res);
+      }
+      const token = (process.env.PADS_DEALER_TOKEN || "").trim();
+      const auth = String(req.headers.authorization || "");
+      if (!token || auth !== "Bearer " + token) return json(res, 403, { error: "dealer_only", message: "PUT/DELETE need the dealer's bearer" }, req);
+      const plan = store.plan(ship[1], ship[2]);
+      if (!plan) return json(res, 400, { error: "bad_name", message: "<seed_id>-<index0>-<count>.pads, for that seed" }, req);
+      if (req.method === "DELETE") return json(res, store.remove(ship[1], ship[2]) ? 200 : 404, { removed: ship[2] }, req);
+      if (req.method === "PUT") {
+        // streamed to a .part, hashed on the way, renamed only if the sha256 the dealer declared matches
+        const want = String(u.searchParams.get("sha256") || "").toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(want)) return json(res, 400, { error: "need_sha256" }, req);
+        const hash = createHash("sha256");
+        const out = fs.createWriteStream(plan.tmp);
+        let bytes = 0;
+        req.on("data", (ch) => { hash.update(ch); bytes += ch.length; });
+        req.pipe(out);
+        out.on("finish", () => {
+          const got = hash.digest("hex");
+          if (got !== want) { try { fs.unlinkSync(plan.tmp); } catch {} return json(res, 409, { error: "sha256_mismatch", got, want }, req); }
+          try { fs.renameSync(plan.tmp, plan.final); } catch (e) { return json(res, 500, { error: "store", message: e.message }, req); }
+          return json(res, 200, { stored: ship[2], bytes, sha256: got }, req);
+        });
+        out.on("error", (e) => json(res, 500, { error: "store", message: e.message }, req));
+        return;
+      }
+      return json(res, 405, { error: "method" }, req);
+    }
     if (p === "/v1/pads/pvm" && req.method === "GET") {
       const r = L.pvm(u.searchParams.get("name") || "");
       return r ? json(res, 200, r, req) : json(res, 404, { error: "unknown_tunnel" }, req);

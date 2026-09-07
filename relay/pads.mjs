@@ -37,6 +37,46 @@ import { createHash, createPrivateKey, createPublicKey, createCipheriv, diffieHe
 import fs from "node:fs";
 import path from "node:path";
 
+/* ---- the shipment store --------------------------------------------------
+ * The dealer PUTs finished shipments here and the phone prefetches them into
+ * its own storage (the platform is the bank; an operator NVMe cache can front
+ * it later). Files are ciphertext to a pad key, so GET is public; PUT/DELETE
+ * take the dealer's bearer. Names are `<seed_id>-<index0>-<count>.pads`. */
+const SHIP_NAME = /^([0-9a-f]{32})-(\d+)-(\d+)\.pads$/;
+export function createShipmentStore({ dir }) {
+  const root = path.join(dir, "pads-shipments");
+  const seedDir = (seed_id) => path.join(root, seed_id);
+  const okSeed = (s) => /^[0-9a-f]{32}$/.test(String(s || ""));
+  return {
+    root,
+    /* Where an upload lands (tmp) and its final path; the name must carry the seed it is for. */
+    plan(seed_id, name) {
+      const m = SHIP_NAME.exec(String(name || ""));
+      if (!okSeed(seed_id) || !m || m[1] !== seed_id) return null;
+      fs.mkdirSync(seedDir(seed_id), { recursive: true });
+      return { tmp: path.join(seedDir(seed_id), "." + name + ".part"), final: path.join(seedDir(seed_id), name), index0: Number(m[2]), count: Number(m[3]) };
+    },
+    list(seed_id) {
+      if (!okSeed(seed_id)) return [];
+      let names = [];
+      try { names = fs.readdirSync(seedDir(seed_id)); } catch { return []; }
+      return names.filter((n) => SHIP_NAME.test(n)).map((n) => {
+        const m = SHIP_NAME.exec(n), st = fs.statSync(path.join(seedDir(seed_id), n));
+        return { name: n, bytes: st.size, index0: Number(m[2]), count: Number(m[3]) };
+      }).sort((a, b) => a.index0 - b.index0);
+    },
+    file(seed_id, name) {
+      const p = this.plan(seed_id, name);
+      return p && fs.existsSync(p.final) ? p.final : null;
+    },
+    remove(seed_id, name) {
+      const p = this.plan(seed_id, name);
+      if (!p) return false;
+      try { fs.unlinkSync(p.final); return true; } catch { return false; }
+    },
+  };
+}
+
 export const PADS_EPOCH = 1;                     // bump to re-key every pVM's seed
 export const MAX_WINDOW = 4096;
 const NONCE_MEMORY = 256;                        // recent request nonces kept per seed (replay guard)

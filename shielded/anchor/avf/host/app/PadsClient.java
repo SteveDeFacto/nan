@@ -96,11 +96,37 @@ final class PadsClient {
         } catch (Exception e) { Main.say("PADS window error " + e); try { out.write("PADWIN fail error\n".getBytes()); out.flush(); } catch (Exception ignored) { } }
     }
 
+    /** Prefetch: the platform's store lists this seed's shipments; download the ones this phone
+     *  does not hold yet (whole files, tmp-then-rename, so streamBank never sees a partial). */
+    static void syncBank(java.io.File dir, String seedIdNow) {
+        try {
+            dir.mkdirs();
+            JSONObject list = http("GET", base + "/v1/pads/shipments?seed_id=" + seedIdNow, null);
+            org.json.JSONArray ships = list.optJSONArray("shipments");
+            if (ships == null) return;
+            for (int i = 0; i < ships.length(); i++) {
+                JSONObject s = ships.getJSONObject(i);
+                java.io.File f = new java.io.File(dir, s.getString("name"));
+                if (f.exists() && f.length() == s.getLong("bytes")) continue;
+                java.io.File tmp = new java.io.File(dir, "." + s.getString("name") + ".part");
+                HttpURLConnection c = (HttpURLConnection) new URL(base + "/v1/pads/shipments/" + seedIdNow + "/" + s.getString("name")).openConnection();
+                c.setConnectTimeout(20000); c.setReadTimeout(120000);
+                if (c.getResponseCode() != 200) { Main.say("PADS fetch " + s.getString("name") + " http " + c.getResponseCode()); continue; }
+                try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[1 << 20]; int n; while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                if (tmp.length() == s.getLong("bytes") && tmp.renameTo(f)) Main.say("PADS fetched " + f.getName() + " (" + (f.length() >> 20) + " MiB)");
+                else { tmp.delete(); Main.say("PADS fetch of " + s.getString("name") + " incomplete"); }
+            }
+        } catch (Exception e) { Main.say("PADS sync error " + e); }
+    }
+
     /** The bank on this phone (P3 fetches it from the operator's box): every .pads file in `dir`,
      *  streamed into the VM one connection each. Files already streamed are skipped by name. */
     static void streamBank(Object vm, java.io.File dir) {
         java.util.Set<String> done = new java.util.HashSet<>();
         for (int round = 0; round < 3600 && !Main.ended(); round++) {
+            if (!base.isEmpty() && !seedId.isEmpty() && round % 15 == 0) syncBank(dir, seedId);   // every ~15 s: what the platform has that we do not
             java.io.File[] files = dir.listFiles((d, n) -> n.endsWith(".pads"));
             if (files != null) {
                 java.util.Arrays.sort(files);
