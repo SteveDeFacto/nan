@@ -93,7 +93,7 @@ import { handleSecrets, initSecrets, secretsEnabled, startSecretsSweep } from ".
 import { handleDomains, initDomains, domainsEnabled, startDomainSweep, domainDeployment, tlsAskAllowed } from "./domains.js";
 import { handleCerts, initCerts } from "./certs.js";
 import { createTunnelHub } from "./tunnel.js";
-import { createPadsLedger, createShipmentStore, padsRouter } from "./pads.mjs";
+import { createPadsLedger, createPrefixStore, createShipmentStore, padsRouter } from "./pads.mjs";
 import { dataDir } from "./store.js";
 import { boxOrigin, boxLabelOfHost } from "./boxhost.js";
 installProcessGuards("api-relay");
@@ -168,8 +168,9 @@ function padsRoutes() {
     const d = dataDir();
     const ledger = d ? createPadsLedger({ dir: d, hub: tunnelHub, masterSeed: process.env.PADS_MASTER_SEED || null }) : null;
     const store = d ? createShipmentStore({ dir: d }) : null;
+    const prefixStore = d ? createPrefixStore({ dir: d }) : null;
     if (!ledger) console.log("[pads] no data dir: the pads ledger is disabled");
-    padsRoutesInstance = padsRouter({ ledger, store, dealerToken: (process.env.PADS_DEALER_TOKEN || "").trim(),
+    padsRoutesInstance = padsRouter({ ledger, store, prefixStore, dealerToken: (process.env.PADS_DEALER_TOKEN || "").trim(),
                                       json: (res, status, body) => json(res, status, body, null), readBody });
   }
   return padsRoutesInstance;

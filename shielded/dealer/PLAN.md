@@ -325,9 +325,13 @@ verification failures, exit 0, exact text.
   model / prefix / tampered file / edited sidecar / no sidecar all refused),
   and `shielded-run` loading a verified KV (`SHIELDED_PREFIX_KV`,
   `SHIELDED_PREFIX_KV_PK`, `SHIELDED_PREFIX_FILE`): 25-token prefix loaded,
-  2 tokens prefilled, text identical to the full prefill. Next: the pVM
-  (owner app streams kv+sig+prefix through the pads port; engine.cpp
-  mirrors the runner) and the wasm shim verb for tenants.
+  2 tokens prefilled, text identical to the full prefill. Platform store:
+  `/v1/prefix-kv/<model digest>/<name>.{kv,kv.sig,txt}` (relay/pads.mjs
+  createPrefixStore, PUT with the dealer bearer, GET public). Phone: owner
+  app fetches by (digest, name) or takes a local dir, pins PREFIXPK in the
+  VM, streams the files over the pads port; engine.cpp verifies + loads
+  (in verification on the Pixel 8 Pro). Next: the wasm shim verb for
+  tenants.
 - DONE 2026-09-07, usage receipts: at the end of a run the engine (inside
   the pVM) signs `enclave-pads-receipt\n<name>\n<seed_id>\n<pads>\n<tokens>\n<nonce>`
   with the transport key (`ggml_backend_shielded_pads_used` = cells

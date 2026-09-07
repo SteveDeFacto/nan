@@ -13,7 +13,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execFileP = promisify(execFile);
 import { fileURLToPath } from "node:url";
-import { createShipmentStore, deriveSeed } from "../relay/pads.mjs";
+import { createPrefixStore, createShipmentStore, deriveSeed, padsRouter } from "../relay/pads.mjs";
 
 const repo = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const loop = path.join(repo, "shielded", "dealer", "dealer-loop.py");
@@ -91,4 +91,40 @@ test("dealer --all serves every consumer the relay lists that has asked for its 
   assert.doesNotMatch(out, /consumer box2/);                                          // never asked for a seed: nothing to mint yet
   assert.deepEqual(seen.put.sort(), [`/v1/pads/shipments/${issued.seed_id}/${issued.seed_id}-0-32.pads`, `/v1/pads/shipments/${issued.seed_id}/${issued.seed_id}-32-32.pads`, `/v1/pads/shipments/${issued.seed_id}/${issued.seed_id}-64-32.pads`]);
   assert.deepEqual(fs.readdirSync(bank).filter((f) => f.endsWith(".pads")).sort(), [`${issued.seed_id}-0-32.pads`, `${issued.seed_id}-32-32.pads`, `${issued.seed_id}-64-32.pads`]);
+});
+
+test("the prefix-KV store keeps <name>.kv/.kv.sig/.txt per model digest, and the router serves them (PUT with the bearer, GET public)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prefix-"));
+  const store = createPrefixStore({ dir });
+  const digest = "ab".repeat(32);
+  assert.equal(store.plan("nope", "sys.kv"), null);
+  assert.equal(store.plan(digest, "../sys.kv"), null);
+  assert.equal(store.plan(digest, "Sys.kv"), null);                       // lowercase names only
+  assert.ok(store.plan(digest, "sys.kv") && store.plan(digest, "sys.kv.sig") && store.plan(digest, "sys.txt"));
+  assert.equal(store.plan(digest, "sys.bin"), null);
+  // through the router: an http server with the host's json/readBody
+  const json = (res, status, body) => { const b = JSON.stringify(body); res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(b) }); res.end(b); };
+  const readBody = (req) => new Promise((r) => { const c = []; req.on("data", (d) => c.push(d)); req.on("end", () => r(Buffer.concat(c))); });
+  const router = padsRouter({ ledger: null, store: null, prefixStore: store, dealerToken: "tok", json, readBody });
+  const srv = http.createServer((req, res) => { router(req, res, new URL(req.url, "http://x")).then((h) => { if (!h) { res.statusCode = 404; res.end(); } }); });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const body = Buffer.alloc(300000, 0x42);
+  const sha = createHash("sha256").update(body).digest("hex");
+  const put = (name, b = body, auth = "Bearer tok", sha256 = sha) => fetch(`${base}/v1/prefix-kv/${digest}/${name}?sha256=${sha256}`, { method: "PUT", headers: { authorization: auth }, body: b }).then(async (r) => ({ status: r.status, body: await r.json() }));
+  assert.equal((await put("sys.kv", body, "Bearer wrong")).status, 403);
+  assert.equal((await put("sys.kv", body, "Bearer tok", "00".repeat(32))).status, 409);   // the sha must match
+  assert.equal((await put("sys.kv")).status, 200);
+  assert.equal((await put("sys.kv.sig", Buffer.from("enclave-prefix-kv-v1\n"), "Bearer tok", createHash("sha256").update("enclave-prefix-kv-v1\n").digest("hex"))).status, 200);
+  assert.equal((await put("sys.bin")).status, 400);
+  const list = await fetch(`${base}/v1/prefix-kv/${digest}`).then((r) => r.json());
+  assert.deepEqual(list.artifacts.map((a) => a.name), ["sys.kv", "sys.kv.sig"]);
+  const got = await fetch(`${base}/v1/prefix-kv/${digest}/sys.kv`);
+  assert.equal(got.status, 200);
+  assert.equal(Buffer.from(await got.arrayBuffer()).equals(body), true);
+  assert.equal((await fetch(`${base}/v1/prefix-kv/${digest}/sys.txt`)).status, 404);
+  assert.equal((await fetch(`${base}/v1/prefix-kv/${digest}/sys.kv`, { method: "DELETE" })).status, 403);
+  assert.equal((await fetch(`${base}/v1/prefix-kv/${digest}/sys.kv`, { method: "DELETE", headers: { authorization: "Bearer tok" } })).status, 200);
+  assert.deepEqual((await fetch(`${base}/v1/prefix-kv/${digest}`).then((r) => r.json())).artifacts.map((a) => a.name), ["sys.kv.sig"]);
+  srv.closeAllConnections(); srv.close(); srv.unref();
 });

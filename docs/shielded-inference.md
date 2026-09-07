@@ -548,8 +548,14 @@ loads the state into its sequence and prefills only the remainder: no pad rows
 for the prefix, no minutes of phone prefill, a one-second re-park after a
 restart. Proved in `shielded-run` (`SHIELDED_PREFIX_KV`, `SHIELDED_PREFIX_FILE`)
 on the 0.8B: a 25-token prefix loaded, 2 remainder tokens prefilled, text
-identical to the full 27-token prefill. The pVM engine and the wasm tenants
-(through the shim) are next.
+identical to the full 27-token prefill. The platform store keeps the
+artifacts per model digest (`PUT/GET /v1/prefix-kv/<digest>/<name>.kv|.kv.sig|.txt`,
+uploads with the dealer's bearer, reads public); the owner app fetches a
+named set (`--es prefixname`, `--es prefixdigest`) or takes a local
+directory (`--es prefix`), pins the platform's prefix key in the VM
+(`PREFIXPK`), and streams the three files over the pads port; the pVM engine
+waits for them, verifies, loads and prefills only the user's part. The wasm
+tenants (through the shim) are next.
 
 **The dealer daemon.** `GET /v1/pads/consumers` lists every attached tunnel
 that offered a pad key with its seed id, ledger mark and whether it has asked

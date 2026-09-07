@@ -12,7 +12,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTunnelHub } from "../../../../relay/tunnel.js";
-import { createPadsLedger, createShipmentStore, padsRouter } from "../../../../relay/pads.mjs";
+import { createPadsLedger, createPrefixStore, createShipmentStore, padsRouter } from "../../../../relay/pads.mjs";
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const port = +arg("--port", 8787);
 const avf = { codeHashes: [arg("--code-hash", "00".repeat(32))], authorityHashes: [arg("--authority", "00".repeat(64))] };
@@ -31,13 +31,14 @@ const hub = createTunnelHub({ allow: [], attest: { avf, devUnattested }, onChang
 const dataDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "out", "local-hub-data");
 const ledger = createPadsLedger({ dir: dataDir, hub, masterSeed: process.env.PADS_MASTER_SEED || null, log: (m) => console.log(m) });
 const store = createShipmentStore({ dir: dataDir });
+const prefixStore = createPrefixStore({ dir: dataDir });
 const json = (res, status, body) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
 const readBody = (req, max = 262144) => new Promise((resolve, reject) => {
   const chunks = []; let n = 0;
   req.on("data", (ch) => { n += ch.length; if (n > max) { req.destroy(); reject(new Error("body too large")); } else chunks.push(ch); });
   req.on("end", () => resolve(Buffer.concat(chunks))); req.on("error", reject);
 });
-const pads = padsRouter({ ledger, store, dealerToken: (process.env.PADS_DEALER_TOKEN || "").trim(), json, readBody });
+const pads = padsRouter({ ledger, store, prefixStore, dealerToken: (process.env.PADS_DEALER_TOKEN || "").trim(), json, readBody });
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   if (await pads(req, res, url)) return;

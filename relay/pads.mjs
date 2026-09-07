@@ -48,9 +48,54 @@ import path from "node:path";
 /* ---- the HTTP surface, shared by api-relay.js and the local hub ----------
  * Returns true when the request was one of ours (answered), false otherwise.
  * `json(res, status, body)` and `readBody(req, max) -> Buffer` are the host's. */
-export function padsRouter({ ledger, store, dealerToken, json, readBody }) {
+export function padsRouter({ ledger, store, prefixStore, dealerToken, json, readBody }) {
+  /* One artifact store's PUT/DELETE/GET: the shipment store (seed-keyed) and
+   * the prefix-KV store (model-digest-keyed) share it. Uploads carry their
+   * sha256 and land tmp-then-rename; PUT/DELETE need the dealer's bearer. */
+  function serveArtifact(st, key, name, req, res, url) {
+    if (req.method === "GET") {
+      const f = st.file(key, name);
+      if (!f) { json(res, 404, { error: "no_such_artifact" }); return true; }
+      const stat = fs.statSync(f);
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": stat.size, "cache-control": "private, max-age=3600" });
+      fs.createReadStream(f).pipe(res); return true;
+    }
+    const auth = String(req.headers.authorization || "");
+    if (!dealerToken || auth !== "Bearer " + dealerToken) { json(res, 403, { error: "dealer_only", message: "PUT/DELETE need the dealer's bearer" }); return true; }
+    const plan = st.plan(key, name);
+    if (!plan) { json(res, 400, { error: "bad_name", message: st.nameHint }); return true; }
+    if (req.method === "DELETE") { json(res, st.remove(key, name) ? 200 : 404, { removed: name }); return true; }
+    if (req.method === "PUT") {
+      const want = String(url.searchParams.get("sha256") || "").toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(want)) { json(res, 400, { error: "need_sha256" }); return true; }
+      const hash = createHash("sha256");
+      const out = fs.createWriteStream(plan.tmp);
+      let bytes = 0;
+      req.on("data", (ch) => { hash.update(ch); bytes += ch.length; });
+      req.pipe(out);
+      out.on("finish", () => {
+        const got = hash.digest("hex");
+        if (got !== want) { try { fs.unlinkSync(plan.tmp); } catch {} return json(res, 409, { error: "sha256_mismatch", got, want }); }
+        try { fs.renameSync(plan.tmp, plan.final); } catch (e) { return json(res, 500, { error: "store", message: e.message }); }
+        json(res, 200, { stored: name, bytes, sha256: got });
+      });
+      out.on("error", (e) => json(res, 500, { error: "store", message: e.message }));
+      return true;
+    }
+    json(res, 405, { error: "method" }); return true;
+  }
   return async function handle(req, res, url) {
     const p = url.pathname;
+    /* The shared-prefix service's artifacts (prefix-kv.h): <name>.kv, <name>.kv.sig
+     * and <name>.txt per model digest. Public bytes (derived from public text and
+     * public weights, signed by the platform's prefix key); PUT/DELETE by the dealer. */
+    if (p.startsWith("/v1/prefix-kv/")) {
+      if (!prefixStore) { json(res, 503, { error: "prefix_kv_disabled" }); return true; }
+      const m = /^\/v1\/prefix-kv\/([0-9a-f]{64})(?:\/([^/]+))?$/.exec(p);
+      if (!m) { json(res, 404, { error: "not_found" }); return true; }
+      if (!m[2]) { if (req.method !== "GET") { json(res, 405, { error: "method" }); return true; } json(res, 200, { model: m[1], artifacts: prefixStore.list(m[1]) }); return true; }
+      return serveArtifact(prefixStore, m[1], m[2], req, res, url);
+    }
     if (!p.startsWith("/v1/pads/")) return false;
     if (!ledger || !store) { json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }); return true; }
     if (p === "/v1/pads/key" && req.method === "GET") { json(res, 200, { key: ledger.key(), epoch: PADS_EPOCH }); return true; }
@@ -79,38 +124,7 @@ export function padsRouter({ ledger, store, dealerToken, json, readBody }) {
       json(res, 200, { seed_id, shipments: store.list(seed_id) }); return true;
     }
     const ship = p.match(/^\/v1\/pads\/shipments\/([0-9a-f]{32})\/([A-Za-z0-9._-]{1,120})$/);
-    if (ship) {
-      if (req.method === "GET") {
-        const f = store.file(ship[1], ship[2]);
-        if (!f) { json(res, 404, { error: "no_such_shipment" }); return true; }
-        const st = fs.statSync(f);
-        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": st.size, "cache-control": "private, max-age=3600" });
-        fs.createReadStream(f).pipe(res); return true;
-      }
-      const auth = String(req.headers.authorization || "");
-      if (!dealerToken || auth !== "Bearer " + dealerToken) { json(res, 403, { error: "dealer_only", message: "PUT/DELETE need the dealer's bearer" }); return true; }
-      const plan = store.plan(ship[1], ship[2]);
-      if (!plan) { json(res, 400, { error: "bad_name", message: "<seed_id>-<index0>-<count>.pads, for that seed" }); return true; }
-      if (req.method === "DELETE") { json(res, store.remove(ship[1], ship[2]) ? 200 : 404, { removed: ship[2] }); return true; }
-      if (req.method === "PUT") {
-        const want = String(url.searchParams.get("sha256") || "").toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(want)) { json(res, 400, { error: "need_sha256" }); return true; }
-        const hash = createHash("sha256");
-        const out = fs.createWriteStream(plan.tmp);
-        let bytes = 0;
-        req.on("data", (ch) => { hash.update(ch); bytes += ch.length; });
-        req.pipe(out);
-        out.on("finish", () => {
-          const got = hash.digest("hex");
-          if (got !== want) { try { fs.unlinkSync(plan.tmp); } catch {} return json(res, 409, { error: "sha256_mismatch", got, want }); }
-          try { fs.renameSync(plan.tmp, plan.final); } catch (e) { return json(res, 500, { error: "store", message: e.message }); }
-          json(res, 200, { stored: ship[2], bytes, sha256: got });
-        });
-        out.on("error", (e) => json(res, 500, { error: "store", message: e.message }));
-        return true;
-      }
-      json(res, 405, { error: "method" }); return true;
-    }
+    if (ship) return serveArtifact(store, ship[1], ship[2], req, res, url);
     json(res, 404, { error: "not_found" }); return true;
   };
 }
@@ -127,6 +141,7 @@ export function createShipmentStore({ dir }) {
   const okSeed = (s) => /^[0-9a-f]{32}$/.test(String(s || ""));
   return {
     root,
+    nameHint: "<seed_id>-<index0>-<count>.pads, for that seed",
     /* Where an upload lands (tmp) and its final path; the name must carry the seed it is for. */
     plan(seed_id, name) {
       const m = SHIP_NAME.exec(String(name || ""));
@@ -338,6 +353,42 @@ export function createPadsLedger({ dir, hub, log = console.log, masterSeed = nul
     mark(seed_id) {
       const rec = seedRecord(seed_id);
       return rec ? { seed_id, mark: rec.mark, updated: rec.updated, name: rec.name } : null;
+    },
+  };
+}
+
+/* ---- the shared-prefix store ---------------------------------------------
+ * prefix-kv-mint's output per model digest: <name>.kv (llama's sequence state),
+ * <name>.kv.sig (the signed sidecar) and <name>.txt (the prefix text). Public
+ * bytes; the consumer trusts the sidecar's signature, not this store. */
+const PREFIX_NAME = /^([a-z0-9][a-z0-9._-]{0,63})\.(kv|kv\.sig|txt)$/;
+export function createPrefixStore({ dir }) {
+  const root = path.join(dir, "prefix-kv");
+  const modelDir = (digest) => path.join(root, digest);
+  const okDigest = (d) => /^[0-9a-f]{64}$/.test(String(d || ""));
+  return {
+    root,
+    nameHint: "<name>.kv | <name>.kv.sig | <name>.txt (lowercase name, 64 chars max)",
+    plan(digest, name) {
+      const m = PREFIX_NAME.exec(String(name || ""));
+      if (!okDigest(digest) || !m) return null;
+      fs.mkdirSync(modelDir(digest), { recursive: true });
+      return { tmp: path.join(modelDir(digest), "." + name + ".part"), final: path.join(modelDir(digest), name), base: m[1], kind: m[2] };
+    },
+    list(digest) {
+      if (!okDigest(digest)) return [];
+      let names = [];
+      try { names = fs.readdirSync(modelDir(digest)); } catch { return []; }
+      return names.filter((n) => PREFIX_NAME.test(n)).sort().map((n) => ({ name: n, bytes: fs.statSync(path.join(modelDir(digest), n)).size }));
+    },
+    file(digest, name) {
+      const p = this.plan(digest, name);
+      return p && fs.existsSync(p.final) ? p.final : null;
+    },
+    remove(digest, name) {
+      const p = this.plan(digest, name);
+      if (!p) return false;
+      try { fs.unlinkSync(p.final); return true; } catch { return false; }
     },
   };
 }
