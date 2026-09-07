@@ -554,8 +554,10 @@ uploads with the dealer's bearer, reads public); the owner app fetches a
 named set (`--es prefixname`, `--es prefixdigest`) or takes a local
 directory (`--es prefix`), pins the platform's prefix key in the VM
 (`PREFIXPK`), and streams the three files over the pads port; the pVM engine
-waits for them, verifies, loads and prefills only the user's part. The wasm
-tenants (through the shim) are next.
+waits for them, verifies, loads and prefills only the user's part. On the
+Pixel 8 Pro the same 27-token prompt generates identical tokens either way,
+and the usage receipts show the saving (39 pad rows for the full prefill,
+14 with the prefix loaded). The wasm tenants (through the shim) are next.
 
 **The dealer daemon.** `GET /v1/pads/consumers` lists every attached tunnel
 that offered a pad key with its seed id, ledger mark and whether it has asked

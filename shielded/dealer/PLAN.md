@@ -329,9 +329,14 @@ verification failures, exit 0, exact text.
   `/v1/prefix-kv/<model digest>/<name>.{kv,kv.sig,txt}` (relay/pads.mjs
   createPrefixStore, PUT with the dealer bearer, GET public). Phone: owner
   app fetches by (digest, name) or takes a local dir, pins PREFIXPK in the
-  VM, streams the files over the pads port; engine.cpp verifies + loads
-  (in verification on the Pixel 8 Pro). Next: the wasm shim verb for
-  tenants.
+  VM, streams the files over the pads port; engine.cpp verifies + loads.
+  PROVED ON THE PIXEL 8 PRO 2026-09-07 (runs 18/19): the same 27-token
+  prompt, full prefill vs 25 tokens loaded from the signed KV + 2
+  prefilled, generated tokens identical; the receipts show the saving,
+  39 vs 14 pad rows for the run (the prefix cost 25 rows of the bank).
+  Next: the wasm shim verb for tenants (a toolchain cycle).
+  Found on the way: the phone engine's stderr was uncollected; it now goes
+  to the encrypted store and its tail rides the control channel on failure.
 - DONE 2026-09-07, usage receipts: at the end of a run the engine (inside
   the pVM) signs `enclave-pads-receipt\n<name>\n<seed_id>\n<pads>\n<tokens>\n<nonce>`
   with the transport key (`ggml_backend_shielded_pads_used` = cells
