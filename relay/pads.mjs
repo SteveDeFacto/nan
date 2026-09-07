@@ -26,6 +26,10 @@
 //                          -> { seed_id, epoch, epk, nonce, box }  the pVM's seed,
 //                             X25519(epk, padKey) -> HKDF-SHA512 -> ChaCha20-Poly1305
 //   POST /v1/pads/reserve  { name, seed_id, want, nonce, sig }
+//   POST /v1/pads/receipt  { name, seed_id, pads, tokens, nonce, sig }
+//     the pVM's signed usage at the end of a run (pads = cells consumed,
+//     tokens = prompt + generated); the platform bills and pays on these
+//   GET  /v1/pads/receipts?seed_id=  { seed_id, pads, tokens, runs, last[] }
 //                          -> { seed_id, lo, hi, iat, sig }
 //   sig (requests) = Ed25519 over the canonical line set in signedMessage();
 //   sig (windows)  = Ed25519 over windowMessage().
@@ -54,11 +58,15 @@ export function padsRouter({ ledger, store, dealerToken, json, readBody }) {
       const m = ledger.mark(url.searchParams.get("seed_id") || "");
       json(res, m ? 200 : 404, m || { error: "unknown_seed" }); return true;
     }
-    if ((p === "/v1/pads/seed" || p === "/v1/pads/reserve") && req.method === "POST") {
+    if (p === "/v1/pads/receipts" && req.method === "GET") {
+      const r = ledger.receipts(url.searchParams.get("seed_id") || "");
+      json(res, r ? 200 : 404, r || { error: "unknown_seed" }); return true;
+    }
+    if ((p === "/v1/pads/seed" || p === "/v1/pads/reserve" || p === "/v1/pads/receipt") && req.method === "POST") {
       let body;
       try { body = JSON.parse((await readBody(req, 8192)).toString("utf8") || "{}"); }
       catch (e) { json(res, e.message === "body too large" ? 413 : 400, { error: "bad_json", message: e.message }); return true; }
-      const r = p === "/v1/pads/seed" ? ledger.seed(body || {}) : ledger.reserve(body || {});
+      const r = p === "/v1/pads/seed" ? ledger.seed(body || {}) : p === "/v1/pads/reserve" ? ledger.reserve(body || {}) : ledger.receipt(body || {});
       json(res, r.status, r.body); return true;
     }
     if (p === "/v1/pads/shipments" && req.method === "GET") {
@@ -144,6 +152,7 @@ export function createShipmentStore({ dir }) {
 
 export const PADS_EPOCH = Number(process.env.PADS_EPOCH || 1);   // bump (env) to re-key every pVM's seed; old shipments become foreign
 export const MAX_WINDOW = 4096;
+const RECEIPT_MEMORY = 64;     // per seed, the most recent receipts kept verbatim (totals are cumulative)
 const NONCE_MEMORY = 256;                        // recent request nonces kept per seed (replay guard)
 
 export function signedMessage(kind, fields) {
@@ -259,6 +268,36 @@ export function createPadsLedger({ dir, hub, log = console.log, masterSeed = nul
       save();                                                  // durable BEFORE the window is handed out
       const wsig = edSign(null, Buffer.from(windowMessage(seed_id, lo, hi, iat)), priv).toString("hex");
       return { status: 200, body: { seed_id, lo, hi, iat, sig: wsig } };
+    },
+
+    /* POST /v1/pads/receipt: the pVM's word on what a run consumed. Signed by
+     * the same transport key as the windows, so neither the owner app nor an
+     * operator can inflate it; totals are what billing and the operator payout
+     * read. Nonces share the seed's replay memory with reserve. */
+    receipt({ name, seed_id, pads, tokens, nonce, sig }) {
+      pads = Number(pads); tokens = Number(tokens);
+      if (!/^[0-9a-f]{32}$/.test(String(seed_id || ""))) return { status: 400, body: { error: "bad_seed_id" } };
+      if (!Number.isSafeInteger(pads) || pads < 0 || !Number.isSafeInteger(tokens) || tokens < 0) return { status: 400, body: { error: "bad_receipt", message: "pads and tokens must be non-negative integers" } };
+      const c = callerOf(name, "receipt", [seed_id, pads, tokens], nonce, sig);
+      if (c.error) return { status: 403, body: c };
+      const rec = seedRecord(seed_id);
+      if (!rec || rec.keyFp !== c.tunnel.keyFp) return { status: 403, body: { error: "not_your_seed", message: "this seed was not issued to this tunnel's key" } };
+      if (rec.nonces.includes(nonce)) return { status: 409, body: { error: "replay", message: "nonce already used" } };
+      rec.nonces.push(nonce); if (rec.nonces.length > NONCE_MEMORY) rec.nonces.splice(0, rec.nonces.length - NONCE_MEMORY);
+      const iat = Math.floor(Date.now() / 1000);
+      const u = rec.usage || (rec.usage = { pads: 0, tokens: 0, runs: 0, last: [] });
+      u.pads += pads; u.tokens += tokens; u.runs += 1;
+      u.last.push({ pads, tokens, iat, nonce }); if (u.last.length > RECEIPT_MEMORY) u.last.splice(0, u.last.length - RECEIPT_MEMORY);
+      save();
+      return { status: 200, body: { seed_id, pads: u.pads, tokens: u.tokens, runs: u.runs, iat } };
+    },
+
+    /* GET /v1/pads/receipts?seed_id= (billing and the operator payout read the totals). */
+    receipts(seed_id) {
+      const rec = seedRecord(seed_id);
+      if (!rec) return null;
+      const u = rec.usage || { pads: 0, tokens: 0, runs: 0, last: [] };
+      return { seed_id, name: rec.name, pads: u.pads, tokens: u.tokens, runs: u.runs, last: u.last };
     },
 
     /* GET /v1/pads/pvm?name=: what a dealer needs to mint for an attached pVM -

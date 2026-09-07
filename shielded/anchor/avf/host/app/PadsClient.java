@@ -96,6 +96,18 @@ final class PadsClient {
         } catch (Exception e) { Main.say("PADS window error " + e); try { out.write("PADWIN fail error\n".getBytes()); out.flush(); } catch (Exception ignored) { } }
     }
 
+    /** The engine's usage receipt (RECEIPT name seed_id pads tokens nonce sig): relay it as signed.
+     *  Nothing to hand back; the platform's totals are what billing reads. */
+    static void onReceipt(String line) {
+        try {
+            String[] f = line.trim().split(" ");
+            if (f.length != 7) { Main.say("PADS receipt malformed"); return; }
+            JSONObject res = http("POST", base + "/v1/pads/receipt", new JSONObject().put("name", f[1]).put("seed_id", f[2])
+                .put("pads", Long.parseLong(f[3])).put("tokens", Long.parseLong(f[4])).put("nonce", f[5]).put("sig", f[6]));
+            Main.say("PADS receipt " + (res.optInt("_status") == 200 ? "recorded: " + f[3] + " pads, " + f[4] + " tokens (seed total " + res.optLong("pads") + "/" + res.optLong("tokens") + ", runs " + res.optLong("runs") + ")" : "refused " + res));
+        } catch (Exception e) { Main.say("PADS receipt error " + e); }
+    }
+
     /** Prefetch: the platform's store lists this seed's shipments; download the ones this phone
      *  does not hold yet (whole files, tmp-then-rename, so streamBank never sees a partial). */
     static void syncBank(java.io.File dir, String seedIdNow) {

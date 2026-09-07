@@ -286,6 +286,21 @@ void ggml_backend_shielded_configure(const char *host, int port, const char *cal
 int ggml_backend_shielded_pool_version(void) { return 1; }
 
 extern "C" double sh_prof[8];
+void ggml_backend_shielded_pads_used(uint64_t *used, uint64_t *missed) {
+    sh_pool &p = sh_pool_get();
+    std::lock_guard<std::mutex> lock(p.mu);
+    uint64_t u = 0, m = 0;
+    for (size_t card = 0; card < p.cards.size(); card++) {
+        sh_state &s = *p.cards[card];
+        std::lock_guard<std::mutex> lk(s.mu);
+        uint64_t cu = 0, cm = 0;
+        if (s.link) sh_link_pool_stats(s.link, &cu, &cm);
+        u += cu; m += cm;
+    }
+    if (used) *used = u;
+    if (missed) *missed = m;
+}
+
 void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, uint64_t *vf) {
     sh_pool &p = sh_pool_get();
     std::lock_guard<std::mutex> lock(p.mu);
@@ -1018,6 +1033,15 @@ static enum ggml_status sh_card_compute(sh_state &s, ggml_cgraph *cgraph) {
                  * entry poisons every future token that attends to it. */
                 s.verify_fail++;
                 fprintf(stderr, "[shielded] %s\n", sh_link_last_error(s.link));
+                return GGML_STATUS_FAILED;
+            }
+            if (rc == SH_ERR_EXHAUST && sh_link_is_dealt(s.link)) {
+                /* Dealt pads and the bank is behind: the trusted half has
+                 * nothing to mask with and must not silently fall back to
+                 * computing everything in the clear at a tenth of the speed
+                 * (shielded/dealer/PLAN.md: "refuses to proceed on pad
+                 * exhaustion"). The request fails loudly; the next one retries. */
+                fprintf(stderr, "[shielded] %s: %s; refusing to proceed without dealt pads\n", ggml_get_name(node->src[0]), sh_link_last_error(s.link));
                 return GGML_STATUS_FAILED;
             }
             if (rc != SH_OK) {

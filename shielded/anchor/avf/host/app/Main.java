@@ -266,6 +266,7 @@ public class Main extends Activity {
             while ((line = r.readLine()) != null) {
                 say("VSOCK " + line); n++;
                 if (line.startsWith("PADWIN ")) PadsClient.onWindow(line, plan.name, out);   // the engine asks for a ledger window
+                if (line.startsWith("RECEIPT ")) PadsClient.onReceipt(line);                 // the engine's signed usage
                 if (line.equals("END")) break;
             }
             say("CONTROL closed after " + n + " lines");

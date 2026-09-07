@@ -1261,6 +1261,7 @@ int sh_link_gemm_local(sh_link *l, const int *nodes, size_t n_nodes,
 }
 
 bool sh_link_is_live(const sh_link *l) { return l && l->pipe; }
+bool sh_link_is_dealt(const sh_link *l) { return l && l->dealt; }
 
 const int8_t *sh_link_weight(const sh_link *l, int node) {
     if (!l || node < 0 || (size_t)node >= l->n_nodes) return NULL;

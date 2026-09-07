@@ -58,6 +58,9 @@ GGML_BACKEND_API void ggml_backend_shielded_set_window_provider(sh_window_fn fn,
 GGML_BACKEND_API int ggml_backend_shielded_mint(const char *seed_hex, const char *seed_id_hex, const char *digest_hex,
                                                 uint64_t index0, uint64_t count, const char *consumer_pk_hex, const char *path);
 
+/* Pads consumed (one cell per weight group per token row) and missed, summed
+ * over the cards: the quantity a dealt-pads usage receipt reports. */
+GGML_BACKEND_API void ggml_backend_shielded_pads_used(uint64_t *used, uint64_t *missed);
 /* Counters for the boot probe and the supervisor's verdict. */
 GGML_BACKEND_API void ggml_backend_shielded_stats(uint64_t *offloaded_nodes,
                                                   uint64_t *local_nodes,

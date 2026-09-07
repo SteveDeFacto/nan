@@ -100,3 +100,26 @@ test("reserve: windows advance the durable mark before they are signed; replay a
   assert.equal(v.seed_id, seed_id); assert.equal(v.padKey, a.padKey); assert.equal(v.mark, 72); assert.ok(!("seed" in v));
   assert.equal(L.pvm("nobody"), null);
 });
+
+test("receipt: signed usage accrues to the seed; replay, foreign seeds and bad counts refused", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pads-"));
+  const a = pvm(), b = pvm();
+  const hub = hubWith({ phone1: { keyFp: a.keyFp, spki: a.spki, padKey: a.padKey }, phone2: { keyFp: b.keyFp, spki: b.spki, padKey: b.padKey } });
+  const L = createPadsLedger({ dir, hub, log: () => {} });
+  const n0 = randomBytes(16).toString("hex");
+  const { seed_id } = L.seed({ name: "phone1", nonce: n0, sig: a.signReq("seed", "phone1", [], n0) }).body;
+  const req = (who, name, pads, tokens, nonce) => ({ name, seed_id, pads, tokens, nonce, sig: who.signReq("receipt", name, [seed_id, pads, tokens], nonce) });
+  const n1 = randomBytes(16).toString("hex");
+  const r1 = L.receipt(req(a, "phone1", 2033, 61, n1));
+  assert.equal(r1.status, 200, JSON.stringify(r1));
+  assert.deepEqual([r1.body.pads, r1.body.tokens, r1.body.runs], [2033, 61, 1]);
+  assert.equal(L.receipt(req(a, "phone1", 2033, 61, n1)).status, 409);                 // replay
+  const r2 = L.receipt(req(a, "phone1", 100, 7, randomBytes(16).toString("hex")));
+  assert.deepEqual([r2.body.pads, r2.body.tokens, r2.body.runs], [2133, 68, 2]);
+  assert.equal(L.receipt(req(b, "phone2", 5, 5, randomBytes(16).toString("hex"))).status, 403); // not its seed
+  assert.equal(L.receipt({ ...req(a, "phone1", 5, 5, randomBytes(16).toString("hex")), pads: -1 }).status, 400);
+  assert.equal(L.receipt({ ...req(a, "phone1", 5, 5, randomBytes(16).toString("hex")), sig: "00" }).status, 403);
+  const tot = L.receipts(seed_id);
+  assert.deepEqual([tot.pads, tot.tokens, tot.runs, tot.last.length], [2133, 68, 2, 2]);
+  assert.equal(L.receipts("0".repeat(32)), null);
+});

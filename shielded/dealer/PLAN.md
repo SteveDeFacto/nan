@@ -235,7 +235,24 @@ verification failures, exit 0, exact text.
 
 ### P4. Shared-prefix KV, receipts, billing
 - Prefix service signs KV for (model, public prefix); pVM loads instead of
-  prefilling; pVM-signed usage receipts feed operator payout.
+  prefilling.
+- DONE 2026-09-07, usage receipts: at the end of a run the engine (inside
+  the pVM) signs `enclave-pads-receipt\n<name>\n<seed_id>\n<pads>\n<tokens>\n<nonce>`
+  with the transport key (`ggml_backend_shielded_pads_used` = cells
+  consumed over the cards; tokens = prompt + generated), prints
+  `RECEIPT name seed_id pads tokens nonce sig` on the control channel, the
+  owner app relays it as `POST /v1/pads/receipt`, and the platform verifies
+  it against the tunnel's attested SPKI, refuses replays (the seed's nonce
+  memory, shared with reserve) and foreign seeds, and accrues per-seed
+  totals (`GET /v1/pads/receipts?seed_id=` -> pads, tokens, runs, last 64).
+  Billing and the operator payout read those totals; neither the app nor
+  the operator can inflate them. `test/pads-ledger.test.mjs` pins it.
+- DONE 2026-09-07, refusal: in dealt mode an EXHAUST from the ring is a
+  hard graph failure (`ggml-shielded.cpp`, "refusing to proceed without
+  dealt pads"), never the self-minting engine's fallback to computing the
+  linear in the clear. Verified on x86: an empty bank fails the run in
+  ~1.5 s with `local 0 nodes`; the same binary with a bank is exact
+  (dealt == self-minting text, 1251 nodes, pad check clean).
 
 Each phase lands behind flags; the self-minting engine stays the default
 until P2 and P3 exist, so nothing in production moves until then.

@@ -63,6 +63,22 @@ static int ctl_read_line(char *buf, size_t cap) {
     buf[n] = 0;
     return (int)n;
 }
+/* The usage receipt the operator is paid on: pads consumed and tokens served,
+ * signed by the transport key, relayed by the owner app to the platform
+ * (PADS receipt). Nothing here is secret; the signature is what makes it
+ * the pVM's word rather than the operator's. */
+static void pads_receipt(const anchor_pads *p, uint64_t pads_used, uint64_t tokens) {
+    uint8_t nb[16]; if (getrandom(nb, sizeof nb, 0) != (ssize_t)sizeof nb) return;
+    char nonce[33], used[24], toks[24], sig_hex[129]; uint8_t sig[64];
+    sh_pads_bin2hex(nb, 16, nonce);
+    snprintf(used, sizeof used, "%llu", (unsigned long long)pads_used);
+    snprintf(toks, sizeof toks, "%llu", (unsigned long long)tokens);
+    const char *fields[4] = { p->name, p->seed_id_hex, used, toks };
+    sh_pads_request_sign(p->transport_sk, "receipt", fields, 4, nonce, sig);
+    sh_pads_bin2hex(sig, 64, sig_hex);
+    outf("RECEIPT %s %s %s %s %s %s", p->name, p->seed_id_hex, used, toks, nonce, sig_hex);
+}
+
 static int pads_window(void *ctx, uint64_t want, uint64_t *lo, uint64_t *hi) {
     const anchor_pads *p = (const anchor_pads *)ctx;
     uint8_t nb[16]; if (getrandom(nb, sizeof nb, 0) != (ssize_t)sizeof nb) return -1;
@@ -103,6 +119,8 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
     if (!r) { outf("ENGINE shielded backend failed to load"); return 2; }
     void *sh_h = dlopen(sh_so.c_str(), RTLD_NOW);
     stats_fn stats = sh_h ? (stats_fn)dlsym(sh_h, "ggml_backend_shielded_stats") : nullptr;
+    typedef void (*pads_used_fn)(uint64_t *, uint64_t *);
+    pads_used_fn pads_used = sh_h ? (pads_used_fn)dlsym(sh_h, "ggml_backend_shielded_pads_used") : nullptr;
     adopt_fn adopt = sh_h ? (adopt_fn)dlsym(sh_h, "sh_pipe_adopt_fd") : nullptr;
     if (!adopt) { outf("ENGINE the shielded module has no sh_pipe_adopt_fd (built without the hook?)"); return 2; }
     adopt(worker_fd);                                 /* the first sh_pipe_open (inside the first graph) gets this */
@@ -167,6 +185,7 @@ extern "C" int engine_main(int ctl_fd, int worker_fd, int model_fd, const char *
          "\"decode_ms_per_tok\":%.1f,\"offloaded_nodes\":%llu,\"local_nodes\":%llu,\"gmac\":%.2f,\"verify_fail\":%llu,\"threads\":%d}",
          n, n_gen, out.c_str(), (t_pp1 - t_pp0) / 1e3, n_gen ? (t_tg1 - t_tg0) / 1e3 / n_gen : 0.0,
          (unsigned long long)off, (unsigned long long)loc, macs / 1e9, (unsigned long long)vf, n_threads);
+    if (pads && pads_used) { uint64_t pu = 0, pm = 0; pads_used(&pu, &pm); pads_receipt(pads, pu, (uint64_t)n + (uint64_t)n_gen); }
     llama_free(ctx); llama_model_free(model);
     return 0;
 }

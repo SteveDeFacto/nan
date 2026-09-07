@@ -121,6 +121,10 @@ int sh_link_gemm_local(sh_link *l, const int *nodes, size_t n_nodes,
 
 /* True once the worker is connected and the graph installed. */
 bool sh_link_is_live(const sh_link *l);
+/* Dealt mode: the ring is fed from shipments and the link never mints; an
+ * EXHAUST from sh_link_gemm then means the bank is behind and the caller
+ * must refuse to proceed rather than compute in the clear. */
+bool sh_link_is_dealt(const sh_link *l);
 
 /* The encoded weight, (N,K), for the caller's TEE-side outlier term. */
 const int8_t *sh_link_weight(const sh_link *l, int node);
