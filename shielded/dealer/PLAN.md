@@ -220,6 +220,19 @@ verification failures, exit 0, exact text.
   and the phone fetches over LAN/USB), prefetch depth from link rate and
   the largest expected prompt.
 
+### P4a. The CVM tier as a consumer (metal boxes) - DESIGN, not built
+- The manager forwards `nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,
+  ModelDigest,Window,Check}` (seed and sk as deployment secrets); the engine
+  inside the guest already consumes. What is missing is the bank's way into
+  a sealed SNP guest: shipments must enter like a model volume does
+  (`metal/volumes.mjs`), as a host-synced directory attached as a writable,
+  non-verity volume the tenant's wasm root sees at `nnShieldedPadSource`,
+  with a host-side sync loop (the phone's `syncBank` on the box: list the
+  seed's shipments on the platform, download what is missing, prune below
+  the mark) and ledger windows taken from the platform instead of a file.
+  Value: metal0's CPU wall moves to a dealer box; the V100s stop waiting on
+  refill threads.
+
 ### P4. Shared-prefix KV, receipts, billing
 - Prefix service signs KV for (model, public prefix); pVM loads instead of
   prefilling; pVM-signed usage receipts feed operator payout.
