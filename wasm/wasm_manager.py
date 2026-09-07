@@ -5578,6 +5578,34 @@ def _spawn_and_wait(rec, ctx):
         rt = _nn_cfg_int(enclave_config, "nnShieldedRefillThreads", 1, 64)
         if rt is not None:
             env["SHIELDED_REFILL_THREADS"] = str(rt)
+        # Dealt pads (shielded/dealer/PLAN.md): the engine imports u = r.W from
+        # shipments in a bank directory instead of minting, derives r from a
+        # seed the platform dealt, and reserves ledger windows before use.
+        # All of source/seed/seedId/sk are required together (the engine
+        # refuses to open otherwise); seed and sk are secrets, referenced from
+        # the config as $name and substituted here, never stored in the
+        # owner-visible record. The ledger is a file path until the CVM tier
+        # takes windows from the platform.
+        try:
+            pads = json.loads(enclave_config)
+        except (ValueError, TypeError):
+            pads = {}
+        if isinstance(pads, dict) and isinstance(pads.get("nnShieldedPadSource"), str) and pads["nnShieldedPadSource"]:
+            env["SHIELDED_PAD_SOURCE"] = pads["nnShieldedPadSource"]
+            for key, var, n in (("nnShieldedPadSeed", "SHIELDED_PAD_SEED", 64), ("nnShieldedPadSeedId", "SHIELDED_PAD_SEED_ID", 32), ("nnShieldedPadSk", "SHIELDED_PAD_SK", 64)):
+                v = pads.get(key)
+                if isinstance(v, str) and len(v) == n and all(c in "0123456789abcdefABCDEF" for c in v):
+                    env[var] = v
+            if isinstance(pads.get("nnShieldedPadLedger"), str) and pads["nnShieldedPadLedger"]:
+                env["SHIELDED_PAD_LEDGER"] = pads["nnShieldedPadLedger"]
+            v = pads.get("nnShieldedPadModelDigest")
+            if isinstance(v, str) and len(v) == 64:
+                env["SHIELDED_PAD_MODEL_DIGEST"] = v
+            pw = _nn_cfg_int(enclave_config, "nnShieldedPadWindow", 1, 4096)
+            if pw is not None:
+                env["SHIELDED_PAD_WINDOW"] = str(pw)
+            if pads.get("nnShieldedPadCheck") is True:
+                env["SHIELDED_PAD_CHECK"] = "1"
         env.update(_nn_shielded_transport_for(enclave_config))
         env.update(_nn_cpu_wait_env(enclave_config))
         # Recurrent-snapshot depth for speculative rewind (the shim's

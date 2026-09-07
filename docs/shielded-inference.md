@@ -439,6 +439,64 @@ Prefill: one masked round trip per linear op over the whole m×d prompt matrix (
 bucket length) — Freivalds batching makes verification ~1 mult/element; this is the
 friendly regime, as is diffusion (per-step batched denoiser, seconds-tolerant users).
 
+## Dealt pads: the mask work off the trusted half
+
+Everything above has the trusted half mint its own pads: `u = r·W` for every
+row it will ever mask, three residue planes of the model's MACs, on cores,
+inside the boundary. Measured on a 27B (2026-09-06) that is the binding
+resource for every shape of load: one chat keeps the refill threads 85%
+busy through speculation, prefill rides the same pads, and the accelerators
+sit at a few percent. The dealt-pad construction moves that work to a party
+that never sees `x + r`, and keeps the masking construction exactly as it is.
+
+**Parties.** The *dealer* holds a seed the trusted half also holds, derives
+`r` from it, mints `u = r·W` in batch on any hardware, and ships `u`
+encrypted to the trusted half's pad key. The *accelerator* still sees only
+`x + r`. The *trusted half* derives the same `r`, masks, unmasks with the
+shipped `u`, verifies every product as before (SECURITY.md section 5), and
+never mints. The *platform* keeps a consumption ledger. Privacy now rests
+on the dealer and the accelerator not colluding (the dealer knows `r`, the
+accelerator knows `x + r`, neither knows both); integrity rests on the same
+Freivalds check as before plus an import-time check of each pad.
+
+**The pad.** `r = ChaCha20(seed, (group << 48) | (index << 24) | block)`
+reduced to `[0, M)` exactly as the mask bank draws; `u` ships as 3 bytes per
+column (`M ~ 2^23.8`), 12.6 MB per token row on the 27B, 1.9 MB on the
+0.8B, incompressible. A shipment (`.pads`) is row-major by index with one
+ChaCha20-Poly1305 cell per `(index, group)` under a per-shipment key boxed
+to the consumer's X25519 pad key; the operator's bank sees ciphertext and
+sizes.
+
+**Single use across reboots.** The consumer reserves a window `[mark,
+mark + W)` from the platform's ledger and the mark advances before the
+window is signed and returned; a restart resumes at the mark. The ledger
+is not on the operator's box, so it cannot be rolled back.
+
+**Integrity.** The product check is unchanged and already covers a wrong
+`u`. With `SHIELDED_PAD_CHECK` the consumer also checks each imported cell,
+`(u·s) == (r·(W s)) mod M` with a per-node random `s` and one weight pass at
+registration, so a wrong dealer is refused at import and named, before any
+use, instead of surfacing later as a worker failure.
+
+**What binds throughput now.** The dealer's egress and the consumer's link
+(rows per second), the bank (burst), the exchange chain (latency), and
+memory (context). Speculation costs rows, so plain decode is the
+bandwidth-efficient mode; prefill needs a pad per prompt token, so the bank
+is sized for the largest prompt burst.
+
+**Status.** `shielded/dealer/PLAN.md` is the design and log. Built:
+`shielded-pads.{h,c}` (format, derivation, reader, writer, ledger window),
+dealt mode in `shielded-tee.c` (`SHIELDED_PAD_*`), `shielded-dealer` and
+`shielded/dealer/dealer-loop.py` (mint ahead of the mark, push to the
+platform), `relay/pads.mjs` (seeds, ledger, shipment store; `/v1/pads/*`),
+the Pixel anchor's pad key, seed, windows and bank. Verified: the 0.8B on
+CPU end to end (exact text, no local minting), and twice on a Pixel 8 Pro's
+protected VM against a workstation hub (2363 nodes offloaded, 0 local, 0
+verification failures, the same text). For a CVM tenant the manager keys are
+`nnShieldedPad{Source,Seed,SeedId,Sk,Ledger,ModelDigest,Window,Check}`,
+seed and sk as deployment secrets; the bank transport for a metal box is
+not built yet.
+
 ## Worker protocol (hardened ggml-rpc derivative)
 
 Transport: TCP loopback CVM↔host (repo has no vsock anywhere; house pattern is TCP +

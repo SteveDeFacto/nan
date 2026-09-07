@@ -43,3 +43,16 @@ test("nnShieldedRefillThreads reaches the engine as the SHIELDED_REFILL_THREADS 
   assert.ok(Number(m[1]) >= 1, "zero refill threads would generate every pad on the request path");
   assert.match(backend, /refill_threads = threads \/ \(int\)parsed\.size\(\)/, "the total is divided over the card links");
 });
+
+test("dealt-pad knobs reach the engine together, seed and sk as substituted secrets, never partially", () => {
+  for (const [key, env] of [["nnShieldedPadSource", "SHIELDED_PAD_SOURCE"], ["nnShieldedPadSeed", "SHIELDED_PAD_SEED"], ["nnShieldedPadSeedId", "SHIELDED_PAD_SEED_ID"],
+                            ["nnShieldedPadSk", "SHIELDED_PAD_SK"], ["nnShieldedPadLedger", "SHIELDED_PAD_LEDGER"], ["nnShieldedPadModelDigest", "SHIELDED_PAD_MODEL_DIGEST"],
+                            ["nnShieldedPadWindow", "SHIELDED_PAD_WINDOW"], ["nnShieldedPadCheck", "SHIELDED_PAD_CHECK"]]) {
+    assert.ok(manager.includes(`"${key}"`) && manager.includes(`"${env}"`), `${key} -> ${env}`);   // seed/seedId/sk go through one loop of (key, env) pairs
+    assert.ok(tee.includes(`"${env}"`), `the engine reads ${env}`);
+  }
+  // the engine refuses a partial set rather than minting: the manager must not paper over that
+  assert.match(tee, /Dealt mode: all four are required together/, "engine refuses a partial dealt env");
+  // secrets are substituted before this block sees the config
+  assert.ok(manager.indexOf("enclave_config = _subst_secrets(enclave_config, secrets)") < manager.indexOf('env["SHIELDED_PAD_SOURCE"]'), "secret refs substituted before the pad env is built");
+});
