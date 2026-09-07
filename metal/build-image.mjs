@@ -325,6 +325,16 @@ function buildShieldedBackend(dstRoot) {
     { src: 'shielded-field.c', obj: 'shielded-field.o', cc: 'cc',  flags: [...base, '-ffp-contract=off'] },
     { src: 'shielded-wire.c',  obj: 'shielded-wire.o',  cc: 'cc',  flags: base },
     { src: 'shielded-tee.c',   obj: 'shielded-tee.o',   cc: 'cc',  flags: base },
+    // Dealt pads (shielded/dealer/PLAN.md): the shipment format, its AEAD and
+    // the bank client the trusted half links against. Every file the Makefile's
+    // CORE_SRC names must be here too - test/metal-shielded-build.test.mjs pins
+    // the two lists together, and the link below refuses undefined symbols, so
+    // an omission fails the build instead of the dlopen inside the enclave.
+    { src: 'shielded-pads.c',  obj: 'shielded-pads.o',  cc: 'cc',  flags: base },
+    { src: 'shielded-bank.c',  obj: 'shielded-bank.o',  cc: 'cc',  flags: base },
+    { src: 'shielded-http.c',  obj: 'shielded-http.o',  cc: 'cc',  flags: base },
+    { src: 'tweetnacl.c',      obj: 'tweetnacl.o',      cc: 'cc',  flags: [...base, '-w'] },
+    { src: 'poly1305-donna.c', obj: 'poly1305-donna.o', cc: 'cc',  flags: base },
     { src: 'shielded-simd.c',  obj: 'shielded-simd-avx512.o', cc: 'cc',
       flags: [...base, '-O3', '-mavx512f', '-mavx512bw', '-mavx512dq', '-mavx512vl', '-mavx512vnni', '-DSH_SIMD_AVX512'] },
     { src: 'shielded-simd.c',  obj: 'shielded-simd-generic.o', cc: 'cc', flags: [...base, '-O3'] },
@@ -348,7 +358,8 @@ function buildShieldedBackend(dstRoot) {
   fs.mkdirSync(dstRoot, { recursive: true });
   const so = path.join(dstRoot, 'libggml-shielded.so');
   sh('c++', ['-shared', '-o', so, ...units.map((u) => path.join(objDir, u.obj)),
-             '-L' + libDir, '-lggml-base', '-lpthread', '-lm',
+             '-L' + libDir, '-lggml', '-lggml-base', '-lpthread', '-lm',   // both ggml libraries: the backend calls ggml_backend_dev_by_type too
+             '-Wl,--no-undefined',            // a missing unit fails HERE, not at dlopen inside the enclave
              '-Wl,-rpath,/usr/local/lib']);
   fs.chmodSync(so, 0o755);
   const ompProfileSrc = path.join(SHIELDED_CODE, 'shielded-omp-profile.c');
