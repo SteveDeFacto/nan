@@ -93,7 +93,7 @@ import { handleSecrets, initSecrets, secretsEnabled, startSecretsSweep } from ".
 import { handleDomains, initDomains, domainsEnabled, startDomainSweep, domainDeployment, tlsAskAllowed } from "./domains.js";
 import { handleCerts, initCerts } from "./certs.js";
 import { createTunnelHub } from "./tunnel.js";
-import { createPadsLedger, createShipmentStore, PADS_EPOCH } from "./pads.mjs";
+import { createPadsLedger, createShipmentStore, padsRouter } from "./pads.mjs";
 import { dataDir } from "./store.js";
 import { boxOrigin, boxLabelOfHost } from "./boxhost.js";
 installProcessGuards("api-relay");
@@ -161,15 +161,18 @@ async function tunnelNameOwner(name) {
   const op = String(e?.operator || "");
   return e?.active && !/^0x0{40}$/i.test(op) ? op.toLowerCase() : null;
 }
-// Dealt pads ledger: created on first use so the data dir and the hub exist.
-let padsLedgerInstance;
-function padsLedger() {
-  if (padsLedgerInstance === undefined) {
+// Dealt pads: created on first use so the data dir and the hub exist.
+let padsRoutesInstance;
+function padsRoutes() {
+  if (padsRoutesInstance === undefined) {
     const d = dataDir();
-    padsLedgerInstance = d ? createPadsLedger({ dir: d, hub: tunnelHub, masterSeed: process.env.PADS_MASTER_SEED || null }) : null;
-    if (!padsLedgerInstance) console.log("[pads] no data dir: the pads ledger is disabled");
+    const ledger = d ? createPadsLedger({ dir: d, hub: tunnelHub, masterSeed: process.env.PADS_MASTER_SEED || null }) : null;
+    const store = d ? createShipmentStore({ dir: d }) : null;
+    if (!ledger) console.log("[pads] no data dir: the pads ledger is disabled");
+    padsRoutesInstance = padsRouter({ ledger, store, dealerToken: (process.env.PADS_DEALER_TOKEN || "").trim(),
+                                      json: (res, status, body) => json(res, status, body, null), readBody });
   }
-  return padsLedgerInstance;
+  return padsRoutesInstance;
 }
 const tunnelHub = createTunnelHub({
   allow: [...DEFAULT_METAL_ALLOW, ...ENV_METAL_ALLOW],
@@ -1612,71 +1615,10 @@ async function gateway(u, req, res) {
     return json(res, 200, { token, address, expiry }, req);
   }
 
-  // Dealt pads (relay/pads.mjs, shielded/dealer/PLAN.md): the ledger key, a
-  // pVM's seed, and reserve-before-use windows, each authenticated by the
-  // attested tunnel's own transport key rather than an account session.
+  // Dealt pads (relay/pads.mjs, shielded/dealer/PLAN.md): ledger, seeds,
+  // windows and the shipment store, one router shared with the local hub.
   if (p.startsWith("/v1/pads/")) {
-    const L = padsLedger();
-    if (!L) return json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }, req);
-    if (p === "/v1/pads/key" && req.method === "GET") return json(res, 200, { key: L.key(), epoch: PADS_EPOCH }, req);
-    // Shipments: the dealer streams them in (bearer PADS_DEALER_TOKEN), the
-    // phone lists and streams them out (ciphertext to its pad key: public).
-    if (p === "/v1/pads/shipments" && req.method === "GET") {
-      const store = createShipmentStore({ dir: dataDir() });
-      return json(res, 200, { seed_id: u.searchParams.get("seed_id") || "", shipments: store.list(u.searchParams.get("seed_id") || "") }, req);
-    }
-    const ship = p.match(/^\/v1\/pads\/shipments\/([0-9a-f]{32})\/([A-Za-z0-9._-]{1,120})$/);
-    if (ship) {
-      const store = createShipmentStore({ dir: dataDir() });
-      if (req.method === "GET") {
-        const f = store.file(ship[1], ship[2]);
-        if (!f) return json(res, 404, { error: "no_such_shipment" }, req);
-        const st = fs.statSync(f);
-        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": st.size, "cache-control": "private, max-age=3600" });
-        return fs.createReadStream(f).pipe(res);
-      }
-      const token = (process.env.PADS_DEALER_TOKEN || "").trim();
-      const auth = String(req.headers.authorization || "");
-      if (!token || auth !== "Bearer " + token) return json(res, 403, { error: "dealer_only", message: "PUT/DELETE need the dealer's bearer" }, req);
-      const plan = store.plan(ship[1], ship[2]);
-      if (!plan) return json(res, 400, { error: "bad_name", message: "<seed_id>-<index0>-<count>.pads, for that seed" }, req);
-      if (req.method === "DELETE") return json(res, store.remove(ship[1], ship[2]) ? 200 : 404, { removed: ship[2] }, req);
-      if (req.method === "PUT") {
-        // streamed to a .part, hashed on the way, renamed only if the sha256 the dealer declared matches
-        const want = String(u.searchParams.get("sha256") || "").toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(want)) return json(res, 400, { error: "need_sha256" }, req);
-        const hash = createHash("sha256");
-        const out = fs.createWriteStream(plan.tmp);
-        let bytes = 0;
-        req.on("data", (ch) => { hash.update(ch); bytes += ch.length; });
-        req.pipe(out);
-        out.on("finish", () => {
-          const got = hash.digest("hex");
-          if (got !== want) { try { fs.unlinkSync(plan.tmp); } catch {} return json(res, 409, { error: "sha256_mismatch", got, want }, req); }
-          try { fs.renameSync(plan.tmp, plan.final); } catch (e) { return json(res, 500, { error: "store", message: e.message }, req); }
-          return json(res, 200, { stored: ship[2], bytes, sha256: got }, req);
-        });
-        out.on("error", (e) => json(res, 500, { error: "store", message: e.message }, req));
-        return;
-      }
-      return json(res, 405, { error: "method" }, req);
-    }
-    if (p === "/v1/pads/pvm" && req.method === "GET") {
-      const r = L.pvm(u.searchParams.get("name") || "");
-      return r ? json(res, 200, r, req) : json(res, 404, { error: "unknown_tunnel" }, req);
-    }
-    if (p === "/v1/pads/ledger" && req.method === "GET") {
-      const m = L.mark(u.searchParams.get("seed_id") || "");
-      return m ? json(res, 200, m, req) : json(res, 404, { error: "unknown_seed" }, req);
-    }
-    if ((p === "/v1/pads/seed" || p === "/v1/pads/reserve") && req.method === "POST") {
-      let body;
-      try { body = JSON.parse((await readBody(req, 8192)).toString("utf8") || "{}"); }
-      catch (e) { return json(res, e.message === "body too large" ? 413 : 400, { error: "bad_json", message: e.message }, req); }
-      const r = p === "/v1/pads/seed" ? L.seed(body || {}) : L.reserve(body || {});
-      return json(res, r.status, r.body, req);
-    }
-    return json(res, 404, { error: "not_found" }, req);
+    if (await padsRoutes()(req, res, u)) return;
   }
 
   if (p === "/v1/claim-hint" && req.method === "POST") {

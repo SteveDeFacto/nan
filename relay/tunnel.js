@@ -318,7 +318,15 @@ export function createTunnelHub({ allow = [], attest = null, reqTimeoutMs = 3000
             const spki = f.rad.transportKey ? Buffer.from(f.rad.transportKey, "base64") : null;
             const isAvf = /android-avf-pvm/.test(f.rad.format || "");
             let res;
-            if (isAvf) {
+            // DEVELOPMENT ONLY, double-gated (the hub's option AND the process
+            // env): a phone whose VM cannot attest yet (vendor level below the
+            // RKP admission) binds on its transport key alone so the rest of
+            // the loop (pads, engine) can be driven. Never set in production.
+            const devUnattested = !!(attest && attest.devUnattested && process.env.ENCLAVE_DEV_UNATTESTED === "1");
+            if (isAvf && devUnattested && spki) {
+              console.log(`[tunnel] ${name}: DEV attach without attestation (ENCLAVE_DEV_UNATTESTED)`);
+              res = { measurement: "dev-unattested", vcekVerified: false };
+            } else if (isAvf) {
               // A phone-anchored host. Same binding as SNP's report_data, in the
               // shape AVF offers: the pVM requested its certificate with
               // challenge = sha256(transportKey || nonce), and its attested key

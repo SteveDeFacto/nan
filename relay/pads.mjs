@@ -37,6 +37,71 @@ import { createHash, createPrivateKey, createPublicKey, createCipheriv, diffieHe
 import fs from "node:fs";
 import path from "node:path";
 
+/* ---- the HTTP surface, shared by api-relay.js and the local hub ----------
+ * Returns true when the request was one of ours (answered), false otherwise.
+ * `json(res, status, body)` and `readBody(req, max) -> Buffer` are the host's. */
+export function padsRouter({ ledger, store, dealerToken, json, readBody }) {
+  return async function handle(req, res, url) {
+    const p = url.pathname;
+    if (!p.startsWith("/v1/pads/")) return false;
+    if (!ledger || !store) { json(res, 503, { error: "pads_disabled", message: "no data dir for the pads ledger" }); return true; }
+    if (p === "/v1/pads/key" && req.method === "GET") { json(res, 200, { key: ledger.key(), epoch: PADS_EPOCH }); return true; }
+    if (p === "/v1/pads/pvm" && req.method === "GET") {
+      const r = ledger.pvm(url.searchParams.get("name") || "");
+      json(res, r ? 200 : 404, r || { error: "unknown_tunnel" }); return true;
+    }
+    if (p === "/v1/pads/ledger" && req.method === "GET") {
+      const m = ledger.mark(url.searchParams.get("seed_id") || "");
+      json(res, m ? 200 : 404, m || { error: "unknown_seed" }); return true;
+    }
+    if ((p === "/v1/pads/seed" || p === "/v1/pads/reserve") && req.method === "POST") {
+      let body;
+      try { body = JSON.parse((await readBody(req, 8192)).toString("utf8") || "{}"); }
+      catch (e) { json(res, e.message === "body too large" ? 413 : 400, { error: "bad_json", message: e.message }); return true; }
+      const r = p === "/v1/pads/seed" ? ledger.seed(body || {}) : ledger.reserve(body || {});
+      json(res, r.status, r.body); return true;
+    }
+    if (p === "/v1/pads/shipments" && req.method === "GET") {
+      const seed_id = url.searchParams.get("seed_id") || "";
+      json(res, 200, { seed_id, shipments: store.list(seed_id) }); return true;
+    }
+    const ship = p.match(/^\/v1\/pads\/shipments\/([0-9a-f]{32})\/([A-Za-z0-9._-]{1,120})$/);
+    if (ship) {
+      if (req.method === "GET") {
+        const f = store.file(ship[1], ship[2]);
+        if (!f) { json(res, 404, { error: "no_such_shipment" }); return true; }
+        const st = fs.statSync(f);
+        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": st.size, "cache-control": "private, max-age=3600" });
+        fs.createReadStream(f).pipe(res); return true;
+      }
+      const auth = String(req.headers.authorization || "");
+      if (!dealerToken || auth !== "Bearer " + dealerToken) { json(res, 403, { error: "dealer_only", message: "PUT/DELETE need the dealer's bearer" }); return true; }
+      const plan = store.plan(ship[1], ship[2]);
+      if (!plan) { json(res, 400, { error: "bad_name", message: "<seed_id>-<index0>-<count>.pads, for that seed" }); return true; }
+      if (req.method === "DELETE") { json(res, store.remove(ship[1], ship[2]) ? 200 : 404, { removed: ship[2] }); return true; }
+      if (req.method === "PUT") {
+        const want = String(url.searchParams.get("sha256") || "").toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(want)) { json(res, 400, { error: "need_sha256" }); return true; }
+        const hash = createHash("sha256");
+        const out = fs.createWriteStream(plan.tmp);
+        let bytes = 0;
+        req.on("data", (ch) => { hash.update(ch); bytes += ch.length; });
+        req.pipe(out);
+        out.on("finish", () => {
+          const got = hash.digest("hex");
+          if (got !== want) { try { fs.unlinkSync(plan.tmp); } catch {} return json(res, 409, { error: "sha256_mismatch", got, want }); }
+          try { fs.renameSync(plan.tmp, plan.final); } catch (e) { return json(res, 500, { error: "store", message: e.message }); }
+          json(res, 200, { stored: ship[2], bytes, sha256: got });
+        });
+        out.on("error", (e) => json(res, 500, { error: "store", message: e.message }));
+        return true;
+      }
+      json(res, 405, { error: "method" }); return true;
+    }
+    json(res, 404, { error: "not_found" }); return true;
+  };
+}
+
 /* ---- the shipment store --------------------------------------------------
  * The dealer PUTs finished shipments here and the phone prefetches them into
  * its own storage (the platform is the bank; an operator NVMe cache can front
