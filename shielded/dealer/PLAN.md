@@ -201,7 +201,7 @@ verification failures, exit 0, exact text.
   calib (`SHIELDED_PAD_MODEL_DIGEST`), and epoch rotation by `PADS_EPOCH`
   on the relay (old shipments become foreign).
 
-### P3. Operator bank and prefetch - IN PROGRESS
+### P3. Operator bank and prefetch - DONE 2026-09-07 (transport), sizing is a knob
 - DONE 2026-09-06: `shielded/dealer/dealer-loop.py` keeps one pVM's bank
   ahead of its ledger mark: reads `/v1/pads/pvm?name=` (public keys, seed
   id, mark), derives the seed from the master exactly as the relay does
@@ -216,9 +216,14 @@ verification failures, exit 0, exact text.
   public domain) at 2.8 GB/s on one x86 core, against TweetNaCl's 53 MB/s
   for XSalsa20-Poly1305, so a 27B row (12.6 MB) opens in ~20 ms and 20
   rows/s cost a fraction of a core. Re-proved on the 0.8B end to end.
-- TODO: the bank on the GPU box (the agent stores what the dealer ships
-  and the phone fetches over LAN/USB), prefetch depth from link rate and
-  the largest expected prompt.
+- DONE 2026-09-07: the bank on the GPU box is any HTTP cache of the
+  platform store's two shapes (P4a: the engine's own bank client fetches
+  the current window plus one ahead regardless of budget, then up to
+  SHIELDED_PAD_CACHE_MB in index order; the guest agent proxies the store
+  on a metal box). Prefetch depth = SHIELDED_PAD_CACHE_MB on the consumer
+  and `--ahead` on the dealer; both must cover the largest prompt burst
+  (one row per prompt token) - the phone still receives its bank through
+  the owner app over vsock.
 
 ### P4a. The CVM tier as a consumer (metal boxes) - BUILT 2026-09-07 (transport), volume design below superseded
 - The engine fetches its own bank and windows over plain HTTP instead of a
@@ -296,7 +301,33 @@ verification failures, exit 0, exact text.
 
 ### P4. Shared-prefix KV, receipts, billing
 - Prefix service signs KV for (model, public prefix); pVM loads instead of
-  prefilling.
+  prefilling. DESIGN 2026-09-07: the shared prefix (system prompt + tool
+  schemas) is public text, so the platform prefills it in the clear on any
+  box it owns and publishes the resulting KV cache for (model digest,
+  prefix text) as a signed artifact: `llama_state_seq_save_file` of the
+  prefix sequence, Ed25519 over sha512(file) || model digest || prefix
+  sha256, key = the platform's prefix key (pinned like the ledger key).
+  The consumer verifies the signature and the digests, loads the state
+  into sequence 0 (`llama_state_seq_load_file`) and continues with the
+  user's turn: no pad rows for the prefix, no minutes of phone prefill
+  (2k tokens = 2k rows = the whole bank on a phone), and on a metal box a
+  restart re-parks the prefix in ~1 s from disk instead of the 295 s
+  page-warm race. KV size: 64 KiB/token on the 27B (128 MB for 2k
+  tokens), far less on the 0.8B. Where it lands: the pVM engine
+  (engine.cpp) and shielded-run call llama directly, so they take it
+  first (`SHIELDED_PREFIX_KV=<file>` + `SHIELDED_PREFIX_KV_PK`, verified
+  in a shared prefix-kv.c); the wasm tenants need the shim to expose
+  state load (ENCLAVE_GGML_* verb) - a wasmtime toolchain cycle, later.
+  The minting tool is `prefix-kv-mint` (prefill + save + sign; plain CPU,
+  no shielding: the prefix is public).
+- DONE 2026-09-07 (x86 half): prefix-kv.{h,c} (sign/verify, TweetNaCl
+  Ed25519 + SHA-512), `prefix-kv-mint`, `prefix-kv-selftest` (wrong key /
+  model / prefix / tampered file / edited sidecar / no sidecar all refused),
+  and `shielded-run` loading a verified KV (`SHIELDED_PREFIX_KV`,
+  `SHIELDED_PREFIX_KV_PK`, `SHIELDED_PREFIX_FILE`): 25-token prefix loaded,
+  2 tokens prefilled, text identical to the full prefill. Next: the pVM
+  (owner app streams kv+sig+prefix through the pads port; engine.cpp
+  mirrors the runner) and the wasm shim verb for tenants.
 - DONE 2026-09-07, usage receipts: at the end of a run the engine (inside
   the pVM) signs `enclave-pads-receipt\n<name>\n<seed_id>\n<pads>\n<tokens>\n<nonce>`
   with the transport key (`ggml_backend_shielded_pads_used` = cells

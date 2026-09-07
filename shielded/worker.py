@@ -299,7 +299,7 @@ class Connection:
                 for i in ids:
                     node = self.nodes[i]
                     outs.append(node.gemm(xr, m).contiguous())
-                torch.cuda.synchronize()
+                if DEVICE == "cuda": torch.cuda.synchronize()
             self.gemm_ms += (time.perf_counter() - t0) * 1e3
             self.recomputes += len(ids)
             if cmd == CMD_FIELD_GEMM24:
@@ -377,7 +377,7 @@ class Connection:
             xr = [p[:m] for p in node.xs]
             out = node.gemm(xr, m)
             node.y[:m].copy_(out)
-            torch.cuda.synchronize()
+            if DEVICE == "cuda": torch.cuda.synchronize()
         self.gemm_ms += (time.perf_counter() - t0) * 1e3
         self.recomputes += 1
         return struct.pack("<I", m)
@@ -424,7 +424,7 @@ class Connection:
             # Per-connection VRAM dies with the connection. Nothing secret was
             # ever in it, but a leaked buffer is a denial-of-service on the card.
             self.storage.clear()
-            torch.cuda.empty_cache()
+            if DEVICE == "cuda": torch.cuda.empty_cache()      # the CPU reference mode must never touch the card, not even to init a context
             self.state.release()
             try:
                 self.sock.close()

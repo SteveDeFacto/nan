@@ -80,6 +80,14 @@ test("dealt pads: mint, read back, tamper, exhaustion, ledger window, link impor
 // the contract too. Truncating instead of rounding to nearest-even lands one ulp
 // low on about half of all blocks and fails NOWHERE -- the two sides simply derive
 // different weights and unmasking returns noise. Caught exactly once, here.
+test("shared-prefix KV: the signed sidecar opens only for the platform's key, model, prefix text and file", () => {
+  const mk = spawnSync("make", ["-s", "-C", dir, "prefix-kv-selftest"], { encoding: "utf8", timeout: 600_000 });
+  assert.equal(mk.status, 0, mk.stderr);
+  const r = spawnSync(join(dir, "prefix-kv-selftest"), { encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, `prefix-kv-selftest failed: ${r.signal || r.status} ${r.stderr || ""}`);
+  assert.match(r.stdout, /prefix-kv-selftest: ok/);
+});
+
 test("dealt pads: minting through a worker (zero pads, product checked mod M) equals the in-process mint cell for cell", async (t) => {
   // shielded/dealer/PLAN.md P4a: the dealer's OWN worker sees r unmasked and
   // returns r.W = u at GPU speed. Proved here against the CPU reference

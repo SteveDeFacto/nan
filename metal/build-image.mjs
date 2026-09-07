@@ -333,6 +333,7 @@ function buildShieldedBackend(dstRoot) {
     { src: 'shielded-pads.c',  obj: 'shielded-pads.o',  cc: 'cc',  flags: base },
     { src: 'shielded-bank.c',  obj: 'shielded-bank.o',  cc: 'cc',  flags: base },
     { src: 'shielded-http.c',  obj: 'shielded-http.o',  cc: 'cc',  flags: base },
+    { src: 'prefix-kv.c',      obj: 'prefix-kv.o',      cc: 'cc',  flags: base },
     { src: 'tweetnacl.c',      obj: 'tweetnacl.o',      cc: 'cc',  flags: [...base, '-w'] },
     { src: 'poly1305-donna.c', obj: 'poly1305-donna.o', cc: 'cc',  flags: base },
     { src: 'shielded-simd.c',  obj: 'shielded-simd-avx512.o', cc: 'cc',

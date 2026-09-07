@@ -536,6 +536,21 @@ the transport carries no trust):
   comes from the calibration file (SHA-512, first 32 bytes, the dealer's own
   label) when the config names none (`test/metal-agent-pads.test.mjs`).
 
+**The shared-prefix KV.** The shared prefix of a chat (system prompt, tool
+schemas) is public text, so the platform prefills it once, in the clear, and
+publishes the KV cache for (model, prefix) as a signed artifact
+(`prefix-kv-mint`: `llama_state_seq_save_file` of the prefix sequence plus a
+sidecar `<file>.sig`, Ed25519 over the model digest, the prefix text's SHA-512,
+the token count and the file's SHA-512). A consumer pins the platform's prefix
+key (`SHIELDED_PREFIX_KV_PK`), verifies the sidecar against this model and the
+exact prefix text before loading a byte (`prefix-kv.c`, `prefix-kv-selftest`),
+loads the state into its sequence and prefills only the remainder: no pad rows
+for the prefix, no minutes of phone prefill, a one-second re-park after a
+restart. Proved in `shielded-run` (`SHIELDED_PREFIX_KV`, `SHIELDED_PREFIX_FILE`)
+on the 0.8B: a 25-token prefix loaded, 2 remainder tokens prefilled, text
+identical to the full 27-token prefill. The pVM engine and the wasm tenants
+(through the shim) are next.
+
 **The dealer daemon.** `GET /v1/pads/consumers` lists every attached tunnel
 that offered a pad key with its seed id, ledger mark and whether it has asked
 for its seed; `shielded/dealer/dealer-loop.py --all --master <hex> --push

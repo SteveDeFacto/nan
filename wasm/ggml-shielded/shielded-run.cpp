@@ -18,6 +18,11 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "prefix-kv.h"
+#include "shielded-pads.h"
+extern "C" {
+#include "tweetnacl.h"
+}
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -95,15 +100,40 @@ int main(int argc, char **argv) {
     }
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 2; }
 
-    std::vector<llama_token> toks(256);
-    int n = llama_tokenize(vocab, prompt, (int)strlen(prompt), toks.data(), (int)toks.size(), true, false);
+    /* SHIELDED_PREFIX_KV: a signed shared-prefix KV (prefix-kv.h) with
+     * SHIELDED_PREFIX_KV_PK (the platform's prefix key) and
+     * SHIELDED_PREFIX_FILE (the prefix text the prompt must start with).
+     * Verified before anything is loaded; the prompt's remainder is then
+     * tokenized on its own and appended, so the prefix costs no pad rows. */
+    std::vector<llama_token> toks;
+    int n_loaded = 0;
+    const char *prompt_rest = prompt;
+    if (const char *kv = getenv("SHIELDED_PREFIX_KV"); kv && *kv) {
+        const char *pkh = getenv("SHIELDED_PREFIX_KV_PK"), *pf = getenv("SHIELDED_PREFIX_FILE"), *calib = getenv("SHIELDED_CALIB");
+        uint8_t pk[32], digest[32];
+        std::string prefix;
+        if (!pkh || !sh_pads_hex2bin(pkh, pk, 32) || !pf || !calib) { fprintf(stderr, "[run] SHIELDED_PREFIX_KV needs SHIELDED_PREFIX_KV_PK (64 hex), SHIELDED_PREFIX_FILE and SHIELDED_CALIB\n"); return 2; }
+        { FILE *f = fopen(pf, "rb"); if (!f) { fprintf(stderr, "[run] cannot read %s\n", pf); return 2; } char b[65536]; size_t k; while ((k = fread(b, 1, sizeof b, f)) > 0) prefix.append(b, k); fclose(f); }
+        { FILE *f = fopen(calib, "rb"); if (!f) { fprintf(stderr, "[run] cannot read %s\n", calib); return 2; } std::string c; char b[65536]; size_t k; while ((k = fread(b, 1, sizeof b, f)) > 0) c.append(b, k); fclose(f);
+          uint8_t h[64]; crypto_hash(h, (const uint8_t *)c.data(), c.size()); memcpy(digest, h, 32); }
+        if (strncmp(prompt, prefix.c_str(), prefix.size())) { fprintf(stderr, "[run] the prompt does not start with the prefix in %s\n", pf); return 2; }
+        char err[256]; uint64_t ntok = 0;
+        if (sh_prefix_kv_verify(kv, pk, digest, prefix.data(), prefix.size(), &ntok, err, sizeof err)) { fprintf(stderr, "[run] prefix KV REFUSED: %s\n", err); return 2; }
+        std::vector<llama_token> loaded(ntok + 16); size_t got = 0;
+        if (!llama_state_seq_load_file(ctx, kv, 0, loaded.data(), loaded.size(), &got) || got != ntok) { fprintf(stderr, "[run] prefix KV load failed (%zu of %llu tokens)\n", got, (unsigned long long)ntok); return 2; }
+        n_loaded = (int)got;
+        prompt_rest = prompt + prefix.size();
+        fprintf(stderr, "[run] prefix KV: %d tokens loaded and verified from %s\n", n_loaded, kv);
+    }
+    toks.resize(strlen(prompt_rest) + 16);
+    int n = llama_tokenize(vocab, prompt_rest, (int)strlen(prompt_rest), toks.data(), (int)toks.size(), n_loaded == 0, n_loaded != 0);
     if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 2; }
     toks.resize(n);
-    fprintf(stderr, "[run] %d prompt tokens\n", n);
+    fprintf(stderr, "[run] %d prompt tokens%s\n", n, n_loaded ? " after the prefix" : "");
 
     llama_batch batch = llama_batch_get_one(toks.data(), n);
     const int64_t t_pp0 = ggml_time_us();
-    if (llama_decode(ctx, batch)) { fprintf(stderr, "decode(prompt) failed\n"); return 2; }
+    if (n > 0 && llama_decode(ctx, batch)) { fprintf(stderr, "decode(prompt) failed\n"); return 2; }
     const int64_t t_pp1 = ggml_time_us();
 
     // Test-only opt-in: compare every logit, not just the selected text, across

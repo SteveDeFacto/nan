@@ -8,7 +8,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC
 LDLIBS  += -lm
 
-CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c shielded-bank.c shielded-http.c tweetnacl.c poly1305-donna.c
+CORE_SRC := shielded-field.c shielded-wire.c shielded-tee.c shielded-pads.c shielded-bank.c shielded-http.c prefix-kv.c tweetnacl.c poly1305-donna.c
 CORE_OBJ := $(CORE_SRC:.c=.o) shielded-simd-avx512.o shielded-simd-generic.o
 # The dealer's build of the trusted half is the ONLY one carrying the zero-pad
 # mint path (SHIELDED_DEALER_MODE: r goes to the dealer's own worker in the
@@ -34,7 +34,7 @@ GGML_INC := -I$(GGML_SRC)/ggml/include -I$(GGML_SRC)/ggml/src
 CXX      ?= c++
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -fPIC
 
-all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest pads-unbox pads-keygen
+all: shielded-probe field-selftest prepare-selftest half-selftest refill-selftest dealt-selftest pads-unbox pads-keygen prefix-kv-selftest
 
 # Built only where an engine checkout exists; `make ggml` opts in.
 ggml: ggml-test
@@ -86,6 +86,8 @@ pads-unbox: pads-unbox.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 bank-probe: bank-probe.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+prefix-kv-selftest: prefix-kv-selftest.c prefix-kv.o shielded-pads.o tweetnacl.o poly1305-donna.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 pads-keygen: pads-keygen.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -108,9 +110,15 @@ ggml-shielded-dealer.o: ggml-shielded.cpp ggml-shielded.h shielded-latency.h shi
 libggml-shielded-dealer.so: ggml-shielded-dealer.o $(DEALER_OBJ)
 	$(CXX) $(CXXFLAGS) -shared -o $@ $^ -L$(GGML_LIB) -lggml-base $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 
-shielded-run: shielded-run.cpp libggml-shielded.so
-	$(CXX) $(CXXFLAGS) -I$(GGML_SRC)/include $(GGML_INC) -o $@ $< \
-	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl -Wl,-rpath,$(GGML_LIB)
+shielded-run: shielded-run.cpp libggml-shielded.so prefix-kv.o shielded-pads.o tweetnacl.o poly1305-donna.o
+	$(CXX) $(CXXFLAGS) -I$(GGML_SRC)/include $(GGML_INC) -o $@ $< prefix-kv.o shielded-pads.o tweetnacl.o poly1305-donna.o \
+	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
+
+# The platform's shared-prefix service, offline (prefix-kv.h): prefill in the
+# clear, save the sequence state, sign the sidecar. No shielded backend.
+prefix-kv-mint: prefix-kv-mint.cpp prefix-kv.o shielded-pads.o tweetnacl.o poly1305-donna.o
+	$(CXX) $(CXXFLAGS) -I$(GGML_SRC)/include $(GGML_INC) -o $@ $^ \
+	  -L$(GGML_LIB) -lllama -lggml -lggml-base -ldl $(LDLIBS) -Wl,-rpath,$(GGML_LIB)
 
 # shielded-field.o is the SAME object the backend links, -ffp-contract=off and
 # all: the calibrator's w_fixed must be the runtime's, byte for byte, or the
