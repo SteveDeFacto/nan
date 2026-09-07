@@ -325,7 +325,7 @@ export function createTunnelHub({ allow = [], attest = null, reqTimeoutMs = 3000
             const devUnattested = !!(attest && attest.devUnattested && process.env.ENCLAVE_DEV_UNATTESTED === "1");
             if (isAvf && devUnattested && spki) {
               console.log(`[tunnel] ${name}: DEV attach without attestation (ENCLAVE_DEV_UNATTESTED)`);
-              res = { measurement: "dev-unattested", vcekVerified: false };
+              res = { ok: true, reasons: [], measurement: "dev-unattested", vcekVerified: false };
             } else if (isAvf) {
               // A phone-anchored host. Same binding as SNP's report_data, in the
               // shape AVF offers: the pVM requested its certificate with

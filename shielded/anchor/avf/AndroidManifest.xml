@@ -26,7 +26,7 @@
     <!-- debuggable: lets `adb shell run-as` place a model in the app's files dir on a locked
          phone (an app cannot read /data/local/tmp). The VM's protection and the attestation
          do not depend on this flag; a release build drops it. -->
-    <application android:hasCode="true" android:extractNativeLibs="false" android:debuggable="true" android:label="Enclave Anchor (AVF)">
+    <application android:usesCleartextTraffic="true" android:hasCode="true" android:extractNativeLibs="false" android:debuggable="true" android:label="Enclave Anchor (AVF)">
         <activity android:name=".Main" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
