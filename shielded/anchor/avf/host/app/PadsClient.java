@@ -116,6 +116,16 @@ final class PadsClient {
             JSONObject list = http("GET", base + "/v1/pads/shipments?seed_id=" + seedIdNow, null);
             org.json.JSONArray ships = list.optJSONArray("shipments");
             if (ships == null) return;
+            /* spent rows never come back: drop local shipments wholly below the platform's mark */
+            JSONObject led = http("GET", base + "/v1/pads/ledger?seed_id=" + seedIdNow, null);
+            long mark = led.optInt("_status") == 200 ? led.optLong("mark", 0) : 0;
+            java.io.File[] have = dir.listFiles((d, n) -> n.endsWith(".pads"));
+            if (have != null) for (java.io.File f : have) {
+                String[] parts = f.getName().substring(0, f.getName().length() - 5).split("-");
+                boolean foreign = parts.length != 3 || !parts[0].equals(seedIdNow);
+                boolean spent = !foreign && mark > 0 && Long.parseLong(parts[1]) + Long.parseLong(parts[2]) <= mark;
+                if ((foreign || spent) && f.delete()) Main.say("PADS dropped " + f.getName() + (foreign ? " (another seed)" : " (below mark " + mark + ")"));
+            }
             for (int i = 0; i < ships.length(); i++) {
                 JSONObject s = ships.getJSONObject(i);
                 java.io.File f = new java.io.File(dir, s.getString("name"));
@@ -139,7 +149,8 @@ final class PadsClient {
         java.util.Set<String> done = new java.util.HashSet<>();
         for (int round = 0; round < 3600 && !Main.ended(); round++) {
             if (!base.isEmpty() && !seedId.isEmpty() && round % 15 == 0) syncBank(dir, seedId);   // every ~15 s: what the platform has that we do not
-            java.io.File[] files = dir.listFiles((d, n) -> n.endsWith(".pads"));
+            final String mine = seedId.isEmpty() ? null : seedId + "-";
+            java.io.File[] files = mine == null ? null : dir.listFiles((d, n) -> n.endsWith(".pads") && n.startsWith(mine));   // this seed only
             if (files != null) {
                 java.util.Arrays.sort(files);
                 for (java.io.File f : files) {
@@ -148,10 +159,14 @@ final class PadsClient {
                     if (pfd == null) { Main.say("PADS connect failed"); return; }
                     try (OutputStream out = new FileOutputStream(pfd.getFileDescriptor()); InputStream in = new java.io.FileInputStream(f)) {
                         out.write(("PADS " + f.getName() + " " + f.length() + "\n").getBytes()); out.flush();
+                        java.io.FileInputStream ackIn = new java.io.FileInputStream(pfd.getFileDescriptor());
+                        int go = ackIn.read();
+                        if (go == 'H') { done.add(f.getName()); Main.say("PADS " + f.getName() + " already in the VM"); continue; }
+                        if (go != 'G') { Main.say("PADS " + f.getName() + " VM refused the header"); continue; }
                         byte[] buf = new byte[1 << 20]; int n; long sent = 0;
                         while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); sent += n; }
                         out.flush();
-                        int ack = new java.io.FileInputStream(pfd.getFileDescriptor()).read();
+                        int ack = ackIn.read();
                         Main.say("PADS " + f.getName() + " " + (sent >> 20) + " MiB " + (ack == 'K' ? "accepted" : "REFUSED"));
                         if (ack == 'K') done.add(f.getName());
                     } catch (Exception e) { Main.say("PADS stream error " + e); }

@@ -101,7 +101,15 @@ def main():
     while True:
         seed, seed_id, pk, mark = a.seed, a.seed_id, a.pk, a.mark
         if a.relay and a.name:
-            info = relay_get(a.relay, f"/v1/pads/pvm?name={a.name}")
+            try:
+                info = relay_get(a.relay, f"/v1/pads/pvm?name={a.name}")
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+                # the pVM detaches whenever the owner app restarts; a 404 here is
+                # routine, the bank keeps and the next pass picks up where it was
+                code = getattr(e, "code", None) or getattr(e, "reason", e)
+                print(f"pVM {a.name} not attached ({code}); waiting", flush=True)
+                if a.once: return 1
+                time.sleep(a.interval); continue
             seed_id, pk, mark = info["seed_id"], info.get("padKey") or pk, info.get("mark", 0)
             if a.master:
                 seed, sid = derive_seed(a.master, info["keyFp"], info.get("epoch", a.epoch))

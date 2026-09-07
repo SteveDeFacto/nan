@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <linux/vm_sockets.h>
 #include <time.h>
 #include <unistd.h>
@@ -291,8 +292,32 @@ static void pads_dir(char *out, size_t cap) {
     if (es) snprintf(out, cap, "%s/pads", es); else snprintf(out, cap, "/data/anchor-pads");
     mkdir(out, 0700);
 }
-/* One shipment per connection: "PADS <name> <bytes>\n" then the bytes, written
- * tmp-then-rename so the engine's reader never sees a partial file. */
+/* Shipments are named <seed_id>-<index0>-<count>.pads. Files of another
+ * seed (an older key or epoch) can never open here and are dropped; files
+ * wholly below `below` (a reserved window's lo) are spent by construction. */
+static int pads_prune(const char *keep_seed, unsigned long long below) {
+    if (!g_pads_dir[0]) return 0;
+    DIR *d = opendir(g_pads_dir); if (!d) return 0;
+    int n = 0; struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t len = strlen(e->d_name);
+        if (len < 6 || strcmp(e->d_name + len - 5, ".pads")) continue;
+        char sid[33] = ""; unsigned long long i0 = 0, cnt = 0;
+        int drop = 0;
+        if (sscanf(e->d_name, "%32[0-9a-f]-%llu-%llu.pads", sid, &i0, &cnt) != 3) drop = 1;
+        else if (keep_seed && strcmp(sid, keep_seed)) drop = 1;
+        else if (below && i0 + cnt <= below) drop = 1;
+        if (!drop) continue;
+        char path[700]; snprintf(path, sizeof path, "%s/%s", g_pads_dir, e->d_name);
+        if (unlink(path) == 0) n++;
+    }
+    closedir(d);
+    return n;
+}
+/* One shipment per connection: "PADS <name> <bytes>\n"; the VM answers one
+ * byte, 'H' (have it already, same size: nothing more is sent) or 'G' (go),
+ * then the bytes follow, written tmp-then-rename so the engine's reader
+ * never sees a partial file. */
 static void *pads_receiver(void *arg) {
     int ls = (int)(intptr_t)arg;
     for (;;) {
@@ -304,6 +329,9 @@ static void *pads_receiver(void *arg) {
         char name[128] = ""; unsigned long long bytes = 0;
         if (n == 0 || sscanf(hdr, "PADS %127s %llu", name, &bytes) != 2 || strchr(name, '/') || strstr(name, "..")) { close(c); continue; }
         char tmp[700], fin[700]; snprintf(tmp, sizeof tmp, "%s/.%s.tmp", g_pads_dir, name); snprintf(fin, sizeof fin, "%s/%s", g_pads_dir, name);
+        struct stat st;
+        if (stat(fin, &st) == 0 && (unsigned long long)st.st_size == bytes) { (void)!write(c, "H", 1); close(c); continue; }
+        (void)!write(c, "G", 1);
         int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         unsigned long long got = 0; static char buf[1 << 16];
         while (fd >= 0 && got < bytes) {
@@ -337,7 +365,7 @@ static void run_engine(int ls_wk, int ls_model, int ls_pads, const char *prompt,
     }
     engine_main_fn em = (engine_main_fn)dlsym(h, "engine_main");
     if (!em) { OUT("ENGINE libengine.so has no engine_main"); return; }
-    anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex };
+    anchor_pads pads = { g_tsk, g_ledger_pk, g_pad_name, g_seed_id_hex, pads_prune };
     const anchor_pads *pp = NULL;
     if (with_pads) {
         if (!g_have_seed || !g_have_ledger) { OUT("ENGINE pads requested but no seed/ledger from the owner; refusing to mint for myself"); close(worker_fd); close(model_fd); return; }
@@ -482,7 +510,10 @@ int AVmPayload_main(void) {
                     sh_pads_hex2bin(sid, g_seed_id, 16) && sh_pads_hex2bin(epk_h, epk, 32) && sh_pads_hex2bin(nonce_h, nonce, 12) && sh_pads_hex2bin(box_h, box, 48) &&
                     sh_pads_seed_open(epk, nonce, box, 48, g_psk, g_ppk, g_seed) == 0) {
                     strncpy(g_pad_name, name, sizeof g_pad_name - 1); strncpy(g_seed_id_hex, sid, 32); g_have_seed = 1;
+                    if (!g_pads_dir[0]) pads_dir(g_pads_dir, sizeof g_pads_dir);
+                    int dropped = pads_prune(sid, 0);
                     OUT("PADSEED ok %s", sid);
+                    if (dropped) OUT("PADS dropped %d shipment(s) of other seeds", dropped);
                 } else { g_have_seed = 0; OUT("PADSEED fail"); }
             }
             else if (!strncmp(l, "PADSIGN ", 8)) {     /* PADSIGN <kind> <nonce> [fields...] -> PADSIG <hex> */

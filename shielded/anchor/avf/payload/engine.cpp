@@ -99,6 +99,8 @@ static int pads_window(void *ctx, uint64_t want, uint64_t *lo, uint64_t *hi) {
         uint8_t wsig[64];
         if (!sh_pads_hex2bin(sh, wsig, 64) || !sh_pads_window_verify(p->ledger_pk, p->seed_id_hex, l, h, iat, wsig)) { outf("ENGINE pads: window signature REJECTED"); return -1; }
         *lo = l; *hi = h;
+        /* every index below lo is spent for good: the shipments wholly below it go */
+        if (p->prune && l) { int n = p->prune(p->seed_id_hex, l); if (n) outf("ENGINE pads: dropped %d spent shipment(s) below %llu", n, l); }
         return 0;
     }
     return -1;
